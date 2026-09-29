@@ -1221,8 +1221,8 @@ def locate(obj) -> str:
         path = path.relative_to(PKG_ROOT)
     except ValueError:
         pass
-    return f"{path}:{line}"
-
+    #return f"{path}:{line}"
+    return f"{path.as_posix()}:{line}"
 
 def where(dotted: str) -> str:
     """'stmlab/keithley.py:199 find_suppress' for a dotted name."""
