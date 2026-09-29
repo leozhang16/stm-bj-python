@@ -1,0 +1,20 @@
+# Python: generated on each machine, never shared
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Measurement data: never in git (large binary files; they live on the NAS)
+data/
+*.h5
+
+# Outputs the snippets and the manual build regenerate
+snippets/figures/
+manual_build/*.aux
+manual_build/*.log
+manual_build/*.out
+manual_build/*.toc
+
+# Operating-system clutter
+.DS_Store
+Thumbs.db

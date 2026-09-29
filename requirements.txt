@@ -1,0 +1,18 @@
+# Core -- everything simulated runs with just these two.
+numpy>=1.24
+h5py>=3.8
+
+# Analysis figures in the experiment scripts, and the GUI's graph windows.
+matplotlib>=3.7
+
+# The GUI (gui.py) also needs Tkinter, which is part of Python itself, not a
+# pip package: python.org installers bundle it; Homebrew Python needs
+# `brew install python-tk@3.12`; Debian/Ubuntu `apt install python3-tk`.
+
+# Hardware only (install on the lab PC):
+# nidaqmx>=0.9        # the PXI-4461 (and the low-res card if present)
+# pyserial>=3.5       # NanoPZ coarse actuator
+# pyvisa>=1.13        # Keithley 428 over GPIB (needs NI-488.2 or equivalent)
+
+# Development
+pytest>=7.0

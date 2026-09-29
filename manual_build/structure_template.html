@@ -1,0 +1,409 @@
+<title>stmlab Code Map</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#f5f6f8; --panel:#ffffff; --ink:#1c2128; --muted:#5b6573; --line:#d6dbe3;
+  --soft:#eceff4; --accent:#8c3a10; --accent-ink:#ffffff; --focus:#3f7cc2;
+  --l-entry:#b8923a; --l-gui:#3f7cc2; --l-recipes:#3e8a4a; --l-rig:#c2572e; --l-card:#6d5aa8;
+  --l-entry-bg:#f6efdc; --l-gui-bg:#e3edf9; --l-recipes-bg:#e4f1e3; --l-rig-bg:#f8e3dc; --l-card-bg:#ebe6f5;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:"IBM Plex Sans",-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#14171c; --panel:#1c2026; --ink:#e6e9ee; --muted:#9aa5b3; --line:#2e3540;
+    --soft:#242a33; --accent:#e08a5c; --accent-ink:#14171c; --focus:#7fb0ea;
+    --l-entry:#d4b064; --l-gui:#7fb0ea; --l-recipes:#7cc386; --l-rig:#ee8f68; --l-card:#a794e0;
+    --l-entry-bg:#2b271b; --l-gui-bg:#1b2634; --l-recipes-bg:#1b2a1e; --l-rig-bg:#32211b; --l-card-bg:#26212f;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#14171c; --panel:#1c2026; --ink:#e6e9ee; --muted:#9aa5b3; --line:#2e3540;
+  --soft:#242a33; --accent:#e08a5c; --accent-ink:#14171c; --focus:#7fb0ea;
+  --l-entry:#d4b064; --l-gui:#7fb0ea; --l-recipes:#7cc386; --l-rig:#ee8f68; --l-card:#a794e0;
+  --l-entry-bg:#2b271b; --l-gui-bg:#1b2634; --l-recipes-bg:#1b2a1e; --l-rig-bg:#32211b; --l-card-bg:#26212f;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--sans);}
+a{color:var(--accent)}
+code,.mono{font-family:var(--mono);font-size:12.5px}
+button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer}
+button:focus-visible,input:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+
+header{padding:22px 28px 14px;border-bottom:1px solid var(--line);background:var(--panel)}
+header h1{margin:0;font-size:22px;font-weight:600;letter-spacing:-0.01em;text-wrap:balance}
+header p{margin:6px 0 0;color:var(--muted);max-width:68ch}
+.eyebrow{font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted);font-weight:500}
+
+.toolbar{display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:12px 28px;border-bottom:1px solid var(--line);background:var(--panel)}
+.search{flex:1 1 320px;display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:6px;padding:6px 10px;background:var(--bg)}
+.search input{flex:1;border:0;background:none;color:var(--ink);font:inherit;font-family:var(--mono);font-size:13px}
+.search input::placeholder{color:var(--muted)}
+.tabs{display:flex;gap:4px;background:var(--soft);padding:3px;border-radius:6px}
+.tabs button{padding:5px 12px;border-radius:4px;color:var(--muted);font-weight:500}
+.tabs button[aria-selected="true"]{background:var(--panel);color:var(--ink);box-shadow:0 1px 0 var(--line)}
+.stat{color:var(--muted);font-variant-numeric:tabular-nums}
+
+main{display:grid;grid-template-columns:minmax(380px,1.05fr) minmax(360px,1fr);gap:0;min-height:60vh}
+@media (max-width:900px){main{grid-template-columns:1fr}}
+.left{padding:18px 20px 28px 28px;border-right:1px solid var(--line)}
+.right{padding:18px 28px 28px 20px}
+@media (max-width:900px){.left{border-right:0;border-bottom:1px solid var(--line)}.right{padding-left:28px}}
+
+.hidden{display:none !important}
+
+/* layer map */
+.legend{color:var(--muted);margin:0 0 12px;font-size:13px}
+.layer{border-radius:8px;padding:10px 12px 12px;margin-bottom:10px;border:1px solid var(--line)}
+.layer h3{margin:0 0 8px;font-size:12px;letter-spacing:0.06em;text-transform:uppercase;font-weight:600}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:4px 8px 4px 6px;border-radius:5px;border:1px solid var(--line);background:var(--panel);font-family:var(--mono);font-size:12px;line-height:1.2}
+.chip .dot{width:8px;height:8px;border-radius:2px;flex:none}
+.chip:hover{border-color:var(--ink)}
+.chip[aria-pressed="true"]{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent);background:var(--panel)}
+.chip.dim{opacity:.35}
+.layer.entry{background:var(--l-entry-bg)} .layer.entry h3,.dot.entry{color:var(--l-entry);background-color:var(--l-entry)}
+.layer.gui{background:var(--l-gui-bg)} .layer.gui h3,.dot.gui{color:var(--l-gui);background-color:var(--l-gui)}
+.layer.recipes{background:var(--l-recipes-bg)} .layer.recipes h3,.dot.recipes{color:var(--l-recipes);background-color:var(--l-recipes)}
+.layer.rig{background:var(--l-rig-bg)} .layer.rig h3,.dot.rig{color:var(--l-rig);background-color:var(--l-rig)}
+.layer.card{background:var(--l-card-bg)} .layer.card h3,.dot.card{color:var(--l-card);background-color:var(--l-card)}
+.layer h3{background:none !important}
+
+/* paths */
+.path{display:grid;grid-template-columns:auto 1fr;gap:0 14px;align-items:stretch}
+.step{display:contents}
+.step .file{justify-self:end;text-align:right}
+.step .file button{font-family:var(--mono);font-size:12px;padding:3px 8px;border:1px solid var(--line);border-radius:5px;background:var(--panel)}
+.step .file button:hover{border-color:var(--ink)}
+.step .what{padding:4px 0 14px;position:relative;color:var(--ink)}
+.step .what::before{content:"";position:absolute;left:-15px;top:0;bottom:0;border-left:2px solid var(--line)}
+.step:last-child .what::before{display:none}
+.step .what::after{content:"";position:absolute;left:-19px;top:9px;width:10px;height:10px;border-radius:50%;background:var(--accent)}
+.path-intro{color:var(--muted);margin:0 0 14px;max-width:66ch}
+
+/* detail */
+.detail h2{margin:0;font-family:var(--mono);font-size:17px;font-weight:500;word-break:break-all}
+.detail .meta{color:var(--muted);margin:4px 0 12px;display:flex;gap:14px;flex-wrap:wrap;font-variant-numeric:tabular-nums}
+.detail .purpose{margin:0 0 18px;max-width:66ch}
+.section{margin:18px 0 0}
+.section h4{margin:0 0 8px;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.group{border-top:1px solid var(--line);padding:8px 0}
+.group:last-child{border-bottom:1px solid var(--line)}
+.group .target{font-family:var(--mono);font-size:12.5px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.group .target button{font-family:var(--mono);font-weight:500;color:var(--accent)}
+.group .target button:hover{text-decoration:underline}
+.group .count{color:var(--muted);font-variant-numeric:tabular-nums}
+.syms{display:flex;flex-wrap:wrap;gap:4px 8px;margin-top:5px}
+.sym{font-family:var(--mono);font-size:12px;padding:1px 6px;border-radius:4px;background:var(--soft)}
+.sym.hit{outline:2px solid var(--focus)}
+.sym small{color:var(--muted);font-family:var(--sans);font-size:11px;margin-left:5px}
+.empty{color:var(--muted);font-style:italic}
+
+/* neighborhood svg */
+.hood{margin:14px 0 4px;width:100%;overflow-x:auto}
+.hood svg{display:block;width:100%;height:auto;font-family:var(--mono);font-size:11px}
+.hood text{fill:var(--ink)}
+.hood .edge{stroke:var(--muted);stroke-width:1;fill:none;opacity:.7}
+.hood .box{fill:var(--panel);stroke:var(--line)}
+.hood .box.me{stroke:var(--accent);stroke-width:2}
+.hood .lab{fill:var(--muted);font-family:var(--sans)}
+
+/* functions table */
+.fns{width:100%;border-collapse:collapse;font-size:12.5px}
+.fns th{text-align:left;font-weight:600;color:var(--muted);padding:6px 8px 6px 0;border-bottom:1px solid var(--line);font-size:11px;letter-spacing:.06em;text-transform:uppercase}
+.fns td{padding:5px 8px 5px 0;border-bottom:1px solid var(--line);vertical-align:top}
+.fns td:first-child{font-family:var(--mono);white-space:nowrap;font-variant-numeric:tabular-nums}
+.fns td:last-child{color:var(--muted)}
+.tablewrap{overflow-x:auto}
+
+/* search results */
+.results{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:4px}
+.results li button{width:100%;text-align:left;padding:6px 8px;border:1px solid var(--line);border-radius:5px;background:var(--panel);font-family:var(--mono);font-size:12.5px;display:flex;justify-content:space-between;gap:10px}
+.results li button:hover{border-color:var(--ink)}
+.results li button span{color:var(--muted);font-family:var(--sans);font-size:12px}
+footer{padding:14px 28px 26px;color:var(--muted);border-top:1px solid var(--line);font-size:12.5px}
+footer code{font-size:11.5px}
+@media (prefers-reduced-motion: no-preference){.chip,.results li button,.step .file button{transition:border-color .12s}}
+</style>
+
+<header>
+  <div class="eyebrow">python_code_entire_igor_w_GUI · generated from the source</div>
+  <h1>Which file calls what</h1>
+  <p>Every <code>.py</code> in the folder, and every call from a function in one file to a function in another — extracted by parsing the code, not written by hand. Click a file to see what it calls and who calls it; follow a button click or a break-junction trace top to bottom; or search for a function.</p>
+</header>
+
+<div class="toolbar">
+  <label class="search"><span class="eyebrow" style="font-size:10px">Find</span><input id="q" type="search" placeholder="a file, a function, a class… e.g. find_suppress, Rig.play, storage" autocomplete="off"></label>
+  <div class="tabs" role="tablist" aria-label="View">
+    <button role="tab" aria-selected="true" data-view="map">Layer map</button>
+    <button role="tab" aria-selected="false" data-view="click">One click</button>
+    <button role="tab" aria-selected="false" data-view="trace">One trace</button>
+  </div>
+  <div class="stat" id="stat"></div>
+</div>
+
+<main>
+  <section class="left">
+    <div id="view-map">
+      <p class="legend">Five layers, top to bottom. A file only ever calls into the layers below it. Click a file.</p>
+      <div id="layers"></div>
+    </div>
+    <div id="view-click" class="hidden">
+      <p class="path-intro">Press <strong>Find Suppress</strong> on the panel. The same route serves every button; only the worker-thread <code>_impl</code> and the recipe file change.</p>
+      <div class="path" id="path-click"></div>
+    </div>
+    <div id="view-trace" class="hidden">
+      <p class="path-intro"><code>python run.py constant_bias --simulate -n 100</code>, or Start Measurement in constant mode. The GUI's <code>_measure_impl</code> takes the same steps with its own loop.</p>
+      <div class="path" id="path-trace"></div>
+    </div>
+  </section>
+  <section class="right">
+    <div id="results-wrap" class="hidden">
+      <h4 class="eyebrow" style="margin:0 0 8px">Matches</h4>
+      <ul class="results" id="results"></ul>
+    </div>
+    <div class="detail" id="detail"></div>
+  </section>
+</main>
+<footer>Generated by <code>manual_build/gen_structure.py</code> (Python <code>ast</code>): <span id="foot"></span>. Same data as chapter 05 of <code>STMLAB_GUI_Manual.pdf</code>. Calls into numpy, h5py, Tk and the standard library are not shown; calls within one file are not shown. Regenerate after editing code.</footer>
+
+<script>
+const G = /*GRAPH_JSON*/{"modules":[],"edges":[],"click_flow":[],"trace_flow":[]}/*END*/;
+
+const LAYER_KEY = {"Entry points":"entry","The GUI (stmgui)":"gui","Recipes (stmlab)":"recipes","The rig (stmlab)":"rig","Card and instruments":"card"};
+const LAYER_ORDER = ["Entry points","The GUI (stmgui)","Recipes (stmlab)","The rig (stmlab)","Card and instruments"];
+const byRel = {}; G.modules.forEach(m => byRel[m.rel] = m);
+const files = G.modules.filter(m => !m.rel.endsWith("__init__.py"));
+
+// index edges
+const callsFrom = {}, callsTo = {};
+for (const e of G.edges) {
+  (callsFrom[e.from] ||= []).push(e);
+  (callsTo[e.to] ||= []).push(e);
+}
+function displayGroup(rel){
+  if (rel.startsWith("experiments/")) return "experiments";
+  return rel;
+}
+function baseName(rel){ return rel.replace(/^stmlab\//,"").replace(/^stmgui\//,""); }
+
+// ---- layer map ----------------------------------------------------------
+function buildLayers(){
+  const root = document.getElementById("layers");
+  root.innerHTML = "";
+  for (const L of LAYER_ORDER){
+    const key = LAYER_KEY[L];
+    const div = document.createElement("div"); div.className = "layer "+key;
+    const h = document.createElement("h3"); h.textContent = L; div.appendChild(h);
+    const chips = document.createElement("div"); chips.className = "chips";
+    let items = files.filter(m => m.layer === L);
+    // collapse experiments into one chip + individual ones after
+    const exps = items.filter(m => m.rel.startsWith("experiments/"));
+    items = items.filter(m => !m.rel.startsWith("experiments/"));
+    const order = ["gui.py","run.py","stmlab/main.py","stmgui/app.py","stmgui/controller.py","stmgui/state.py","stmgui/widgets.py","stmgui/graphs.py"];
+    items.sort((a,b)=> (order.indexOf(a.rel)+1||99) - (order.indexOf(b.rel)+1||99) || a.rel.localeCompare(b.rel));
+    for (const m of items) chips.appendChild(chip(m.rel, key, m.rel.startsWith("stmgui/")? m.rel : (m.layer==="Entry points"? m.rel : baseName(m.rel)), m.purpose));
+    for (const m of exps) chips.appendChild(chip(m.rel, key, m.rel.replace("experiments/","exp/").replace("/run_experiment.py",""), m.purpose));
+    if (L === "Card and instruments"){
+      const ext = document.createElement("span"); ext.className="chip"; ext.style.opacity=".7";
+      ext.innerHTML = '<span class="dot card"></span>nidaqmx · pyvisa · pyserial';
+      ext.title = "Driver libraries; only daq.py, keithley.py, actuator.py, echem.py and xpiezo.py import them";
+      chips.appendChild(ext);
+    }
+    div.appendChild(chips); root.appendChild(div);
+  }
+}
+function chip(rel, key, label, title){
+  const b = document.createElement("button"); b.className="chip"; b.dataset.rel = rel; b.title = title || rel;
+  b.setAttribute("aria-pressed","false");
+  b.innerHTML = '<span class="dot '+key+'"></span>' + escapeHtml(label);
+  b.addEventListener("click", ()=> select(rel));
+  return b;
+}
+function escapeHtml(s){ return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+// ---- paths ------------------------------------------------------------
+function buildPath(id, steps){
+  const root = document.getElementById(id); root.innerHTML="";
+  steps.forEach(([file, what]) => {
+    const s = document.createElement("div"); s.className="step";
+    const f = document.createElement("div"); f.className="file";
+    const files_ = file.split("|").map(x=>x.trim());
+    files_.forEach((fn,i)=>{
+      const b = document.createElement("button"); b.textContent = fn;
+      const target = byRel[fn] ? fn : null;
+      if (target) b.addEventListener("click", ()=>{ select(target); });
+      else b.disabled = true;
+      f.appendChild(b); if (i < files_.length-1) f.appendChild(document.createTextNode(" "));
+    });
+    const w = document.createElement("div"); w.className="what"; w.textContent = what;
+    s.appendChild(f); s.appendChild(w); root.appendChild(s);
+  });
+}
+
+// ---- detail -----------------------------------------------------------
+let selected = null;
+function select(rel, hilite){
+  selected = rel;
+  document.querySelectorAll(".chip[data-rel]").forEach(c => c.setAttribute("aria-pressed", c.dataset.rel===rel ? "true":"false"));
+  // dim chips not connected
+  const nbrs = new Set([rel]);
+  (callsFrom[rel]||[]).forEach(e=>nbrs.add(e.to)); (callsTo[rel]||[]).forEach(e=>nbrs.add(e.from));
+  document.querySelectorAll(".chip[data-rel]").forEach(c => c.classList.toggle("dim", !nbrs.has(c.dataset.rel)));
+  renderDetail(rel, hilite);
+  const d = document.getElementById("detail"); if (window.innerWidth < 900) d.scrollIntoView({behavior:"smooth", block:"start"});
+}
+function renderDetail(rel, hilite){
+  const m = byRel[rel]; const d = document.getElementById("detail");
+  if (!m){ d.innerHTML = '<p class="empty">Unknown file.</p>'; return; }
+  const out = [];
+  out.push('<div class="eyebrow">'+escapeHtml(m.layer)+'</div>');
+  out.push('<h2>'+escapeHtml(m.rel)+'</h2>');
+  out.push('<div class="meta"><span>'+m.lines+' lines</span><span>'+ (m.functions.length) +' functions</span><span>'+Object.keys(m.classes).length+' classes</span></div>');
+  out.push('<p class="purpose">'+escapeHtml(m.purpose||m.doc||"")+'</p>');
+  out.push('<div class="hood">'+neighborhoodSvg(rel)+'</div>');
+
+  // calls into other files
+  const outs = callsFrom[rel]||[];
+  out.push('<div class="section"><h4>Calls into other files</h4>');
+  if (!outs.length) out.push('<p class="empty">Nothing in another file of this package — a leaf.</p>');
+  else {
+    const byTarget = {};
+    outs.forEach(e => (byTarget[e.to] ||= []).push(e));
+    Object.keys(byTarget).sort().forEach(t => {
+      const es = byTarget[t]; const syms = {};
+      es.forEach(e => (syms[e.symbol] ||= new Set()).add(e.def));
+      out.push('<div class="group"><div class="target"><button data-go="'+escapeHtml(t)+'">'+escapeHtml(t)+'</button><span class="count">'+Object.keys(syms).length+' function'+(Object.keys(syms).length===1?'':'s')+'</span></div><div class="syms">');
+      Object.keys(syms).sort().forEach(s => {
+        const from = [...syms[s]].sort().join(", ");
+        const hit = hilite && (s.toLowerCase().includes(hilite) ) ? " hit":"";
+        out.push('<span class="sym'+hit+'">'+escapeHtml(s)+'<small>from '+escapeHtml(from)+'</small></span>');
+      });
+      out.push('</div></div>');
+    });
+  }
+  out.push('</div>');
+
+  // called by
+  const ins = callsTo[rel]||[];
+  out.push('<div class="section"><h4>Called by</h4>');
+  if (!ins.length) out.push('<p class="empty">Nothing in this package calls it — an entry point (or a file only the user runs).</p>');
+  else {
+    const bySrc = {};
+    ins.forEach(e => (bySrc[e.from] ||= []).push(e));
+    Object.keys(bySrc).sort().forEach(src => {
+      const es = bySrc[src]; const syms = {};
+      es.forEach(e => (syms[e.symbol] ||= new Set()).add(e.def));
+      out.push('<div class="group"><div class="target"><button data-go="'+escapeHtml(src)+'">'+escapeHtml(src)+'</button><span class="count">'+Object.keys(syms).length+' of its function'+(Object.keys(syms).length===1?'':'s')+'</span></div><div class="syms">');
+      Object.keys(syms).sort().forEach(s => {
+        const from = [...syms[s]].sort().join(", ");
+        const hit = hilite && s.toLowerCase().includes(hilite) ? " hit":"";
+        out.push('<span class="sym'+hit+'">'+escapeHtml(s)+'<small>from '+escapeHtml(src.split("/").pop())+': '+escapeHtml(from)+'</small></span>');
+      });
+      out.push('</div></div>');
+    });
+  }
+  out.push('</div>');
+
+  // functions defined
+  const defs = [];
+  m.functions.forEach(f => defs.push([f.name, f.line]));
+  Object.entries(m.classes).forEach(([c, ms]) => ms.forEach(f => defs.push([c+"."+f.name, f.line])));
+  defs.sort((a,b)=>a[1]-b[1]);
+  out.push('<div class="section"><h4>Defined here</h4><div class="tablewrap"><table class="fns"><thead><tr><th>Function</th><th>Line</th><th>Calls into</th></tr></thead><tbody>');
+  const outsByDef = {}; outs.forEach(e => (outsByDef[e.def] ||= []).push(e.to.split("/").pop()+": "+e.symbol));
+  defs.forEach(([n, ln]) => {
+    const hit = hilite && n.toLowerCase().includes(hilite);
+    const calls = [...new Set(outsByDef[n]||[])].sort().join("; ");
+    out.push('<tr'+(hit?' style="outline:2px solid var(--focus)"':'')+'><td>'+escapeHtml(n)+'</td><td>'+ln+'</td><td>'+escapeHtml(calls)+'</td></tr>');
+  });
+  out.push('</tbody></table></div><p class="empty" style="margin:8px 0 0">Open it: <code>less -N +'+(defs[0]?defs[0][1]:1)+' '+escapeHtml(rel)+'</code></p></div>');
+  d.innerHTML = out.join("");
+  d.querySelectorAll("button[data-go]").forEach(b => b.addEventListener("click", ()=> select(b.dataset.go)));
+}
+
+function neighborhoodSvg(rel){
+  const ins = [...new Set((callsTo[rel]||[]).map(e=>e.from))].sort();
+  const outs = [...new Set((callsFrom[rel]||[]).map(e=>e.to))].sort();
+  const W = 720, rowH = 34, boxW = 150, boxH = 24, gapY = 46;
+  const rows = [ins, [rel], outs];
+  const H = 3*boxH + 2*gapY + 40;
+  let s = '<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="callers above, this file, callees below">';
+  const pos = [];
+  rows.forEach((row, r) => {
+    const y = 14 + r*(boxH+gapY);
+    const n = Math.max(row.length,1);
+    const maxPer = Math.floor(W/(boxW+8));
+    const shown = row.slice(0, maxPer);
+    const total = shown.length*boxW + (shown.length-1)*8;
+    let x0 = (W-total)/2;
+    const placed = {};
+    shown.forEach((f, i) => {
+      const x = x0 + i*(boxW+8);
+      placed[f] = [x+boxW/2, y, y+boxH];
+      const me = f===rel;
+      const label = f.replace("experiments/","exp/").replace("/run_experiment.py","");
+      s += '<rect class="box'+(me?' me':'')+'" x="'+x+'" y="'+y+'" width="'+boxW+'" height="'+boxH+'" rx="4"></rect>';
+      s += '<text x="'+(x+boxW/2)+'" y="'+(y+boxH/2+4)+'" text-anchor="middle">'+escapeHtml(label.length>22?label.slice(0,21)+"…":label)+'</text>';
+    });
+    if (row.length > shown.length) s += '<text class="lab" x="'+(W-4)+'" y="'+(y+boxH/2+4)+'" text-anchor="end">+'+(row.length-shown.length)+' more</text>';
+    pos.push(placed);
+  });
+  const mid = pos[1][rel];
+  if (mid){
+    Object.values(pos[0]).forEach(([x,y0,y1]) => s += '<path class="edge" d="M'+x+','+y1+' C'+x+','+(y1+20)+' '+mid[0]+','+(mid[1]-20)+' '+mid[0]+','+mid[1]+'"></path>');
+    Object.values(pos[2]).forEach(([x,y0,y1]) => s += '<path class="edge" d="M'+mid[0]+','+mid[2]+' C'+mid[0]+','+(mid[2]+20)+' '+x+','+(y0-20)+' '+x+','+y0+'"></path>');
+  }
+  s += '<text class="lab" x="4" y="'+(14+boxH/2+4)+'">called by</text>';
+  s += '<text class="lab" x="4" y="'+(14+2*(boxH+gapY)+boxH/2+4)+'">calls into</text>';
+  if (!ins.length) s += '<text class="lab" x="'+(W/2)+'" y="'+(14+boxH/2+4)+'" text-anchor="middle">— nothing in this package; an entry point —</text>';
+  if (!outs.length) s += '<text class="lab" x="'+(W/2)+'" y="'+(14+2*(boxH+gapY)+boxH/2+4)+'" text-anchor="middle">— nothing; a leaf —</text>';
+  return s + '</svg>';
+}
+
+// ---- search -----------------------------------------------------------
+const q = document.getElementById("q");
+q.addEventListener("input", ()=> search(q.value.trim().toLowerCase()));
+function search(term){
+  const wrap = document.getElementById("results-wrap"), ul = document.getElementById("results");
+  if (!term){ wrap.classList.add("hidden"); ul.innerHTML=""; document.querySelectorAll(".chip[data-rel]").forEach(c=>c.classList.remove("dim")); if (selected) select(selected); return; }
+  const hits = [];
+  for (const m of files){
+    if (m.rel.toLowerCase().includes(term)) hits.push({label:m.rel, note:"file", rel:m.rel});
+    m.functions.forEach(f => { if (f.name.toLowerCase().includes(term)) hits.push({label:f.name+"()", note:m.rel+":"+f.line, rel:m.rel}); });
+    Object.entries(m.classes).forEach(([c,ms]) => {
+      if (c.toLowerCase().includes(term)) hits.push({label:c, note:m.rel, rel:m.rel});
+      ms.forEach(f => { if ((c+"."+f.name).toLowerCase().includes(term)) hits.push({label:c+"."+f.name+"()", note:m.rel+":"+f.line, rel:m.rel}); });
+    });
+  }
+  const seen = new Set(); const uniq = hits.filter(h => { const k=h.label+h.note; if (seen.has(k)) return false; seen.add(k); return true; }).slice(0,40);
+  ul.innerHTML = "";
+  if (!uniq.length){ ul.innerHTML = '<li class="empty">No file, function or class matches.</li>'; }
+  uniq.forEach(h => {
+    const li = document.createElement("li"); const b = document.createElement("button");
+    b.innerHTML = escapeHtml(h.label)+'<span>'+escapeHtml(h.note)+'</span>';
+    b.addEventListener("click", ()=>{ select(h.rel, term); });
+    li.appendChild(b); ul.appendChild(li);
+  });
+  wrap.classList.remove("hidden");
+  const rels = new Set(uniq.map(h=>h.rel));
+  document.querySelectorAll(".chip[data-rel]").forEach(c => c.classList.toggle("dim", !rels.has(c.dataset.rel)));
+}
+
+// ---- tabs -------------------------------------------------------------
+document.querySelectorAll('.tabs [role="tab"]').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.tabs [role="tab"]').forEach(x => x.setAttribute("aria-selected", x===t ? "true":"false"));
+  ["map","click","trace"].forEach(v => document.getElementById("view-"+v).classList.toggle("hidden", v!==t.dataset.view));
+  try { localStorage.setItem("stmlab-map-view", t.dataset.view); } catch(e){}
+});
+
+// ---- boot -------------------------------------------------------------
+buildLayers();
+buildPath("path-click", G.click_flow);
+buildPath("path-trace", G.trace_flow);
+document.getElementById("stat").textContent = files.length+" files · "+G.edges.length+" cross-file calls";
+document.getElementById("foot").textContent = files.length+" files, "+G.edges.length+" cross-file calls";
+let startView = "map"; try { startView = localStorage.getItem("stmlab-map-view") || "map"; } catch(e){}
+const tabBtn = document.querySelector('.tabs [data-view="'+startView+'"]'); if (tabBtn) tabBtn.onclick();
+select("stmgui/controller.py");
+</script>

@@ -1,0 +1,67 @@
+\begin{titlepage}
+\vspace*{28mm}
+{\Huge\bfseries\color{accent} stmlab + stmgui\par}
+\vspace{4mm}
+{\Large The complete Igor STM setup in Python, with its panels\par}
+\vspace{14mm}
+\rule{\linewidth}{0.6pt}
+\vspace{4mm}
+
+{\large Igor's three panels, nine graph windows and two macros, rebuilt on
+top of the eight translated experiments --- and the reasoning behind every
+control, every file, and every deviation from the original.\par}
+
+\vspace{4mm}
+\rule{\linewidth}{0.6pt}
+
+\vspace{18mm}
+\begin{keybox}
+\textbf{Read this first.} This manual has three parts.
+
+\textbf{Chapter 05, the structure map}, comes first and stands alone: the
+whole code on a few pages --- what every file is, which file calls which
+function in which other file (extracted from the source, not written), one
+button click followed top to bottom, and one break-junction trace. Read it
+before anything else; return to it whenever a chapter loses you.
+
+\textbf{Part I, the GUI} (chapters 40--51), is new to this folder. Chapter 40
+is the tour; chapter 41 is the lab flow you know from Igor, button by
+button --- Start Writing, Approach, Find Offset, Find Suppress, Start
+Measurement --- and is the one to read before the first run. Chapters
+42--45 are the panels and the graphs, control by control. Chapter 47 is
+what gets written to disk. Chapter 48 is how the code is built, for the day
+something needs changing. Chapters 50--51 are the quick reference and the
+complete binding table: every Igor global and where it lives now.
+
+\textbf{Part II, the core} (chapters 00--30), is the stmlab manual: the
+platform, one chapter per experiment, the support systems and the
+command-line quick reference. It is unchanged from
+\texttt{STMLAB\_Manual.pdf}; the GUI calls exactly this code. Chapter
+numbers in print are the file numbers in \texttt{manual/}, which is why
+they are not consecutive.
+
+\medskip
+Everything runs against a simulated junction with \texttt{-{}-simulate}.
+Every figure in Part I was produced by the GUI itself, on the simulator.
+\end{keybox}
+
+\vfill
+\begin{warnbox}\small
+\textbf{Trust order.} The constant-bias path carries the reference tests and
+the 1~\G{} self-check on the simulator. The four ramp modes, both campaigns
+and the support modules are tested end to end on the simulator, through the
+GUI as well as the command line. Every \texttt{nidaqmx} call, the Keithley
+over GPIB, the second card and the electrochemical cell have \textbf{never
+met their instruments}. The GUI changes none of this: it calls the same
+functions, and is exactly as trustworthy as they are.
+
+Simulate first. Scope second. Tip last.
+\end{warnbox}
+
+\vspace{4mm}
+{\small \texttt{python\_code\_entire\_igor\_w\_GUI/}\quad$\cdot$\quad
+3 panels, 9 graphs, 8 experiments\quad$\cdot$\quad 121 tests\quad$\cdot$\quad
+translated from \texttt{igor\_code/}}
+\end{titlepage}
+
+\tableofcontents

@@ -1,0 +1,111 @@
+\documentclass[11pt,a4paper]{report}
+
+\usepackage{fontspec}
+\usepackage{geometry}
+\geometry{a4paper, margin=25mm, top=25mm, bottom=28mm}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage[most]{tcolorbox}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{microtype}
+
+
+\setmainfont{Palatino}
+\setmonofont{Menlo}[Scale=0.82]
+
+\definecolor{ink}{HTML}{1A1A1A}
+\definecolor{accent}{HTML}{8C3A10}
+\definecolor{rule}{HTML}{B0AAA0}
+\definecolor{panel}{HTML}{F4F1EA}
+\definecolor{warnbg}{HTML}{FBEEE8}
+\definecolor{warnrule}{HTML}{B5451B}
+\definecolor{codebg}{HTML}{F7F5F0}
+
+\color{ink}
+
+\hypersetup{colorlinks=true, linkcolor=accent, urlcolor=accent,
+            pdftitle={stmlab + stmgui: the complete Igor STM setup in Python, with its panels}, pdfauthor={}}
+
+\lstdefinestyle{py}{
+  basicstyle=\ttfamily\footnotesize\color{ink},
+  keywordstyle=\color{accent}\bfseries,
+  commentstyle=\color{gray}\itshape,
+  stringstyle=\color{teal},
+  showstringspaces=false,
+  breaklines=true,
+  breakatwhitespace=true,
+  columns=fullflexible,
+  keepspaces=true,
+  backgroundcolor=\color{codebg},
+  frame=none,
+  xleftmargin=8pt,
+  framexleftmargin=8pt,
+  framexrightmargin=4pt,
+  framextopmargin=4pt,
+  framexbottommargin=4pt,
+  aboveskip=8pt,
+  belowskip=8pt,
+  language=Python,
+  literate={-}{{-}}1 {>}{{>}}1 {<}{{<}}1,
+}
+\lstdefinestyle{out}{
+  basicstyle=\ttfamily\scriptsize\color{ink!85},
+  breaklines=true,
+  breakatwhitespace=false,
+  breakindent=14pt,
+  postbreak=\mbox{\textcolor{accent}{$\hookrightarrow$}\space},
+  columns=fullflexible,
+  keepspaces=true,
+  backgroundcolor=\color{panel},
+  frame=none,
+  xleftmargin=8pt,
+  framexleftmargin=8pt,
+  framexrightmargin=4pt,
+  framextopmargin=4pt,
+  framexbottommargin=4pt,
+  aboveskip=8pt,
+  belowskip=8pt,
+  language=,
+}
+\lstset{style=py}
+
+\titleformat{\chapter}[display]
+  {\normalfont\Large\bfseries\color{accent}}
+  {\filright\normalsize\bfseries\MakeUppercase{\chaptertitlename\ \thechapter}}
+  {6pt}{\Huge\filright}
+\titlespacing*{\chapter}{0pt}{0pt}{28pt}
+
+\titleformat{\section}{\normalfont\large\bfseries\color{accent}}{\thesection}{0.8em}{}
+\titleformat{\subsection}{\normalfont\bfseries}{\thesubsection}{0.8em}{}
+
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancyhead[L]{\footnotesize\itshape\nouppercase{\leftmark}}
+\fancyhead[R]{\footnotesize\thepage}
+
+\newtcolorbox{keybox}[1][]{
+  enhanced, breakable, colback=panel, colframe=rule,
+  boxrule=0pt, leftrule=2.5pt, arc=0pt, left=8pt, right=8pt,
+  top=6pt, bottom=6pt, #1}
+
+\newtcolorbox{warnbox}[1][]{
+  enhanced, breakable, colback=warnbg, colframe=warnrule,
+  boxrule=0pt, leftrule=2.5pt, arc=0pt, left=8pt, right=8pt,
+  top=6pt, bottom=6pt, #1}
+
+\newcommand{\run}[1]{\vspace{2pt}\noindent\colorbox{panel}{\parbox{\dimexpr\linewidth-2\fboxsep}{\ttfamily\small #1}}\vspace{3pt}}
+
+\newcommand{\G}{$G_0$}
+\setlength{\parskip}{5pt}
+\setlength{\parindent}{0pt}
+% Prefer loose lines over hyphenated file names or overfull boxes.
+\sloppy
+\setlength{\emergencystretch}{3.5em}
