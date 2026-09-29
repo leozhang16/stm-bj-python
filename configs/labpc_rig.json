@@ -1,0 +1,125 @@
+{
+  "channels": {
+    "device": "dev1",
+    "ao_piezo": "ao0",
+    "ao_bias": "ao1",
+    "ai_voltage": "ai0",
+    "ai_current": "ai1",
+    "ai_range_v": 10.0,
+    "bias_ao_range_v": 2.5,
+    "expected_product_type": "PXI-4461",
+    "low_res_device": null
+  },
+  "limits": {
+    "piezo_ao_min_v": 0.0,
+    "piezo_ao_max_v": 10.0,
+    "bias_max_v": 0.5,
+    "preamp_saturation_v": 9.5,
+    "max_coarse_steps": 2000,
+    "coarse_step_max_piezo_v": 0.1
+  },
+  "ramp": {
+    "sample_rate_hz": 40000.0,
+    "pull_length_nm": 5.0,
+    "pull_rate_nm_per_s": 20.0,
+    "bias_v": 0.1,
+    "engage_g0": 0.5,
+    "break_g0": 0.0005,
+    "approach_step_nm": 0.5,
+    "retract_step_nm": 5.0,
+    "settle_samples": 1000,
+    "settle_discard": 800,
+    "pre_pad_samples": 400,
+    "post_pad_samples": 400,
+    "spike_front_ms": 7.5,
+    "spike_back_ms": 2.5,
+    "smash_every": 50,
+    "smash_in_nm": 30.0,
+    "smash_out_nm": -40.0,
+    "traces_target": 1000,
+    "max_attempts": 100000,
+    "piezo_park_v": 0.0,
+    "piezo_headroom_v": 0.02
+  },
+  "cal": {
+    "preamp_gain_v_per_a": 1000000.0,
+    "current_zero_v": 0.0,
+    "piezo_nm_per_volt": 62.0,
+    "hv_amp_gain": null,
+    "bias_output_sign": -1.0,
+    "voltage_input_sign": -1.0,
+    "ai_gain_error": 1.0,
+    "ai_offset_v": 0.0,
+    "granted_sample_rate_hz": null,
+    "group_delay_samples": null
+  },
+  "actuator": {
+    "kind": "none",
+    "port": "COM1",
+    "baud": 19200,
+    "step_size": 5,
+    "settle_s": 0.1,
+    "stop_current_ua": 0.1
+  },
+  "push_pull": {
+    "initial_pull_nm": 1.0,
+    "push_pull_nm": 1.5,
+    "hold_nm": 1.0,
+    "final_pull_nm": 4.0,
+    "cycles": 2
+  },
+  "iv": {
+    "init_pull_nm": 3.0,
+    "final_pull_nm": 4.0,
+    "cap_nm": 0.5,
+    "ramp_nm": 2.0,
+    "max_bias_v": 1.0,
+    "positive_first": false
+  },
+  "ac_hold": {
+    "init_pull_nm": 3.0,
+    "final_pull_nm": 4.0,
+    "hold_nm": 3.0,
+    "cap_nm": 0.5,
+    "amp_v": 0.8,
+    "freq_khz": 10.0
+  },
+  "hb_hold": {
+    "init_pull_nm": 3.0,
+    "final_pull_nm": 4.0,
+    "hold_nm": 3.0,
+    "cap_in_nm": 0.1,
+    "cap_fin_nm": 0.1,
+    "hold_bias_v": 0.8
+  },
+  "vzero": {
+    "interval_mv": 5.0,
+    "n_points": 5,
+    "every_n_traces": 50,
+    "settle_s": 0.05
+  },
+  "keithley": {
+    "resource": "GPIB0::22::INSTR",
+    "gain_exponent": 6,
+    "suppress_const": 0.0,
+    "series_resistance_ohm": 106130.0,
+    "enabled": false
+  },
+  "echem": {
+    "counter_electrode_channel": "ao1",
+    "gate_mv": 0.0,
+    "cv_rate_hz": 1000.0,
+    "scan_rate_mv_per_s": 100.0,
+    "peak_one_v": -1.0,
+    "peak_two_v": 1.0,
+    "cycles": 1
+  },
+  "xpiezo": {
+    "channel": "ao0",
+    "nm_per_volt": 522.0,
+    "min_v": 0.0,
+    "max_v": 10.0
+  },
+  "simulate": false,
+  "notes": ""
+}
