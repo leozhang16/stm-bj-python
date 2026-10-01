@@ -8,7 +8,7 @@
     "ai_range_v": 10.0,
     "bias_ao_range_v": 2.5,
     "expected_product_type": "PXI-4461",
-    "low_res_device": null
+    "low_res_device": "dev2"
   },
   "limits": {
     "piezo_ao_min_v": 0.0,
