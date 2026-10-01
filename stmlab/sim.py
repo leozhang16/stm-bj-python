@@ -64,6 +64,11 @@ class SimulatedDaqSession:
         self._mol_len_nm = 0.0
         self._tip_quality = 1.0
 
+        # Piezo sense readback of the last play, like DaqSession.last_sense_v:
+        # (n,) volts on a two-card config, None on a one-card one.
+        self.last_sense_v: np.ndarray | None = None
+        self.sense_sync = "hardware" if cfg.channels.has_piezo_sense else "none"
+
     # -- interface --------------------------------------------------------
 
     def configure(self, n_samples: int) -> None:
@@ -112,6 +117,18 @@ class SimulatedDaqSession:
         current_v += self.rng.normal(0.0, self.noise_v_rms, current_v.shape)
         voltage_v = bias_v + self.rng.normal(0.0, self.noise_v_rms * 4,
                                              bias_v.shape)
+
+        if self.cfg.channels.has_piezo_sense:
+            # The driver box's monitor output follows the command: the same
+            # displacement, expressed in the sense line's own volts-per-nm,
+            # seen with the same delay as the other inputs, plus a little
+            # noise from the low-res card.
+            sense_v = (piezo_v * cal.piezo_nm_per_volt / cal.sense_nm_per_volt
+                       + self.rng.normal(0.0, 2e-4, piezo_v.shape))
+            lim = self.cfg.channels.sense_ai_range_v
+            self.last_sense_v = np.clip(sense_v, -lim, lim)
+        else:
+            self.last_sense_v = None
 
         limit = self.cfg.channels.ai_range_v
         return np.clip(np.stack([voltage_v, current_v]), -limit, limit)

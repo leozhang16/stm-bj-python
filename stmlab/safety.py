@@ -159,6 +159,24 @@ def verify_devices(cfg: RigConfig) -> None:
                 f"4461's pinout, and driving the piezo ramp into a preamp "
                 f"input destroys the preamp.")
 
+    # The second card, when configured. With two cards the alias-swap hazard
+    # is real: NI MAX renumbers devices when cards change slots.
+    low_res = cfg.channels.low_res_device
+    if low_res:
+        if low_res not in names:
+            raise SafetyViolation(
+                f"low-res device {low_res!r} not found. Present: "
+                f"{', '.join(names) or '(none)'}. Set channels.low_res_device "
+                f"to null for a one-card rig, or fix the alias in NI MAX.")
+        expected = cfg.channels.low_res_expected_product_type
+        if expected:
+            actual = system.devices[low_res].product_type
+            if expected.lower().replace("-", "") not in \
+                    actual.lower().replace("-", ""):
+                raise SafetyViolation(
+                    f"low-res device {low_res!r} is a {actual!r}, expected "
+                    f"{expected!r}. The two cards' aliases may be swapped.")
+
 
 def park_all_outputs(cfg: RigConfig) -> None:
     """Drive every output to its safe value, using short-lived tasks.

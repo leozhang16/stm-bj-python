@@ -416,10 +416,14 @@ class RigController:
             "current_ua": current_ua, "junction_mv": junction_mv,
             "piezo_v": rig.piezo_v,
             "beep": abs(current_ua) > self.opts.beep_current_ua})
+        if rig.last_sense_v is not None and rig.last_sense_v.size == n:
+            piezo_nm = C.sense_volts_to_nm(rig.last_sense_v)   # readback
+        else:
+            piezo_nm = np.full(n, rig.piezo_nm)                  # commanded
         self._emit("highres", {
             "voltage_mv": C.voltage_input_sign * v * 1e3,
             "current_ua": C.volts_to_amps(i) * 1e6,
-            "piezo_nm": np.full(n, rig.piezo_nm)})
+            "piezo_nm": piezo_nm})
 
     # ------------------------------------------------------------------
     # Piezo controls
@@ -787,7 +791,12 @@ class RigController:
                 M = cfg.channels
                 piezo_cmd = ramp.waveform[M.ROW_PIEZO,
                                           ramp.pre_pad:ramp.pre_pad + ramp.n_pull]
-                piezo_nm = cfg.cal.piezo_volts_to_nm(piezo_cmd)
+                # SenseInDisplay: Igor's SenseIn was the readback from the
+                # low-res card. Show that when the rig has one, otherwise the
+                # commanded trajectory.
+                sense_nm = record.piezo_sense_nm(cfg)
+                piezo_nm = (sense_nm if sense_nm is not None
+                            else cfg.cal.piezo_volts_to_nm(piezo_cmd))
                 disp_nm = cfg.cal.piezo_volts_to_nm(ramp.start_piezo_v
                                                     - piezo_cmd)
                 bias_mv = cfg.cal.voltage_input_sign * record.voltage_v * 1e3

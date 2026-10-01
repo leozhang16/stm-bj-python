@@ -15,7 +15,7 @@ Bool rows are checkboxes. Rows with no limits are display-only or unbounded, as 
 | `G_FastReadWaveSize` | Fast Read Wave Size | `opts.fast_read_wave_size` | int | 25, 2000, 0 | 200 |
 | `G_HighResOutputRange` | HighRes Output Range (V) | `cfg.channels.bias_ao_range_v` | float | 0, 10, 0 | 2.5 |
 | `K_ZPiezoScale` | Z piezo scale (nm/V) | `cfg.cal.piezo_nm_per_volt` | float |  | 62 |
-| `K_SenseScale` | Z Sense scale (nm/V) | `opts.sense_scale_nm_per_v` | float |  | 314 |
+| `K_SenseScale` | Z Sense scale (nm/V) | `cfg.cal.sense_nm_per_volt` | float |  | 314 |
 | `G_PiezoOffset_nm` | Piezo offset (nm) | `opts.piezo_offset_nm` | float | 0, 620, 0 | 0 |
 
 ## Inputs tab

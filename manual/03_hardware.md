@@ -39,7 +39,7 @@ means every feature that needs it **refuses cleanly** instead of guessing:
 | Lateral X piezo (experiment 07) | `<dev2>/ao0`, 0-10 V, 522 nm/V (`K_XPiezoScale`, Setup1_STMBJ.ipf:40) | `XPiezoError: no low-res device configured` (xpiezo.py `setup`) |
 | EChem counter electrode / gate | `<dev2>/ao1`, +/-5 V (Igor `MXCreateAOVoltageChan(-5,5)`) | `EChemError: no low-res device configured` (echem.py `CounterElectrode.on`) |
 | Low-res CV (`run_cv(kind="lowres")`) | Same counter-electrode channel, driven +/-10 V as Igor did | `EChemError: lowres CV needs channels.low_res_device` |
-| Piezo sense readback | Igor read the driver's output voltage back and stored it as POExtension | Not translated: with one card the displacement axis is the commanded trajectory (analysis.py `displacement_nm`); the piezo is open-loop either way |
+| Piezo sense readback | `<dev2>/ai2` (`channels.ai_piezo_sense`), the driver box's monitor output; Igor's SenseIn / POExtension, 314 nm/V (`K_SenseScale`, `cal.sense_nm_per_volt`) | Silently absent: `Rig.last_sense_v` and `TraceRecord.piezo_sense_v` are `None`, the data file has no `piezo_sense_v` dataset, and SenseInDisplay shows the commanded trajectory. With the second card it is read in its own task during every play, triggered off `/<dev1>/ao/StartTrigger`, and stored as raw volts beside the record. The displacement axis stays the commanded trajectory either way (analysis.py `displacement_nm`); the readback is for checking the piezo, not for the histogram |
 
 The high-res CV needs **no** second card -- it drives Dev1/ao1, the
 junction-bias channel, with the tip as working electrode. That is exactly why

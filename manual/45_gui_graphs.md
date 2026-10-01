@@ -109,13 +109,15 @@ own waveform is.
 **Igor:** `SenseInDisplay()`, line 100 — `SenseIn`, the piezo position in
 nm read back from the low-res card's sense input, against points.
 
-**Now:** the *commanded* piezo position in nm for the last trace, against
-sample number. This rig has one card and no sense line; the number shown
-is the same tracked command every safety check trusts. A straight
+**Now:** on a two-card rig (`channels.low_res_device` set), the piezo
+position *read back* on the sense line for the last trace, in nm
+(`TraceRecord.piezo_sense_v` × `cal.sense_nm_per_volt`), against sample
+number -- Igor's SenseIn. On a one-card rig, the *commanded* position
+instead, the same tracked command every safety check trusts. A straight
 descending line is a constant pull; a push-pull cycle shows its
-excursions; a hold shows a flat section. If you ever add a sense input,
-`Rig.play` returns the record and this window is where the readback
-belongs.
+excursions; a hold shows a flat section. With the readback, a lag or a
+rounded corner at the turn-around is the piezo and its driver, not the
+code.
 
 !FIG[figures/gui/SenseInDisplay.png]{SenseInDisplay for a constant pull: the commanded piezo descending at 20 nm/s from the contact point, 10 000 points at 40 kHz for a 5 nm excursion.}
 

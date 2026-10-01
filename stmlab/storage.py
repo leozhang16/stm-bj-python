@@ -44,6 +44,8 @@ class SessionWriter:
         self._h5 = None
         self._n = 0
         self._n_samples: int | None = None
+        self._with_sense = False
+        self._warned_sense = False
 
     # -- lifecycle --------------------------------------------------------
 
@@ -60,6 +62,8 @@ class SessionWriter:
                                                    indent=2)
         self._h5.attrs["units"] = (
             "voltage_v and current_v are raw volts at the ADC. "
+            "piezo_sense_v, when present, is the piezo sense readback in raw "
+            "volts (nm = volts * cal.sense_nm_per_volt). "
             "Conductance is derived, not stored.")
         log.info("writing to %s", self.path)
         return self
@@ -82,11 +86,17 @@ class SessionWriter:
 
     # -- writing ----------------------------------------------------------
 
-    def _create(self, n_samples: int) -> None:
+    def _create(self, n_samples: int, with_sense: bool) -> None:
         h5 = self._h5
         self._n_samples = n_samples
+        self._with_sense = with_sense
         chunks = (self.chunk_traces, n_samples)
-        for name in ("voltage_v", "current_v"):
+        names = ["voltage_v", "current_v"]
+        if with_sense:
+            # Piezo sense readback, raw volts from the low-res card. Only
+            # present in files from a two-card rig; readers must not assume it.
+            names.append("piezo_sense_v")
+        for name in names:
             h5.create_dataset(
                 name, shape=(0, n_samples), maxshape=(None, n_samples),
                 dtype="float64", chunks=chunks, compression=self.compression)
@@ -108,8 +118,9 @@ class SessionWriter:
             raise RuntimeError("SessionWriter is not open")
 
         n_samples = trace.voltage_v.size
+        sense = getattr(trace, "piezo_sense_v", None)
         if self._n_samples is None:
-            self._create(n_samples)
+            self._create(n_samples, with_sense=sense is not None)
         elif n_samples != self._n_samples:
             raise ValueError(
                 f"trace has {n_samples} samples but this file holds "
@@ -117,8 +128,19 @@ class SessionWriter:
 
         h5 = self._h5
         i = self._n
-        for name, value in (("voltage_v", trace.voltage_v),
-                            ("current_v", trace.current_v)):
+        rows = [("voltage_v", trace.voltage_v), ("current_v", trace.current_v)]
+        if self._with_sense:
+            if sense is None:
+                # The readback went missing mid-session (a dropped read);
+                # keep the file rectangular and make the gap visible.
+                sense = np.full(n_samples, np.nan)
+            rows.append(("piezo_sense_v", sense))
+        elif sense is not None and not self._warned_sense:
+            log.warning("first trace had no piezo sense readback, so this "
+                        "file has no piezo_sense_v dataset; later readbacks "
+                        "are not stored")
+            self._warned_sense = True
+        for name, value in rows:
             ds = h5[name]
             ds.resize(i + 1, axis=0)
             ds[i, :] = value
@@ -179,6 +201,19 @@ class Session:
 
     def raw(self, i: int) -> tuple[np.ndarray, np.ndarray]:
         return (self._h5["voltage_v"][i], self._h5["current_v"][i])
+
+    @property
+    def has_piezo_sense(self) -> bool:
+        """Was this session recorded with the piezo sense line?"""
+        return "piezo_sense_v" in self._h5
+
+    def piezo_sense(self, i: int, in_nm: bool = True) -> np.ndarray | None:
+        """Piezo sense readback of trace ``i``, in nm (or raw volts), or None
+        for a file from a one-card rig."""
+        if not self.has_piezo_sense:
+            return None
+        v = self._h5["piezo_sense_v"][i]
+        return self.cfg.cal.sense_volts_to_nm(v) if in_nm else v
 
     def conductance(self, i: int, cal=None,
                     use_measured_voltage: bool = True) -> np.ndarray:

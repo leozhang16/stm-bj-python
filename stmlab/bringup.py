@@ -108,6 +108,62 @@ def step_devices(cfg: RigConfig) -> int:
             ("ao1 junction bias", cfg.channels.path(cfg.channels.ao_bias), ao_names)):
         r.add(PASS if path in available else FAIL, label, path)
 
+    # The second card and the piezo sense line, when configured. Inputs only,
+    # so nothing here can move anything.
+    low_res = cfg.channels.low_res_device
+    if low_res:
+        if low_res not in names:
+            r.add(FAIL, "low-res device present",
+                  f"{low_res!r} not found among {names}. Set "
+                  f"channels.low_res_device to null for a one-card rig.")
+        else:
+            r.add(PASS, "low-res device present", low_res)
+            lr = system.devices[low_res]
+            expected = cfg.channels.low_res_expected_product_type or ""
+            got = lr.product_type
+            if expected and expected.lower().replace("-", "") not in \
+                    got.lower().replace("-", ""):
+                r.add(FAIL, "low-res product type",
+                      f"{got!r}, expected {expected!r}; are the two cards' "
+                      f"aliases swapped?")
+            else:
+                r.add(PASS, "low-res product type", got)
+
+            sense_path = cfg.channels.piezo_sense_path
+            if sense_path is None:
+                r.add(CHECK, "piezo sense", "channels.ai_piezo_sense is null; "
+                      "no readback will be taken")
+            else:
+                lr_ai = {c.name for c in lr.ai_physical_chans}
+                r.add(PASS if sense_path in lr_ai else FAIL,
+                      "ai2 piezo sense", sense_path)
+                # Can the second card start on the first card's trigger? This
+                # is the PXI backplane route that makes the readback line up
+                # with the record. Commit only; never started.
+                try:
+                    from nidaqmx.constants import TaskMode
+                    with nidaqmx.Task() as task:
+                        task.ai_channels.add_ai_voltage_chan(
+                            sense_path,
+                            min_val=-cfg.channels.sense_ai_range_v,
+                            max_val=cfg.channels.sense_ai_range_v)
+                        task.timing.cfg_samp_clk_timing(
+                            cfg.ramp.sample_rate_hz,
+                            sample_mode=AcquisitionType.FINITE,
+                            samps_per_chan=1000)
+                        task.triggers.start_trigger.cfg_dig_edge_start_trig(
+                            cfg.channels.ao_start_trigger)
+                        task.control(TaskMode.TASK_COMMIT)
+                    r.add(PASS, "sense trigger route",
+                          f"{cfg.channels.ao_start_trigger} -> {low_res}")
+                except Exception as exc:
+                    r.add(CHECK, "sense trigger route",
+                          f"{cfg.channels.ao_start_trigger} cannot start "
+                          f"{low_res} ({exc}). The readback will be software-"
+                          f"started: aligned to ~1 ms, fine for watching the "
+                          f"piezo. For a hardware route, identify the chassis "
+                          f"in NI MAX so both cards share its trigger bus.")
+
     # Rate coercion: a delta-sigma card grants discrete rates.
     requested = cfg.ramp.sample_rate_hz
     try:

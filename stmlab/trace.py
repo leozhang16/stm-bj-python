@@ -56,6 +56,10 @@ class TraceRecord:
     sample_rate_hz: float
     timestamp: float = field(default_factory=time.time)
     attempt: int = 0
+    # Piezo sense readback over the same samples, raw volts from the low-res
+    # card; None on a one-card rig. Igor's POExtension. Informational: the
+    # displacement axis is still the commanded one (``displacement_nm``).
+    piezo_sense_v: np.ndarray | None = None
 
     def conductance_g0(self, cfg: RigConfig,
                        use_measured_voltage: bool = True) -> np.ndarray:
@@ -68,6 +72,13 @@ class TraceRecord:
     def displacement_nm(self, cfg: RigConfig) -> np.ndarray:
         return analysis.displacement_nm(self.voltage_v.size, cfg.ramp,
                                         self.sample_rate_hz)
+
+    def piezo_sense_nm(self, cfg: RigConfig) -> np.ndarray | None:
+        """Measured piezo position along the trace, in nm (Igor's SenseIn),
+        or None when the rig has no sense line."""
+        if self.piezo_sense_v is None:
+            return None
+        return cfg.cal.sense_volts_to_nm(self.piezo_sense_v)
 
 
 # --------------------------------------------------------------------------
@@ -191,6 +202,20 @@ def capture(rig, ramp, index: int = 0,
                     "samples); increase post_pad_samples", delay)
         return None
 
+    # The sense line, when there is one, is cut with the same indices as the
+    # two record rows: one rule for everything in a TraceRecord. It comes
+    # from the other card, which has no decimation filter, so the readback
+    # actually leads the record by part of the group delay -- a fraction of a
+    # millisecond, far below anything the readback is used to judge.
+    sense = getattr(rig, "last_sense_v", None)
+    sense_cut = None
+    if sense is not None:
+        if sense.size >= stop:
+            sense_cut = np.asarray(sense[start:stop], dtype=float).copy()
+        else:
+            log.warning("piezo sense readback has %d samples, record needs "
+                        "%d; dropping it for this trace", sense.size, stop)
+
     M = cfg.channels
     return TraceRecord(
         index=index,
@@ -200,7 +225,8 @@ def capture(rig, ramp, index: int = 0,
         start_piezo_v=ramp.start_piezo_v,
         bias_v=cfg.ramp.bias_v if bias_v is None else bias_v,
         sample_rate_hz=rig.sample_rate_hz,
-        attempt=rig.attempts)
+        attempt=rig.attempts,
+        piezo_sense_v=sense_cut)
 
 
 def _measure_delay(cfg: RigConfig, record: np.ndarray, ramp: Ramp,

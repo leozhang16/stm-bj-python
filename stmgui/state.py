@@ -29,7 +29,6 @@ class GuiOptions:
     # DAQ tab
     fast_read_wave_size: int = 200        # G_FastReadWaveSize
     piezo_offset_nm: float = 0.0          # G_PiezoOffset_nm (position after Start Writing)
-    sense_scale_nm_per_v: float = 314.0   # K_SenseScale, display only
 
     # Piezo controls
     piezo_step_nm: float = 5.0            # G_PiezoDeltaZ_nm
@@ -179,7 +178,7 @@ PARAMS: dict[str, Param] = {p.igor: p for p in (
           "HighRes Output Range (V)", (0, 10, 0), "%g"),
     Param("K_ZPiezoScale", "cfg.cal.piezo_nm_per_volt", float,
           "Z piezo scale (nm/V)", fmt="%g"),
-    Param("K_SenseScale", "opts.sense_scale_nm_per_v", float,
+    Param("K_SenseScale", "cfg.cal.sense_nm_per_volt", float,
           "Z Sense scale (nm/V)", fmt="%g"),
 
     # -- Inputs tab ----------------------------------------------------

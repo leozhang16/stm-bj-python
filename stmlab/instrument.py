@@ -36,6 +36,10 @@ class Rig:
         self._bias_v = cfg.ramp.bias_v
         self.coarse_steps = 0
 
+        # Piezo sense readback from the last play, (n,) volts, or None on a
+        # rig without a sense line. Informational: nothing decides on it.
+        self.last_sense_v: np.ndarray | None = None
+
     # -- lifecycle --------------------------------------------------------
 
     def open(self) -> "Rig":
@@ -119,11 +123,23 @@ class Rig:
             waveform[M.ROW_PIEZO] = np.clip(row, lo, hi)
 
         record = self._session.play(waveform)
+        self.last_sense_v = getattr(self._session, "last_sense_v", None)
 
         self._piezo_v = float(waveform[M.ROW_PIEZO, -1])
         self._bias_v = float(self.cfg.cal.bias_output_sign
                              * waveform[M.ROW_BIAS, -1])
         return record
+
+    @property
+    def sense_nm(self) -> float | None:
+        """Piezo position the sense line reported at the end of the last play,
+        in nm; None without a sense line. The tracker ``piezo_v`` is what the
+        interlock trusts -- this is the number you compare it against."""
+        if self.last_sense_v is None or self.last_sense_v.size == 0:
+            return None
+        discard = min(self.cfg.ramp.settle_discard, self.last_sense_v.size - 1)
+        tail = self.last_sense_v[discard:]
+        return float(self.cfg.cal.sense_volts_to_nm(np.mean(tail)))
 
     # -- DC moves ---------------------------------------------------------
 

@@ -46,17 +46,32 @@ class DaqError(RuntimeError):
 
 
 class DaqSession:
-    """Open AI and AO tasks on one card, with a fixed record length."""
+    """Open AI and AO tasks on one card, with a fixed record length.
+
+    On a two-card rig (``channels.low_res_device`` set) a third, one-channel
+    AI task reads the piezo sense line on the second card during every play:
+    same N, same rate, started by the same ``ao/StartTrigger``. Its samples
+    are left in :attr:`last_sense_v` rather than added to the record, so the
+    (2, n) contract of :meth:`play` -- and every row index above this layer --
+    is untouched.
+    """
 
     def __init__(self, cfg: RigConfig):
         self.cfg = cfg
         self._ai = None
         self._ao = None
+        self._sense = None                   # piezo sense task, or None
         self._n = 0
         self._ao_running = False
         self._retriggerable = True
         self.granted_rate_hz: float | None = None
         self.idle_behavior: str = "unknown"
+        # Piezo sense readback from the last play, (n,) volts, or None when
+        # this rig has no sense line.
+        self.last_sense_v: np.ndarray | None = None
+        # "hardware" once the sense task triggers off ao/StartTrigger,
+        # "software" if that route was refused and it is started by Python.
+        self.sense_sync: str = "none"
 
     # -- lifecycle --------------------------------------------------------
 
@@ -96,12 +111,23 @@ class DaqSession:
             self._ai.ai_channels.add_ai_voltage_chan(
                 chan, min_val=-m.ai_range_v, max_val=m.ai_range_v)
 
+        # The piezo sense line lives on the other card, so it cannot join the
+        # task above (a DSA card and an X-series card never share a task).
+        # One channel, its own task, read alongside the record.
+        sense_path = m.piezo_sense_path
+        if sense_path is not None:
+            self._sense = nidaqmx.Task("stmbj_sense")
+            self._sense.ai_channels.add_ai_voltage_chan(
+                sense_path, min_val=-m.sense_ai_range_v,
+                max_val=m.sense_ai_range_v)
+            log.info("piezo sense readback on %s", sense_path)
+
         # Timing and triggering are deferred to configure(), which the first
         # play() calls with the record length it needs.
         return self
 
     def close(self) -> None:
-        for task in (self._ai, self._ao):
+        for task in (self._sense, self._ai, self._ao):
             if task is not None:
                 try:
                     task.stop()
@@ -111,7 +137,7 @@ class DaqSession:
                     task.close()
                 except Exception:
                     pass
-        self._ai = self._ao = None
+        self._ai = self._ao = self._sense = None
         self._ao_running = False
 
     def __enter__(self) -> "DaqSession":
@@ -184,9 +210,58 @@ class DaqSession:
                     "requested %.6f Hz, card granted %.6f Hz; the granted "
                     "rate is what every time axis uses", rate, granted)
 
+        if self._sense is not None:
+            self._configure_sense(n_samples, granted)
+
         if self._retriggerable:
             self._ai.start()      # armed once, stays armed for the session
         self._n = n_samples
+
+    def _configure_sense(self, n_samples: int, rate: float) -> None:
+        """Time the sense task like the record and start it on AO's trigger.
+
+        The second card runs on its own oscillator, so it is asked for the
+        rate the first card actually granted; over one record the two clocks
+        drift apart by well under a sample. The start trigger crosses the PXI
+        backplane: DAQmx routes ``/dev1/ao/StartTrigger`` to the second card
+        by itself when both cards sit in one chassis that NI MAX knows about.
+        If that route is refused, the task is started from Python just before
+        the outputs instead -- good to about a millisecond, enough to watch
+        the piezo, not enough to time anything -- and says so loudly.
+        """
+        from nidaqmx.constants import AcquisitionType
+
+        try:
+            self._sense.stop()
+        except Exception:
+            pass
+        self._sense.timing.cfg_samp_clk_timing(
+            rate, sample_mode=AcquisitionType.FINITE,
+            samps_per_chan=n_samples)
+
+        try:
+            self._sense.triggers.start_trigger.cfg_dig_edge_start_trig(
+                self.cfg.channels.ao_start_trigger)
+            # Commit so a refused route fails here, not inside play().
+            from nidaqmx.constants import TaskMode
+            self._sense.control(TaskMode.TASK_COMMIT)
+            self.sense_sync = "hardware"
+        except Exception as exc:
+            self._sense.triggers.start_trigger.disable_start_trig()
+            self.sense_sync = "software"
+            log.warning(
+                "could not start the piezo sense task from %s (%s). It will "
+                "be software-started instead, so the readback is aligned to "
+                "the record only to about a millisecond. Check that both "
+                "cards are in one PXI chassis identified in NI MAX.",
+                self.cfg.channels.ao_start_trigger, exc)
+
+        got = float(self._sense.timing.samp_clk_rate)
+        if abs(got - rate) > 1e-6:
+            log.warning("sense card granted %.6f Hz against the record's "
+                        "%.6f Hz; the readback will stretch by %.2f samples "
+                        "over one record", got, rate,
+                        n_samples * abs(got - rate) / rate)
 
     # -- the one verb -----------------------------------------------------
 
@@ -195,7 +270,8 @@ class DaqSession:
 
         ``waveform`` is (2, n): row 0 the piezo command, row 1 the bias, both
         in volts at the DAQ. The return is (2, n): row 0 the junction voltage
-        on ai0, row 1 the preamp output on ai1.
+        on ai0, row 1 the preamp output on ai1. On a two-card rig the piezo
+        sense readback for the same n samples is left in ``last_sense_v``.
         """
         waveform = np.asarray(waveform, dtype=float)
         if waveform.ndim != 2 or waveform.shape[0] != 2:
@@ -213,6 +289,13 @@ class DaqSession:
         if not self._retriggerable:
             self._ai.stop()
             self._ai.start()
+        if self._sense is not None:
+            # Armed per play: an X-series input has no filter to settle, so
+            # re-arming costs nothing. Hardware-triggered, this waits for the
+            # same edge as AI; software-started, it begins now, a few hundred
+            # microseconds before the outputs.
+            self._sense.stop()
+            self._sense.start()
 
         self._ao.start()             # fires ao/StartTrigger -> AI begins
         self._ao_running = True
@@ -220,6 +303,10 @@ class DaqSession:
 
         data = self._ai.read(number_of_samples_per_channel=n,
                              timeout=timeout_s)
+        if self._sense is not None:
+            sense = self._sense.read(number_of_samples_per_channel=n,
+                                     timeout=timeout_s)
+            self.last_sense_v = np.asarray(sense, dtype=float).ravel()
         # AO is left running: the outputs hold their last sample, which is how
         # the piezo keeps its position between plays.
         return np.asarray(data, dtype=float)

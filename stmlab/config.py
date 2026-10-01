@@ -75,6 +75,17 @@ class ChannelMap:
     # None means "this rig has one card" and every feature needing it refuses
     # cleanly instead of guessing.
     low_res_device: str | None = None
+    # Checked by verify_devices() when low_res_device is set; None skips it.
+    low_res_expected_product_type: str | None = "PXIe-6361"
+
+    # Piezo sense readback: the piezo driver box's monitor output, read on the
+    # low-res card. Igor's SenseIn / POExtension. It is read in its own task
+    # during every play, N samples at the same rate, started by the same
+    # trigger as the other inputs, and travels beside the record as
+    # ``Rig.last_sense_v``; it never enters the (2, n) record itself. None
+    # means "no sense line" even on a two-card rig.
+    ai_piezo_sense: str | None = "ai2"
+    sense_ai_range_v: float = 10.0
 
     # Row indices into the (2, n) arrays that cross the DAQ boundary. ClassVar
     # so they stay out of asdict() and therefore out of the data files: they
@@ -86,6 +97,18 @@ class ChannelMap:
 
     def path(self, channel: str) -> str:
         return f"{self.device}/{channel}"
+
+    @property
+    def has_piezo_sense(self) -> bool:
+        """True only on a two-card rig with a sense channel named."""
+        return bool(self.low_res_device) and bool(self.ai_piezo_sense)
+
+    @property
+    def piezo_sense_path(self) -> str | None:
+        """``dev2/ai2``, or None when this rig has no sense line."""
+        if not self.has_piezo_sense:
+            return None
+        return f"{self.low_res_device}/{self.ai_piezo_sense}"
 
     @property
     def ai_channels(self) -> tuple[str, str]:
@@ -255,6 +278,12 @@ class Calibration:
     # Nothing in this package multiplies by it.
     hv_amp_gain: float | None = None
 
+    # Displacement per volt on the piezo *sense* line (the driver box's
+    # monitor output, read on the low-res card). Igor: K_SenseScale = 314.
+    # Only used to turn the readback into nm for display and storage; the
+    # displacement axis of every trace stays the commanded one.
+    sense_nm_per_volt: float = 314.0
+
     # Igor writes -(TipBias/1000) to ao1 and negates ai0 to recover the
     # junction voltage (Functions_STMBJ.ipf:347, 358).
     bias_output_sign: float = -1.0
@@ -289,6 +318,10 @@ class Calibration:
 
     def piezo_volts_to_nm(self, v: float | Any) -> Any:
         return v * self.piezo_nm_per_volt
+
+    def sense_volts_to_nm(self, v: float | Any) -> Any:
+        """Piezo sense readback volts -> nm (Igor: SenseIn * K_SenseScale)."""
+        return v * self.sense_nm_per_volt
 
 
 # --------------------------------------------------------------------------
@@ -634,6 +667,13 @@ def validate(cfg: RigConfig) -> list[str]:
         problems.append(
             "coarse_step_max_piezo_v is outside the piezo range, so the "
             "coarse-step interlock can never be satisfied (or never fires)")
+
+    # Piezo sense readback: only checked on a two-card rig that reads it.
+    if M.has_piezo_sense:
+        if C.sense_nm_per_volt <= 0:
+            problems.append("cal.sense_nm_per_volt must be positive")
+        if M.sense_ai_range_v <= 0:
+            problems.append("channels.sense_ai_range_v must be positive")
 
     # Sampling.
     if R.sample_rate_hz <= 0:

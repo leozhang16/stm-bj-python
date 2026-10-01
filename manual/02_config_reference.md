@@ -38,13 +38,17 @@ Igor's `SetUpHRTaskID1` (Functions_STMBJ.ipf:243).
 | `bias_ao_range_v` | `2.5` | V | `G_HighResOutputRange` | Card-enforced range of the bias AO channel (the piezo AO range comes from `SafetyLimits`, so hardware clip and software check can never disagree -- Igor passed `G_PiezoChanLow/High` into `MXCreateAOVoltageChan`, Controls_STMBJ.ipf:152) |
 | `expected_product_type` | `"PXI-4461"` | -- | -- | Product-type check in `verify_devices()`; `None` skips it |
 | `low_res_device` | `None` | -- | Setup1_STMBJ.ipf:36-41 ("dev2") | Igor's second card: piezo sense readback, X piezo on ao0, EChem counter electrode on ao1. `None` means "this rig has one card" and every feature needing it refuses cleanly |
+| `low_res_expected_product_type` | `"PXIe-6361"` | -- | -- | Product-type check of the second card in `verify_devices()` and `bringup 1`, only when `low_res_device` is set; `None` skips it |
+| `ai_piezo_sense` | `"ai2"` | -- | Setup1_STMBJ.ipf (SenseIn / POExtension) | Piezo sense readback: the driver box's monitor output, on the *low-res* card. Read in its own one-channel task during every play, same N and rate, started by the same `ao/StartTrigger`, and carried beside the record as `Rig.last_sense_v` / `TraceRecord.piezo_sense_v`. Needs `low_res_device`; `None` means no sense line |
+| `sense_ai_range_v` | `10.0` | V | -- | Range of the sense input |
 
 Class constants (`ClassVar`, deliberately excluded from `asdict()` and the
 data files because they describe this code's array layout, not the rig):
 `ROW_VOLTAGE = 0`, `ROW_CURRENT = 1` (input rows), `ROW_PIEZO = 0`,
 `ROW_BIAS = 1` (output rows). Derived helpers: `path(ch)`, `ai_channels`,
-`ao_channels`, and `ao_start_trigger` (`/<device>/ao/StartTrigger` -- the
-terminal AI triggers off, derived rather than hardcoded).
+`ao_channels`, `ao_start_trigger` (`/<device>/ao/StartTrigger` -- the
+terminal AI triggers off, derived rather than hardcoded), `has_piezo_sense`
+and `piezo_sense_path` (`<low_res_device>/<ai_piezo_sense>`, or `None`).
 
 ## SafetyLimits (`cfg.limits`)
 
@@ -107,6 +111,7 @@ Measured constants; produced by `calibrate.py`, saved per session.
 | `current_zero_v` | `0.0` | V | -- | Preamp resting offset; hundreds of microvolts, drifts with temperature, re-measure every session (`validate` warns while it is 0) |
 | `piezo_nm_per_volt` | `62.0` | nm/V | `K_ZPiezoScale` | Displacement per volt at the DAQ output, end to end including the driver box |
 | `hv_amp_gain` | `None` | -- | -- | Driver-box gain if ever measured separately; documentation only, nothing multiplies by it |
+| `sense_nm_per_volt` | `314.0` | nm/V | `K_SenseScale` | Displacement per volt on the piezo *sense* line (`channels.ai_piezo_sense`). Converts the readback to nm for SenseInDisplay and `Session.piezo_sense()`; the displacement axis of every trace stays the commanded one |
 | `bias_output_sign` | `-1.0` | -- | Functions_STMBJ.ipf:347 | Igor writes `-(TipBias/1000)` to ao1 |
 | `voltage_input_sign` | `-1.0` | -- | Functions_STMBJ.ipf:358 | Igor negates ai0 to recover the junction voltage |
 | `ai_gain_error` | `1.0` | -- | -- | Slope from the DC loopback sweep; identity until measured |

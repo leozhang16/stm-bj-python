@@ -238,7 +238,7 @@ class MainPanel(ttk.Frame):
         self.zscale.set(self.state.cfg.cal.piezo_nm_per_volt)
         self.zscale.pack(anchor="w", pady=1)
         self.sscale = ValDisplay(left, "Z Sense scale (nm/V)", fmt="%g", width=6)
-        self.sscale.set(self.state.opts.sense_scale_nm_per_v)
+        self.sscale.set(self.state.cfg.cal.sense_nm_per_volt)
         self.sscale.pack(anchor="w", pady=1)
         self.daq_setvars = [
             self._sv(left, "G_AcquisitionRate", width=8),

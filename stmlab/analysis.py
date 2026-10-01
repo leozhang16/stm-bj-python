@@ -98,11 +98,13 @@ def displacement_nm(n_samples: int, ramp: RampConfig,
     """Tip displacement axis for a pull, in nm, starting at 0.
 
     Commanded, not measured. Igor read the piezo back on the low-res card's
-    sense channel and stored that as POExtension; with one card there is no
-    sense channel, so this is the commanded trajectory. The piezo is open-loop
-    either way -- Igor's sense channel measured the driver's output voltage,
-    not the actual displacement -- so the difference is smaller than it
-    sounds, but hysteresis and creep are absent from this axis entirely.
+    sense channel and stored that as POExtension; here that readback, when
+    the rig has a second card, travels as ``TraceRecord.piezo_sense_v`` for
+    checking the piezo, and this axis stays the commanded trajectory. The
+    piezo is open-loop either way -- the sense channel measures the driver's
+    output voltage, not the actual displacement -- so the difference is
+    smaller than it sounds, but hysteresis and creep are absent from this
+    axis entirely.
     """
     fs = sample_rate_hz or ramp.sample_rate_hz
     return np.arange(n_samples, dtype=float) * ramp.pull_rate_nm_per_s / fs

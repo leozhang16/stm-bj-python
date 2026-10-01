@@ -26,7 +26,8 @@ of `controller.py` with the Igor control procedures goes.
 | X piezo | no range check | refuses a move outside 0 … 10 V | the headroom is finite |
 | Mode ramps | bias refused nowhere | `limits.bias_max_v` raised to 1.1× the sweep/hold with a warning | the limit exists to protect the constant-bias modes, and lifting it should be visible |
 | `LateralEXPT` | slider to 0 *after* the actuator steps | `Rig.withdraw()` *before* them | the interlock needs the fine piezo parked before a coarse step |
-| Readout "Piezo" and SenseInDisplay | the second card's sense input | the commanded piezo voltage | one card, no sense line |
+| Readout "Piezo" | the second card's sense input | the commanded piezo voltage | the interlock trusts the command, so that is what is shown |
+| SenseInDisplay | the second card's sense input | the sense readback when `channels.low_res_device` is set, else the commanded trajectory | one-card rigs have no sense line |
 | Inputs-tab `_EChem` controls | created disabled, never enabled | not reproduced | they were invisible in Igor |
 | `check08`, `setvar15`, `setvar5`, `setvar7` | disabled placeholders | not reproduced | untitled and unbound |
 | Thermocouple sampling | commented out | absent | as in Igor |
