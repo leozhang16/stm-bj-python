@@ -13,7 +13,7 @@ card directly.
 
 | Test | What it moves | What it shows | Needs |
 |---|---|---|---|
-| `01_piezo_sweep.py` | Z piezo (`dev1/ao0`), by slider or by a sweep | commanded volts and the sense readback (`dev2/ai2`) against time; a side panel with the config's ranges, the position now, and a live straight-line fit of readback against command that gives `cal.sense_nm_per_volt` and `cal.sense_zero_v` as config lines (Copy config lines), plus the up/down loop and the ADC step | tip FAR from the sample; the second card for the readback |
+| `01_piezo_sweep.py` | Z piezo (`dev1/ao0`), by slider or by a sweep | commanded volts and the sense readback (`dev2/ai2`) against time; a side panel with the config's ranges, the position now, and a live straight-line fit of readback against command that gives `cal.sense_nm_per_volt` and `cal.sense_zero_v` as config lines (Copy config lines), plus the up/down loop and the ADC step; a readback-only window (button, or `--readback`) that shows the sense line alone, mean removed, in microvolts and picometres: one point per hold for creep and drift, and every sample of the last hold for ripple and hum. The main plot has two y axes, command (left) and readback (right), linked through the config's calibration; the y-axis row chooses full range, the sweep's own range, auto, or manual limits. `--sweep 4.90 4.98 --sweep-rate 0.02 --ymode sweep` starts a 5 nm sweep with the axes on it | tip FAR from the sample; the second card for the readback |
 
 ## Running
 

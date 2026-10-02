@@ -82,6 +82,7 @@ class PiezoWorker(threading.Thread):
         self._quit = threading.Event()     # not _stop: Thread owns that name
         self._lock = threading.Lock()
         self.samples: collections.deque = collections.deque(maxlen=200_000)
+        self.last_raw: np.ndarray | None = None      # the last hold, every sample
         self.t0 = time.monotonic()
         self.error: str | None = None
 
@@ -117,6 +118,11 @@ class PiezoWorker(threading.Thread):
         with self._lock:
             self.samples.clear()
             self.t0 = time.monotonic()
+
+    def raw_snapshot(self) -> np.ndarray | None:
+        """Every sample of the last hold, volts on the sense line."""
+        with self._lock:
+            return None if self.last_raw is None else self.last_raw.copy()
 
     def snapshot(self) -> np.ndarray:
         """(n, 3): seconds since start, commanded V, sense V (nan if none)."""
@@ -159,6 +165,7 @@ class PiezoWorker(threading.Thread):
                 with self._lock:
                     self.samples.append((now - self.t0, self.rig.piezo_v,
                                          sense_v))
+                    self.last_raw = None if sense is None else sense.copy()
 
                 time.sleep(max(0.0, self.period - (time.monotonic() - now)))
         except Exception as exc:                # noqa: BLE001
@@ -467,7 +474,10 @@ def save_csv(path: Path, data: np.ndarray) -> None:
 
 def run_gui(cfg: RigConfig, rate: float, hold_ms: float, window_s: float,
             out: Path | None, autoclose: float | None = None,
-            config_name: str = "defaults") -> int:
+            config_name: str = "defaults", readback: bool = False,
+            sweep: tuple[float, float] | None = None,
+            sweep_rate: float | None = None,
+            ymode_start: str = "full") -> int:
     import tkinter as tk
     from tkinter import ttk
 
@@ -530,9 +540,10 @@ def run_gui(cfg: RigConfig, rate: float, hold_ms: float, window_s: float,
     # -- the sweep ----------------------------------------------------------
     sb = ttk.LabelFrame(root, text="Sweep")
     sb.pack(fill="x", padx=8, pady=4)
-    from_var = tk.StringVar(value=f"{L.piezo_ao_min_v:.2f}")
-    to_var = tk.StringVar(value=f"{L.piezo_ao_max_v:.2f}")
-    rate_var = tk.StringVar(value=f"{rate:g}")
+    sw_lo, sw_hi = sweep if sweep else (L.piezo_ao_min_v, L.piezo_ao_max_v)
+    from_var = tk.StringVar(value=f"{sw_lo:.3f}")
+    to_var = tk.StringVar(value=f"{sw_hi:.3f}")
+    rate_var = tk.StringVar(value=f"{sweep_rate if sweep_rate else rate:g}")
     bounce_var = tk.BooleanVar(value=True)
     for col, (label, var) in enumerate((("from (V)", from_var),
                                         ("to (V)", to_var),
@@ -575,25 +586,213 @@ def run_gui(cfg: RigConfig, rate: float, hold_ms: float, window_s: float,
         status.config(text=f"saved {path}")
     ttk.Button(rb, text="Save CSV", command=on_save).grid(
         row=0, column=4, rowspan=2, padx=12)
+    ttk.Button(rb, text="Readback window",
+               command=lambda: open_readback()).grid(
+        row=0, column=5, rowspan=2, padx=12)
+
+    # -- the readback-only window ------------------------------------------
+    # Two plots of the sense line alone, auto-scaled and with the mean taken
+    # out, so the y axis reads in microvolts and picometres rather than
+    # volts. Top: one point per hold (the settled mean of each 10 ms hold,
+    # so ADC noise is averaged down), the slow picture: creep, drift, steps.
+    # Bottom: every sample of the last hold at the full 40 kHz, the fast
+    # picture: ripple, mains hum, the ADC's own noise. What it watches is the
+    # driver's monitor output, so it sees the drive, not the tip: mechanical
+    # vibration of the junction only shows in the tunnelling current.
+    rb_state: dict = {"win": None}
+
+    def open_readback():
+        if rb_state["win"] is not None and rb_state["win"].winfo_exists():
+            rb_state["win"].lift()
+            return
+        win = tk.Toplevel(root)
+        win.title("readback only: " + (cfg.channels.piezo_sense_path or "no sense line"))
+        rb_state["win"] = win
+        fig2 = Figure(figsize=(6.4, 5.0), dpi=100)
+        ax_slow = fig2.add_subplot(211)
+        ax_fast = fig2.add_subplot(212)
+        for a_ in (ax_slow, ax_fast):
+            a_.tick_params(labelsize=8)
+            a_.grid(True, alpha=0.3)
+        ax_slow.set_title("one point per hold (settled mean), minus the mean shown",
+                          fontsize=9)
+        ax_slow.set_xlabel("time (s)", fontsize=8)
+        ax_slow.set_ylabel("sense (uV)", fontsize=8)
+        ax_fast.set_title("the last hold, every sample, minus its mean",
+                          fontsize=9)
+        ax_fast.set_xlabel("time within the hold (ms)", fontsize=8)
+        ax_fast.set_ylabel("sense (uV)", fontsize=8)
+        (l_slow,) = ax_slow.plot([], [], color="#d62728", lw=1.0)
+        (l_fast,) = ax_fast.plot([], [], color="#d62728", lw=0.6)
+        pm_slow = ax_slow.secondary_yaxis(
+            "right", functions=(lambda v: v * C.sense_nm_per_volt * 1e-3,
+                                lambda nm: nm / (C.sense_nm_per_volt * 1e-3)))
+        pm_slow.set_ylabel("pm", fontsize=8)
+        pm_slow.tick_params(labelsize=8)
+        pm_fast = ax_fast.secondary_yaxis(
+            "right", functions=(lambda v: v * C.sense_nm_per_volt * 1e-3,
+                                lambda nm: nm / (C.sense_nm_per_volt * 1e-3)))
+        pm_fast.set_ylabel("pm", fontsize=8)
+        pm_fast.tick_params(labelsize=8)
+        fig2.tight_layout()
+        canvas2 = FigureCanvasTkAgg(fig2, master=win)
+        canvas2.get_tk_widget().pack(fill="both", expand=True)
+        stats = ttk.Label(win, text="", font=("Courier", 9), justify="left")
+        stats.pack(fill="x", padx=8, pady=(0, 6))
+        secs_var = tk.StringVar(value="10")
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=8, pady=(0, 6))
+        ttk.Label(bar, text="seconds shown").pack(side="left")
+        ttk.Entry(bar, textvariable=secs_var, width=5).pack(side="left", padx=4)
+        ttk.Label(bar, text=f"hold = {worker.n_hold} samples = "
+                            f"{1e3 * worker.n_hold / rig.sample_rate_hz:.0f} ms; "
+                            f"--hold-ms 50 shows three mains cycles per hold").pack(
+            side="left", padx=12)
+
+        def refresh_readback():
+            if not win.winfo_exists():
+                rb_state["win"] = None
+                return
+            try:
+                secs = max(1.0, float(secs_var.get()))
+            except ValueError:
+                secs = 10.0
+            data = worker.snapshot()
+            text = []
+            if data.shape[0] and np.isfinite(data[:, 2]).any():
+                t, sv = data[:, 0], data[:, 2]
+                keep = (t >= t[-1] - secs) & np.isfinite(sv)
+                if keep.sum() >= 2:
+                    ts, ss = t[keep], sv[keep]
+                    mean = ss.mean()
+                    y = (ss - mean) * 1e6
+                    l_slow.set_data(ts, y)
+                    ax_slow.set_xlim(ts[-1] - secs, ts[-1])
+                    pad = max(5.0, 0.15 * np.ptp(y)) if y.size else 5.0
+                    ax_slow.set_ylim(y.min() - pad, y.max() + pad)
+                    rms = y.std()
+                    moved = np.ptp(data[keep, 1]) > 0.005
+                    text.append(f"per-hold means, last {secs:g} s: mean "
+                                f"{mean:.4f} V, rms {rms:6.1f} uV = "
+                                f"{rms * C.sense_nm_per_volt * 1e-3:6.1f} pm, "
+                                f"peak-to-peak {np.ptp(y):6.1f} uV"
+                                + ("   (the command moved in this window: "
+                                   "wait for it to stand still)" if moved else ""))
+            raw = worker.raw_snapshot()
+            if raw is not None and raw.size > 1:
+                half = raw.size // 2
+                seg = raw[half:]                      # the settled half
+                yr = (seg - seg.mean()) * 1e6
+                tr = (np.arange(seg.size) + half) / rig.sample_rate_hz * 1e3
+                l_fast.set_data(tr, yr)
+                ax_fast.set_xlim(tr[0], tr[-1])
+                pad = max(5.0, 0.15 * np.ptp(yr))
+                ax_fast.set_ylim(yr.min() - pad, yr.max() + pad)
+                lsb = 2 * cfg.channels.sense_ai_range_v / 65536 * 1e6
+                text.append(f"within the last hold ({seg.size} samples at "
+                            f"{rig.sample_rate_hz / 1e3:.0f} kHz): rms "
+                            f"{yr.std():6.1f} uV = "
+                            f"{yr.std() * C.sense_nm_per_volt * 1e-3:6.1f} pm; "
+                            f"ADC step {lsb:.0f} uV on +/-"
+                            f"{cfg.channels.sense_ai_range_v:g} V")
+            stats.config(text="\n".join(text) or "waiting for samples")
+            canvas2.draw_idle()
+            win.after(200, refresh_readback)
+
+        refresh_readback()
 
     # -- the plot, with the fit panel beside it --------------------------------
     body = ttk.Frame(root)
     body.pack(fill="both", expand=True, padx=8, pady=4)
 
+    plot_col = ttk.Frame(body)
+    plot_col.pack(side="left", fill="both", expand=True)
+
+    # Y axis control. The command and the readback live on two axes, left
+    # and right, because a 5 nm pull is 81 mV of command but 4 mV of
+    # readback: on one axis the readback is a flat line. The right axis is
+    # linked to the left through the config's scale and zero, so when the
+    # calibration is right the two lines lie on top of each other at any
+    # zoom; "unlink" lets the readback find its own scale instead.
+    yrow = ttk.Frame(plot_col)
+    yrow.pack(fill="x", pady=(0, 2))
+    ttk.Label(yrow, text="y axis:").pack(side="left")
+    ymode = tk.StringVar(value=ymode_start)
+    for text, val in (("full range", "full"), ("sweep range", "sweep"),
+                      ("auto", "auto"), ("manual", "manual")):
+        ttk.Radiobutton(yrow, text=text, value=val, variable=ymode).pack(
+            side="left", padx=3)
+    ymin_var = tk.StringVar(value=f"{L.piezo_ao_min_v:.2f}")
+    ymax_var = tk.StringVar(value=f"{L.piezo_ao_max_v:.2f}")
+    ttk.Entry(yrow, textvariable=ymin_var, width=7).pack(side="left", padx=(6, 2))
+    ttk.Label(yrow, text="to").pack(side="left")
+    ttk.Entry(yrow, textvariable=ymax_var, width=7).pack(side="left", padx=2)
+    ylink = tk.BooleanVar(value=True)
+    ttk.Checkbutton(yrow, text="readback axis linked", variable=ylink).pack(
+        side="left", padx=8)
+
     fig = Figure(figsize=(6.4, 3.6), dpi=100)
     ax = fig.add_subplot(111)
+    ax2 = ax.twinx()
     ax.set_xlabel("time (s)", fontsize=9)
-    ax.tick_params(labelsize=9)
+    for a_ in (ax, ax2):
+        a_.tick_params(labelsize=9)
     ax.grid(True, alpha=0.3)
     (l_cmd,) = ax.plot([], [], color="#1f77b4", lw=1.2,
                        label=f"command  {cfg.channels.path(cfg.channels.ao_piezo)}")
     sense_label = (cfg.channels.piezo_sense_path or "no sense line")
-    (l_sense,) = ax.plot([], [], color="#d62728", lw=1.2,
-                         label=f"sense  {sense_label}")
-    ax.legend(loc="lower left", bbox_to_anchor=(0.0, 1.0), ncol=2,
+    (l_sense,) = ax2.plot([], [], color="#d62728", lw=1.2,
+                          label=f"sense  {sense_label}")
+    ax.tick_params(axis="y", colors="#1f77b4")
+    ax2.tick_params(axis="y", colors="#d62728")
+    ax.legend([l_cmd, l_sense], [l_cmd.get_label(), l_sense.get_label()],
+              loc="lower left", bbox_to_anchor=(0.0, 1.0), ncol=2,
               fontsize=8, frameon=False)
-    canvas = FigureCanvasTkAgg(fig, master=body)
-    canvas.get_tk_widget().pack(side="left", fill="both", expand=True)
+    canvas = FigureCanvasTkAgg(fig, master=plot_col)
+    canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def cmd_to_sense_v(v):
+        """Where the readback should sit for a command, by the config."""
+        return C.piezo_volts_to_nm(v) / C.sense_nm_per_volt + C.sense_zero_v
+
+    def y_limits(cmd_v: np.ndarray, sense_v: np.ndarray, in_nm: bool):
+        """(left lo, left hi, right lo, right hi) for the chosen mode."""
+        mode = ymode.get()
+        if mode == "sweep":
+            try:
+                lo, hi = sorted((float(from_var.get()), float(to_var.get())))
+            except ValueError:
+                lo, hi = L.piezo_ao_min_v, L.piezo_ao_max_v
+        elif mode == "manual":
+            try:
+                lo, hi = sorted((float(ymin_var.get()), float(ymax_var.get())))
+            except ValueError:
+                lo, hi = L.piezo_ao_min_v, L.piezo_ao_max_v
+            if in_nm:                       # the boxes are in the shown unit
+                lo, hi = C.nm_to_piezo_volts(lo), C.nm_to_piezo_volts(hi)
+        elif mode == "auto" and cmd_v.size:
+            lo, hi = float(cmd_v.min()), float(cmd_v.max())
+        else:
+            lo, hi = L.piezo_ao_min_v, L.piezo_ao_max_v
+        if hi - lo < 1e-6:
+            lo, hi = lo - 0.005, hi + 0.005
+        pad = 0.05 * (hi - lo) if mode != "manual" else 0.0
+        lo, hi = lo - pad, hi + pad
+
+        fin = np.isfinite(sense_v)
+        if ylink.get() or not fin.any():
+            s_lo, s_hi = cmd_to_sense_v(lo), cmd_to_sense_v(hi)
+        else:                               # the readback on its own scale
+            sv = sense_v[fin]
+            s_lo, s_hi = float(sv.min()), float(sv.max())
+            if s_hi - s_lo < 1e-6:
+                s_lo, s_hi = s_lo - 1e-4, s_hi + 1e-4
+            s_pad = 0.05 * (s_hi - s_lo)
+            s_lo, s_hi = s_lo - s_pad, s_hi + s_pad
+        if in_nm:
+            return (C.piezo_volts_to_nm(lo), C.piezo_volts_to_nm(hi),
+                    C.sense_volts_to_nm(s_lo), C.sense_volts_to_nm(s_hi))
+        return lo, hi, s_lo, s_hi
 
     side = ttk.LabelFrame(body, text="Fit and ranges")
     side.pack(side="right", fill="y", padx=(8, 0))
@@ -643,18 +842,21 @@ def run_gui(cfg: RigConfig, rate: float, hold_ms: float, window_s: float,
         if data.shape[0]:
             t, cmd, sense = data[:, 0], data[:, 1], data[:, 2]
             in_nm = nm_var.get()
+            right = max(t[-1], window_s)
+            shown = t >= right - window_s
             if in_nm:
                 y_cmd, y_sense = C.piezo_volts_to_nm(cmd), C.sense_volts_to_nm(sense)
-                ax.set_ylabel("piezo (nm)", fontsize=9)
-                ax.set_ylim(C.piezo_volts_to_nm(L.piezo_ao_min_v) - 10,
-                            C.piezo_volts_to_nm(L.piezo_ao_max_v) + 10)
+                ax.set_ylabel("command (nm)", fontsize=9, color="#1f77b4")
+                ax2.set_ylabel("readback (nm)", fontsize=9, color="#d62728")
             else:
                 y_cmd, y_sense = cmd, sense
-                ax.set_ylabel("volts at the DAQ", fontsize=9)
-                ax.set_ylim(L.piezo_ao_min_v - 0.3, L.piezo_ao_max_v + 0.3)
+                ax.set_ylabel("command (V at the DAQ)", fontsize=9, color="#1f77b4")
+                ax2.set_ylabel("readback (V)", fontsize=9, color="#d62728")
+            lo, hi, s_lo, s_hi = y_limits(cmd[shown], sense[shown], in_nm)
+            ax.set_ylim(lo, hi)
+            ax2.set_ylim(s_lo, s_hi)
             l_cmd.set_data(t, y_cmd)
             l_sense.set_data(t, y_sense)
-            right = max(t[-1], window_s)
             ax.set_xlim(right - window_s, right)
             canvas.draw_idle()
 
@@ -708,9 +910,16 @@ def run_gui(cfg: RigConfig, rate: float, hold_ms: float, window_s: float,
     root.protocol("WM_DELETE_WINDOW", on_close)
 
     root.after(100, refresh)
+    if readback:
+        root.after(300, open_readback)
+    if sweep is not None:                       # --sweep: start it at once
+        root.after(500, on_sweep)
     if autoclose is not None:                   # smoke test: sweep, then quit
-        root.after(500, lambda: worker.start_sweep(
-            L.piezo_ao_min_v, L.piezo_ao_max_v, rate, bounce=True))
+        if readback:                            # (readback: hold still instead)
+            root.after(500, lambda: worker.goto(5.0))
+        elif sweep is None:
+            root.after(500, lambda: worker.start_sweep(
+                L.piezo_ao_min_v, L.piezo_ao_max_v, rate, bounce=True))
         root.after(int(autoclose * 1000), on_close)
     try:
         root.mainloop()
@@ -739,6 +948,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--headless", type=float, metavar="SECONDS",
                    help="no window: sweep the whole range back and forth for "
                         "this long, print a report, exit")
+    p.add_argument("--readback", action="store_true",
+                   help="also open the readback-only window at start")
+    p.add_argument("--sweep", type=float, nargs=2, metavar=("FROM", "TO"),
+                   help="GUI: fill the sweep boxes with these volts and start "
+                        "sweeping at once, e.g. --sweep 4.90 4.98 for a 5 nm pull")
+    p.add_argument("--sweep-rate", type=float, default=None,
+                   help="GUI: the sweep box's rate in V/s (default: --rate). "
+                        "A 5 nm pull at the experiment's 20 nm/s is 0.32 V/s; "
+                        "0.02 V/s makes it slow enough to watch")
+    p.add_argument("--ymode", choices=("full", "sweep", "auto", "manual"),
+                   default="full", help="GUI: y-axis mode at start")
     p.add_argument("--out", type=Path, help="CSV to write (headless: always; "
                                             "GUI: the Save CSV button)")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -769,7 +989,10 @@ def main(argv: list[str] | None = None) -> int:
             return run_headless(cfg, args.headless, args.rate, args.hold_ms, out)
         return run_gui(cfg, args.rate, args.hold_ms, args.window, args.out,
                        autoclose=args.autoclose,
-                       config_name=args.config.name if args.config else "defaults")
+                       config_name=args.config.name if args.config else "defaults",
+                       readback=args.readback,
+                       sweep=tuple(args.sweep) if args.sweep else None,
+                       sweep_rate=args.sweep_rate, ymode_start=args.ymode)
     except (ConfigError, SafetyViolation) as exc:
         log.error("%s", exc)
         return 1
