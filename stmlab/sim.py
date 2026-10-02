@@ -124,6 +124,7 @@ class SimulatedDaqSession:
             # seen with the same delay as the other inputs, plus a little
             # noise from the low-res card.
             sense_v = (piezo_v * cal.piezo_nm_per_volt / cal.sense_nm_per_volt
+                       + cal.sense_zero_v
                        + self.rng.normal(0.0, 2e-4, piezo_v.shape))
             lim = self.cfg.channels.sense_ai_range_v
             self.last_sense_v = np.clip(sense_v, -lim, lim)

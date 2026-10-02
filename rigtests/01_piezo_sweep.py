@@ -112,6 +112,12 @@ class PiezoWorker(threading.Thread):
     def stop(self) -> None:
         self._quit.set()
 
+    def reset(self) -> None:
+        """Forget every point so far; the fit starts over from here."""
+        with self._lock:
+            self.samples.clear()
+            self.t0 = time.monotonic()
+
     def snapshot(self) -> np.ndarray:
         """(n, 3): seconds since start, commanded V, sense V (nan if none)."""
         with self._lock:
@@ -242,29 +248,209 @@ def run_headless(cfg: RigConfig, seconds: float, rate: float, hold_ms: float,
     return 0
 
 
-def report(cfg: RigConfig, data: np.ndarray) -> None:
+def fit_summary(cfg: RigConfig, data: np.ndarray) -> dict:
+    """Everything the report and the side panel say, as numbers.
+
+    Keys always present: n, seconds, has_sense. Once the command has moved:
+    corr, verdict ("not following" / "following"). Once it follows: a, b
+    (sense = a * command + b), resid_mv, scale (nm per sense volt, through
+    the command's nm/V), loop_mv / loop_nm / lag_s when both legs exist,
+    lsb_mv / lsb_nm, sense_min / sense_max, better_range, max_dev_nm.
+    """
+    C, M = cfg.cal, cfg.channels
+    out: dict = {"n": int(data.shape[0]),
+                 "seconds": float(data[-1, 0]) if data.shape[0] else 0.0,
+                 "has_sense": False, "verdict": None, "corr": None}
     if data.shape[0] < 2:
+        return out
+    cmd, sense = data[:, 1], data[:, 2]
+    out["cmd_min"], out["cmd_max"] = float(cmd.min()), float(cmd.max())
+    fin = np.isfinite(sense)
+    if not fin.any():
+        return out
+    out["has_sense"] = True
+    cmd, sense = cmd[fin], sense[fin]
+    r = following(cmd, sense)
+    out["corr"] = r
+    if r is None:
+        return out                               # not enough motion yet
+    out["verdict"] = "following" if r >= 0.9 else "not following"
+    if r < 0.9:
+        return out
+
+    a, b = np.polyfit(cmd, sense, 1)
+    resid = sense - (a * cmd + b)
+    out.update(a=float(a), b=float(b), resid_mv=float(1e3 * resid.std()),
+               scale=float(C.piezo_nm_per_volt / a))
+
+    # Legs: points where the command was moving up, and moving down. Points
+    # where it stood still belong to neither, and a leg has to span more than
+    # a volt before a line through it means anything.
+    step = np.r_[0.0, np.diff(cmd)]
+    rising, falling = step > 1e-4, step < -1e-4
+    if (rising.sum() > 10 and falling.sum() > 10
+            and np.ptp(cmd[rising]) > 1.0 and np.ptp(cmd[falling]) > 1.0):
+        mid = 0.5 * (cmd.min() + cmd.max())
+        up = np.polyval(np.polyfit(cmd[rising], sense[rising], 1), mid)
+        down = np.polyval(np.polyfit(cmd[falling], sense[falling], 1), mid)
+        loop = float(down - up)
+        rate = _rate_v_per_s(data)
+        out.update(loop_mid_v=float(mid), loop_mv=1e3 * loop,
+                   loop_nm=float(loop / a * C.piezo_nm_per_volt),
+                   lag_s=float(abs(loop / a) / 2 / rate) if rate > 0 else None)
+
+    lsb = 2 * M.sense_ai_range_v / 65536
+    out.update(lsb_mv=1e3 * lsb, lsb_nm=float(lsb / a * C.piezo_nm_per_volt),
+               sense_min=float(sense.min()), sense_max=float(sense.max()))
+    span = sense.max() - sense.min()
+    out["better_range"] = None
+    if sense.max() < 0.4 * M.sense_ai_range_v and span < 0.2 * M.sense_ai_range_v:
+        out["better_range"] = next(
+            (rr for rr in (1.0, 2.0, 5.0) if sense.max() < 0.8 * rr), None)
+    out["max_dev_nm"] = float(np.max(np.abs(
+        C.sense_volts_to_nm(sense) - C.piezo_volts_to_nm(cmd))))
+    return out
+
+
+def report(cfg: RigConfig, data: np.ndarray) -> None:
+    """The headless printout, from fit_summary."""
+    f = fit_summary(cfg, data)
+    if f["n"] < 2:
         print("no samples")
         return
-    cmd, sense = data[:, 1], data[:, 2]
-    print(f"{data.shape[0]} points over {data[-1, 0]:.1f} s; command "
-          f"{cmd.min():.3f} .. {cmd.max():.3f} V")
-    if np.isnan(sense).all():
+    print(f"{f['n']} points over {f['seconds']:.1f} s; command "
+          f"{f['cmd_min']:.3f} .. {f['cmd_max']:.3f} V")
+    if not f["has_sense"]:
         print("no sense readback (channels.low_res_device is None)")
         return
-    moving = cmd > 0.5                      # fit the ratio away from 0 V
-    if moving.sum() > 10:
-        ratio = float(np.median(sense[moving] / cmd[moving]))
-        expected = cfg.cal.piezo_nm_per_volt / cfg.cal.sense_nm_per_volt
-        print(f"sense / command = {ratio:.4f}  (expected "
-              f"{expected:.4f} = {cfg.cal.piezo_nm_per_volt:g} / "
-              f"{cfg.cal.sense_nm_per_volt:g})")
-        print(f"implied sense scale = {cfg.cal.piezo_nm_per_volt / ratio:.1f} "
-              f"nm/V  (config says {cfg.cal.sense_nm_per_volt:g})")
-    cmd_nm = cfg.cal.piezo_volts_to_nm(cmd)
-    sense_nm = cfg.cal.sense_volts_to_nm(sense)
-    print(f"largest |sense - command| = {np.nanmax(np.abs(sense_nm - cmd_nm)):.2f}"
-          f" nm with the config's scales")
+    if f["corr"] is None:
+        print("the command did not move enough to judge the readback")
+        return
+    print(f"correlation(sense, command) = {f['corr']:+.3f}")
+    if f["verdict"] == "not following":
+        print("THE SENSE LINE IS NOT FOLLOWING THE COMMAND. The readback "
+              "drifted or sat still while the piezo was commanded over "
+              f"{f['cmd_max'] - f['cmd_min']:.1f} V. No ratio can be taken "
+              "from this. Check: is the piezo driver box on; is its monitor "
+              f"output cabled to {cfg.channels.piezo_sense_path} on the "
+              "second card's terminal block; is the input wired as the "
+              f"config says (channels.sense_terminal = "
+              f"{cfg.channels.sense_terminal!r}; a BNC from a box is "
+              "usually 'rse').")
+        return
+    C = cfg.cal
+    # A straight-line fit, sense = a * command + b. The line need not pass
+    # through the origin: a driver box can sit at some volts with the
+    # command at 0 V, and that offset is cal.sense_zero_v.
+    print(f"sense = {f['a']:.5f} * command + {f['b']:.4f} V   (rms residual "
+          f"{f['resid_mv']:.1f} mV)")
+    print(f"slope {f['a']:.5f} V/V; config implies "
+          f"{C.piezo_nm_per_volt / C.sense_nm_per_volt:.5f} = "
+          f"{C.piezo_nm_per_volt:g} / {C.sense_nm_per_volt:g}")
+    print(f"with the command's {C.piezo_nm_per_volt:g} nm/V, this readback is "
+          f"{f['scale']:.0f} nm per sense volt, zero {f['b']:.4f} V. For the "
+          f"config:")
+    print(f'    "sense_nm_per_volt": {f["scale"]:.1f},')
+    print(f'    "sense_zero_v": {f["b"]:.4f},')
+    # Up legs against down legs at the same command: a loop is hysteresis
+    # of the piezo, or a lag in the driver; two sweep rates tell them apart
+    # (a lag loop grows with the rate, hysteresis does not).
+    if "loop_mv" in f:
+        lag = f"~{f['lag_s']:.2f} s" if f["lag_s"] is not None else "?"
+        print(f"up/down loop at {f['loop_mid_v']:.1f} V command: "
+              f"{f['loop_mv']:+.1f} mV = {f['loop_nm']:+.1f} nm "
+              f"(hysteresis, or a lag of {lag})")
+    print(f"readback spans {f['sense_min']:.3f} .. {f['sense_max']:.3f} V on a "
+          f"+/-{cfg.channels.sense_ai_range_v:g} V input: one ADC step is "
+          f"{f['lsb_mv']:.2f} mV = {f['lsb_nm']:.2f} nm of command")
+    if f["better_range"]:
+        print(f"    (channels.sense_ai_range_v = {f['better_range']:g} would give "
+              f"{cfg.channels.sense_ai_range_v / f['better_range']:.0f}x finer steps)")
+    print(f"largest |sense - command| = {f['max_dev_nm']:.1f} nm with the "
+          f"config's scale and zero")
+
+
+def panel_text(cfg: RigConfig, f: dict, now_cmd: float | None,
+               now_sense: float | None, config_name: str,
+               rate: float) -> str:
+    """The side panel: config, the position now, and the live fit."""
+    C, M, L = cfg.cal, cfg.channels, cfg.limits
+    lo_nm, hi_nm = C.piezo_volts_to_nm(L.piezo_ao_min_v), \
+        C.piezo_volts_to_nm(L.piezo_ao_max_v)
+    lines = [
+        f"CONFIG  {config_name}",
+        f" command  {M.path(M.ao_piezo):<10} {L.piezo_ao_min_v:.2f} .. "
+        f"{L.piezo_ao_max_v:.2f} V",
+        f" piezo    {C.piezo_nm_per_volt:g} nm/V  (Igor K_ZPiezoScale)",
+        f" window   {lo_nm:.0f} .. {hi_nm:.0f} nm of travel",
+        f" sense    {M.piezo_sense_path or 'none':<10} +/-{M.sense_ai_range_v:g} V"
+        f"  {M.sense_terminal}",
+        f" sense cal {C.sense_nm_per_volt:g} nm/V, zero {C.sense_zero_v:.4f} V",
+        "",
+        "NOW",
+    ]
+    if now_cmd is None:
+        lines.append(" (no samples yet)")
+    else:
+        lines.append(f" command  {now_cmd:7.3f} V  = {C.piezo_volts_to_nm(now_cmd):7.1f} nm")
+        if now_sense is None or not np.isfinite(now_sense):
+            lines.append(" sense    (no sense line)")
+        else:
+            lines.append(f" sense    {now_sense:7.4f} V = "
+                         f"{C.sense_volts_to_nm(now_sense):7.1f} nm")
+    lines += [f" slider ramps at {rate:g} V/s", ""]
+
+    lines.append(f"FIT  (all {f['n']} points, {f['seconds']:.0f} s)")
+    if not f["has_sense"]:
+        lines.append(" no sense line")
+    elif f["corr"] is None:
+        lines.append(" move the piezo > 1 V to fit")
+    elif f["verdict"] == "not following":
+        lines += [f" corr     {f['corr']:+.3f}   NOT FOLLOWING",
+                  " the readback ignores the command:",
+                  " driver box on? cable on the sense",
+                  " input? sense_terminal right?"]
+    else:
+        lines += [
+            f" corr     {f['corr']:+.4f}   following",
+            f" sense = {f['a']:.5f} x cmd + {f['b']:.4f} V",
+            f" rms resid {f['resid_mv']:.1f} mV",
+            f" => {f['scale']:.0f} nm per sense volt",
+        ]
+        if "loop_mv" in f:
+            lag = f"~{f['lag_s']:.2f} s" if f["lag_s"] is not None else "?"
+            lines += [f" loop     {f['loop_mv']:+.1f} mV = {f['loop_nm']:+.1f} nm",
+                      f"          (hysteresis, or lag {lag})"]
+        lines.append(f" ADC step {f['lsb_mv']:.2f} mV = {f['lsb_nm']:.2f} nm")
+        if f["better_range"]:
+            lines.append(f"          (+/-{f['better_range']:g} V input: "
+                         f"{M.sense_ai_range_v / f['better_range']:.0f}x finer)")
+        lines += ["",
+                  f' for "cal" in {config_name}:',
+                  f'   "sense_nm_per_volt": {f["scale"]:.1f},',
+                  f'   "sense_zero_v": {f["b"]:.4f},']
+    return "\n".join(lines)
+
+
+def _rate_v_per_s(data: np.ndarray) -> float:
+    """Typical |d command / dt| while moving, V/s."""
+    t, cmd = data[:, 0], data[:, 1]
+    if t.size < 3:
+        return 0.0
+    v = np.abs(np.diff(cmd) / np.maximum(np.diff(t), 1e-6))
+    v = v[v > 0.05]
+    return float(np.median(v)) if v.size else 0.0
+
+
+def following(cmd: np.ndarray, sense: np.ndarray) -> float | None:
+    """Correlation between readback and command, or None if the command
+    hardly moved. 0.99 is a connected sense line; a floating input gives
+    anything, usually near zero."""
+    if cmd.size < 10 or cmd.max() - cmd.min() < 1.0:
+        return None
+    if np.std(sense) == 0:
+        return 0.0
+    return float(np.corrcoef(cmd, sense)[0, 1])
 
 
 def save_csv(path: Path, data: np.ndarray) -> None:
@@ -280,7 +466,8 @@ def save_csv(path: Path, data: np.ndarray) -> None:
 # --------------------------------------------------------------------------
 
 def run_gui(cfg: RigConfig, rate: float, hold_ms: float, window_s: float,
-            out: Path | None, autoclose: float | None = None) -> int:
+            out: Path | None, autoclose: float | None = None,
+            config_name: str = "defaults") -> int:
     import tkinter as tk
     from tkinter import ttk
 
@@ -370,8 +557,10 @@ def run_gui(cfg: RigConfig, rate: float, hold_ms: float, window_s: float,
     rb = ttk.Frame(root)
     rb.pack(fill="x", padx=8, pady=4)
     ro = {}
+    titles = {"command": "command", "sense": "sense",
+              "ratio": "sense vs command (last 15 s)"}
     for col, key in enumerate(("command", "sense", "ratio")):
-        ttk.Label(rb, text=key, font=("Arial", 9, "bold")).grid(
+        ttk.Label(rb, text=titles[key], font=("Arial", 9, "bold")).grid(
             row=0, column=col, padx=12, sticky="w")
         ro[key] = ttk.Label(rb, text="--", font=("Courier", 10), width=30)
         ro[key].grid(row=1, column=col, padx=12, sticky="w")
@@ -387,8 +576,11 @@ def run_gui(cfg: RigConfig, rate: float, hold_ms: float, window_s: float,
     ttk.Button(rb, text="Save CSV", command=on_save).grid(
         row=0, column=4, rowspan=2, padx=12)
 
-    # -- the plot -----------------------------------------------------------
-    fig = Figure(figsize=(7.2, 3.6), dpi=100)
+    # -- the plot, with the fit panel beside it --------------------------------
+    body = ttk.Frame(root)
+    body.pack(fill="both", expand=True, padx=8, pady=4)
+
+    fig = Figure(figsize=(6.4, 3.6), dpi=100)
     ax = fig.add_subplot(111)
     ax.set_xlabel("time (s)", fontsize=9)
     ax.tick_params(labelsize=9)
@@ -400,10 +592,49 @@ def run_gui(cfg: RigConfig, rate: float, hold_ms: float, window_s: float,
                          label=f"sense  {sense_label}")
     ax.legend(loc="lower left", bbox_to_anchor=(0.0, 1.0), ncol=2,
               fontsize=8, frameon=False)
-    canvas = FigureCanvasTkAgg(fig, master=root)
-    canvas.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=4)
+    canvas = FigureCanvasTkAgg(fig, master=body)
+    canvas.get_tk_widget().pack(side="left", fill="both", expand=True)
+
+    side = ttk.LabelFrame(body, text="Fit and ranges")
+    side.pack(side="right", fill="y", padx=(8, 0))
+    panel = tk.Text(side, width=44, height=26, font=("Courier", 9),
+                    relief="flat", wrap="none", state="disabled",
+                    background=root.cget("background"))
+    panel.pack(fill="both", expand=True, padx=4, pady=4)
+    last_fit = {"f": fit_summary(cfg, np.zeros((0, 3))), "tick": 0}
+
+    def set_panel(text: str) -> None:
+        panel.config(state="normal")
+        panel.delete("1.0", "end")
+        panel.insert("1.0", text)
+        panel.config(state="disabled")
+
+    def on_clear():
+        worker.reset()
+        last_fit["f"] = fit_summary(cfg, np.zeros((0, 3)))
+        status.config(text="points cleared; the fit starts over")
+
+    def on_copy():
+        f = last_fit["f"]
+        if f.get("verdict") != "following":
+            status.config(text="nothing to copy: no fit yet")
+            return
+        text = (f'"sense_nm_per_volt": {f["scale"]:.1f},\n'
+                f'"sense_zero_v": {f["b"]:.4f},')
+        root.clipboard_clear()
+        root.clipboard_append(text)
+        status.config(text="config lines copied to the clipboard")
+
+    pbtn = ttk.Frame(side)
+    pbtn.pack(fill="x", padx=4, pady=(0, 4))
+    ttk.Button(pbtn, text="Clear points", command=on_clear).pack(
+        side="left", padx=2)
+    ttk.Button(pbtn, text="Copy config lines", command=on_copy).pack(
+        side="left", padx=2)
+
     status = ttk.Label(root, text="", font=("Arial", 9))
     status.pack(fill="x", padx=8, pady=(0, 6))
+    set_panel(panel_text(cfg, last_fit["f"], None, None, config_name, rate))
 
     def refresh():
         if worker.error:
@@ -434,18 +665,44 @@ def run_gui(cfg: RigConfig, rate: float, hold_ms: float, window_s: float,
                 ro["ratio"].config(text="")
             else:
                 ro["sense"].config(text=f"{s:7.4f} V  = {C.sense_volts_to_nm(s):7.1f} nm")
-                if c > 0.5:
+                recent = data[-300:]                 # the last ~15 s
+                fin = np.isfinite(recent[:, 2])
+                rc, rs = recent[fin, 1], recent[fin, 2]
+                r = following(rc, rs) if fin.any() else None
+                if r is None:
+                    ro["ratio"].config(text="(move the piezo to judge)")
+                elif r < 0.9:
+                    ro["ratio"].config(text=f"NOT FOLLOWING  r={r:+.2f}")
+                else:
+                    a = np.polyfit(rc, rs, 1)[0]
                     ro["ratio"].config(
-                        text=f"{s / c:.4f}  (config {C.piezo_nm_per_volt / C.sense_nm_per_volt:.4f})")
+                        text=f"slope {a:.4f}  (config {C.piezo_nm_per_volt / C.sense_nm_per_volt:.4f})")
             if not dragging["on"]:
                 slider.set(c)               # the knob follows the piezo
+
+            # The side panel: the fit over every point, twice a second.
+            last_fit["tick"] += 1
+            if last_fit["tick"] % 5 == 0:
+                last_fit["f"] = fit_summary(cfg, data[-50_000:])
+            set_panel(panel_text(cfg, last_fit["f"], float(c),
+                                 None if np.isnan(s) else float(s),
+                                 config_name, rate))
         root.after(100, refresh)
 
-    def on_close():
+    parked = {"done": False}
+
+    def park_and_close():
+        """Stop the worker and park the rig, exactly once."""
+        if parked["done"]:
+            return
+        parked["done"] = True
         worker.stop()
         worker.join(timeout=5)
+        close_rig(guard, rig)
+
+    def on_close():
         try:
-            close_rig(guard, rig)
+            park_and_close()
         finally:
             root.destroy()
     root.protocol("WM_DELETE_WINDOW", on_close)
@@ -455,7 +712,12 @@ def run_gui(cfg: RigConfig, rate: float, hold_ms: float, window_s: float,
         root.after(500, lambda: worker.start_sweep(
             L.piezo_ao_min_v, L.piezo_ao_max_v, rate, bounce=True))
         root.after(int(autoclose * 1000), on_close)
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        # Ctrl-C in the terminal, or any error out of the window: the rig
+        # is parked here, the same as on the close button.
+        park_and_close()
     return 0
 
 
@@ -506,10 +768,14 @@ def main(argv: list[str] | None = None) -> int:
                                f"piezo_sweep_{time.strftime('%Y%m%d_%H%M%S')}.csv")
             return run_headless(cfg, args.headless, args.rate, args.hold_ms, out)
         return run_gui(cfg, args.rate, args.hold_ms, args.window, args.out,
-                       autoclose=args.autoclose)
+                       autoclose=args.autoclose,
+                       config_name=args.config.name if args.config else "defaults")
     except (ConfigError, SafetyViolation) as exc:
         log.error("%s", exc)
         return 1
+    except KeyboardInterrupt:
+        log.info("interrupted; outputs parked")
+        return 130
 
 
 if __name__ == "__main__":

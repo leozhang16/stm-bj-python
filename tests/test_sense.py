@@ -176,3 +176,38 @@ def test_a_missing_readback_mid_session_is_stored_as_nan(tmp_path):
         assert len(session) == 2
         assert np.isfinite(session.piezo_sense(0)).all()
         assert np.isnan(session.piezo_sense(1)).all()
+
+
+def test_validate_rejects_an_unknown_sense_terminal():
+    from stmlab.config import ConfigError
+    cfg = RigConfig()
+    cfg.channels.low_res_device = "dev2"
+    cfg.channels.sense_terminal = "single"
+    with pytest.raises(ConfigError):
+        validate(cfg)
+    for ok in ("default", "RSE", "nrse", "diff"):
+        cfg.channels.sense_terminal = ok
+        validate(cfg)
+
+
+def test_sense_zero_is_removed_before_scaling():
+    cfg = RigConfig()
+    cfg.cal.sense_nm_per_volt = 1262.0
+    cfg.cal.sense_zero_v = 0.85
+    assert cfg.cal.sense_volts_to_nm(0.85) == pytest.approx(0.0)
+    assert cfg.cal.sense_volts_to_nm(1.35) == pytest.approx(631.0)
+
+
+def test_simulated_readback_with_an_offset_still_matches_the_command():
+    cfg, rig = _rig(two_cards=True)
+    cfg.cal.sense_nm_per_volt = 1262.0
+    cfg.cal.sense_zero_v = 0.85
+    try:
+        record = rig.hold(piezo_v=5.0, n_samples=400)
+        del record
+        # raw volts carry the offset; the nm conversion removes it
+        settled = rig.last_sense_v[-200:]      # the first samples are delayed
+        assert settled.mean() == pytest.approx(0.85 + 5.0 * 62 / 1262, abs=0.01)
+        assert rig.sense_nm == pytest.approx(rig.piezo_nm, abs=1.0)
+    finally:
+        rig.close()

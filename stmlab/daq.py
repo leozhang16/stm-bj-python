@@ -45,6 +45,20 @@ class DaqError(RuntimeError):
     pass
 
 
+def sense_terminal_config(m):
+    """ChannelMap.sense_terminal -> nidaqmx TerminalConfiguration."""
+    from nidaqmx.constants import TerminalConfiguration as TC
+    names = {"default": "DEFAULT", "rse": "RSE", "nrse": "NRSE", "diff": "DIFF"}
+    key = names.get(m.sense_terminal.lower())
+    if key is None:
+        raise DaqError(f"channels.sense_terminal {m.sense_terminal!r} is not "
+                       f"one of {sorted(names)}")
+    member = getattr(TC, key, None)
+    if member is None and key == "DIFF":        # older nidaqmx spelling
+        member = getattr(TC, "DIFFERENTIAL")
+    return member
+
+
 class DaqSession:
     """Open AI and AO tasks on one card, with a fixed record length.
 
@@ -72,6 +86,8 @@ class DaqSession:
         # "hardware" once the sense task triggers off ao/StartTrigger,
         # "software" if that route was refused and it is started by Python.
         self.sense_sync: str = "none"
+        self._warned_retrigger = False
+        self._warned_sense_rate = False
 
     # -- lifecycle --------------------------------------------------------
 
@@ -118,9 +134,10 @@ class DaqSession:
         if sense_path is not None:
             self._sense = nidaqmx.Task("stmbj_sense")
             self._sense.ai_channels.add_ai_voltage_chan(
-                sense_path, min_val=-m.sense_ai_range_v,
-                max_val=m.sense_ai_range_v)
-            log.info("piezo sense readback on %s", sense_path)
+                sense_path, terminal_config=sense_terminal_config(m),
+                min_val=-m.sense_ai_range_v, max_val=m.sense_ai_range_v)
+            log.info("piezo sense readback on %s (%s)", sense_path,
+                     m.sense_terminal)
 
         # Timing and triggering are deferred to configure(), which the first
         # play() calls with the record length it needs.
@@ -195,12 +212,15 @@ class DaqSession:
             self._retriggerable = True
         except Exception as exc:
             self._retriggerable = False
-            log.warning(
-                "card refused a retriggerable start trigger (%s); arming AI "
-                "once per play instead. Correct, but the input filter "
-                "re-settles at the start of every record -- keep "
-                "pre_pad_samples comfortably above the settling length or the "
-                "metallic-contact region of each trace will be corrupt.", exc)
+            if not self._warned_retrigger:          # once, not per configure()
+                self._warned_retrigger = True
+                log.warning(
+                    "card refused a retriggerable start trigger (%s); arming "
+                    "AI once per play instead. Correct, but the input filter "
+                    "re-settles at the start of every record -- keep "
+                    "pre_pad_samples comfortably above the settling length or "
+                    "the metallic-contact region of each trace will be "
+                    "corrupt.", str(exc).splitlines()[0])
 
         granted = float(self._ai.timing.samp_clk_rate)
         if self.granted_rate_hz is None:
@@ -211,23 +231,29 @@ class DaqSession:
                     "rate is what every time axis uses", rate, granted)
 
         if self._sense is not None:
-            self._configure_sense(n_samples, granted)
+            self._configure_sense(n_samples, rate, granted)
 
         if self._retriggerable:
             self._ai.start()      # armed once, stays armed for the session
         self._n = n_samples
 
-    def _configure_sense(self, n_samples: int, rate: float) -> None:
+    def _configure_sense(self, n_samples: int, rate: float,
+                         record_rate: float) -> None:
         """Time the sense task like the record and start it on AO's trigger.
 
-        The second card runs on its own oscillator, so it is asked for the
-        rate the first card actually granted; over one record the two clocks
-        drift apart by well under a sample. The start trigger crosses the PXI
-        backplane: DAQmx routes ``/dev1/ao/StartTrigger`` to the second card
-        by itself when both cards sit in one chassis that NI MAX knows about.
-        If that route is refused, the task is started from Python just before
-        the outputs instead -- good to about a millisecond, enough to watch
-        the piezo, not enough to time anything -- and says so loudly.
+        The second card runs on its own oscillator and is asked for the
+        *nominal* rate, not the rate the first card granted: a DSA card grants
+        40000.000035 Hz, and an X-series card asked for that rounds UP to the
+        next divisor of its 100 MHz timebase, 40016 Hz, four samples of
+        stretch over a trace. Asked for 40000 Hz it divides exactly, and the
+        two clocks then differ by under a part per million.
+
+        The start trigger crosses the PXI backplane: DAQmx routes
+        ``/dev1/ao/StartTrigger`` to the second card by itself when both
+        cards sit in one chassis that NI MAX knows about. If that route is
+        refused, the task is started from Python just before the outputs
+        instead -- good to about a millisecond, enough to watch the piezo,
+        not enough to time anything -- and says so loudly.
         """
         from nidaqmx.constants import AcquisitionType
 
@@ -257,11 +283,13 @@ class DaqSession:
                 self.cfg.channels.ao_start_trigger, exc)
 
         got = float(self._sense.timing.samp_clk_rate)
-        if abs(got - rate) > 1e-6:
+        stretch = n_samples * abs(got - record_rate) / record_rate
+        if stretch > 0.25 and not self._warned_sense_rate:
+            self._warned_sense_rate = True
             log.warning("sense card granted %.6f Hz against the record's "
                         "%.6f Hz; the readback will stretch by %.2f samples "
-                        "over one record", got, rate,
-                        n_samples * abs(got - rate) / rate)
+                        "over a %d-sample record", got, record_rate, stretch,
+                        n_samples)
 
     # -- the one verb -----------------------------------------------------
 

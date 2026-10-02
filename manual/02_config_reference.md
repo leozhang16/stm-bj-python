@@ -41,6 +41,7 @@ Igor's `SetUpHRTaskID1` (Functions_STMBJ.ipf:243).
 | `low_res_expected_product_type` | `"PXIe-6361"` | -- | -- | Product-type check of the second card in `verify_devices()` and `bringup 1`, only when `low_res_device` is set; `None` skips it |
 | `ai_piezo_sense` | `"ai2"` | -- | Setup1_STMBJ.ipf (SenseIn / POExtension) | Piezo sense readback: the driver box's monitor output, on the *low-res* card. Read in its own one-channel task during every play, same N and rate, started by the same `ao/StartTrigger`, and carried beside the record as `Rig.last_sense_v` / `TraceRecord.piezo_sense_v`. Needs `low_res_device`; `None` means no sense line |
 | `sense_ai_range_v` | `10.0` | V | -- | Range of the sense input |
+| `sense_terminal` | `"default"` | -- | -- | How the sense input is wired: `default` (the card's default, DIFF on an X-series card), `rse`, `nrse` or `diff`. A readback that drifts and ignores the command is the signature of a floating minus input: try `rse` for a BNC from a box |
 
 Class constants (`ClassVar`, deliberately excluded from `asdict()` and the
 data files because they describe this code's array layout, not the rig):
@@ -111,7 +112,8 @@ Measured constants; produced by `calibrate.py`, saved per session.
 | `current_zero_v` | `0.0` | V | -- | Preamp resting offset; hundreds of microvolts, drifts with temperature, re-measure every session (`validate` warns while it is 0) |
 | `piezo_nm_per_volt` | `62.0` | nm/V | `K_ZPiezoScale` | Displacement per volt at the DAQ output, end to end including the driver box |
 | `hv_amp_gain` | `None` | -- | -- | Driver-box gain if ever measured separately; documentation only, nothing multiplies by it |
-| `sense_nm_per_volt` | `314.0` | nm/V | `K_SenseScale` | Displacement per volt on the piezo *sense* line (`channels.ai_piezo_sense`). Converts the readback to nm for SenseInDisplay and `Session.piezo_sense()`; the displacement axis of every trace stays the commanded one |
+| `sense_nm_per_volt` | `314.0` | nm/V | `K_SenseScale` | Displacement per volt on the piezo *sense* line (`channels.ai_piezo_sense`): nm = (sense_v − `sense_zero_v`) × this. Converts the readback to nm for SenseInDisplay and `Session.piezo_sense()`; the displacement axis of every trace stays the commanded one. Measured by `rigtests/01_piezo_sweep.py`, which prints both numbers as config lines |
+| `sense_zero_v` | `0.0` | V | -- | What the sense line reads with the command at 0 V. A driver box's monitor output need not sit at zero when the piezo is parked |
 | `bias_output_sign` | `-1.0` | -- | Functions_STMBJ.ipf:347 | Igor writes `-(TipBias/1000)` to ao1 |
 | `voltage_input_sign` | `-1.0` | -- | Functions_STMBJ.ipf:358 | Igor negates ai0 to recover the junction voltage |
 | `ai_gain_error` | `1.0` | -- | -- | Slope from the DC loopback sweep; identity until measured |

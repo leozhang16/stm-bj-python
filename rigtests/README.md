@@ -13,7 +13,7 @@ card directly.
 
 | Test | What it moves | What it shows | Needs |
 |---|---|---|---|
-| `01_piezo_sweep.py` | Z piezo (`dev1/ao0`), by slider or by a sweep | commanded volts and the sense readback (`dev2/ai2`) against time; the sense/command ratio, which checks `cal.sense_nm_per_volt` | tip FAR from the sample; the second card for the readback |
+| `01_piezo_sweep.py` | Z piezo (`dev1/ao0`), by slider or by a sweep | commanded volts and the sense readback (`dev2/ai2`) against time; a side panel with the config's ranges, the position now, and a live straight-line fit of readback against command that gives `cal.sense_nm_per_volt` and `cal.sense_zero_v` as config lines (Copy config lines), plus the up/down loop and the ADC step | tip FAR from the sample; the second card for the readback |
 
 ## Running
 

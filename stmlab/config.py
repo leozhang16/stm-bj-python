@@ -43,6 +43,11 @@ class ConfigError(Exception):
 # Channels
 # --------------------------------------------------------------------------
 
+# Accepted spellings of ChannelMap.sense_terminal, mapped to DAQmx's
+# TerminalConfiguration names in daq.py.
+SENSE_TERMINALS = {"default", "rse", "nrse", "diff"}
+
+
 @dataclass
 class ChannelMap:
     """Which physical channel carries what.
@@ -86,6 +91,12 @@ class ChannelMap:
     # means "no sense line" even on a two-card rig.
     ai_piezo_sense: str | None = "ai2"
     sense_ai_range_v: float = 10.0
+    # How the sense input is wired: "default" (the card's default, DIFF on an
+    # X-series card), "rse" (single-ended, shield to AI GND -- a BNC from a
+    # box is usually this), "nrse" or "diff". A floating minus input reads a
+    # slow drift that follows nothing; if the readback ignores the command,
+    # try "rse" before suspecting the cable.
+    sense_terminal: str = "default"
 
     # Row indices into the (2, n) arrays that cross the DAQ boundary. ClassVar
     # so they stay out of asdict() and therefore out of the data files: they
@@ -282,7 +293,11 @@ class Calibration:
     # monitor output, read on the low-res card). Igor: K_SenseScale = 314.
     # Only used to turn the readback into nm for display and storage; the
     # displacement axis of every trace stays the commanded one.
+    # nm = (sense_v - sense_zero_v) * sense_nm_per_volt. Both numbers come
+    # from rigtests/01_piezo_sweep.py: the readback against the command is a
+    # straight line, and the line need not pass through 0 V.
     sense_nm_per_volt: float = 314.0
+    sense_zero_v: float = 0.0           # what the sense line reads at 0 V command
 
     # Igor writes -(TipBias/1000) to ao1 and negates ai0 to recover the
     # junction voltage (Functions_STMBJ.ipf:347, 358).
@@ -320,8 +335,9 @@ class Calibration:
         return v * self.piezo_nm_per_volt
 
     def sense_volts_to_nm(self, v: float | Any) -> Any:
-        """Piezo sense readback volts -> nm (Igor: SenseIn * K_SenseScale)."""
-        return v * self.sense_nm_per_volt
+        """Piezo sense readback volts -> nm (Igor: SenseIn * K_SenseScale),
+        after removing what the line reads with the piezo parked."""
+        return (v - self.sense_zero_v) * self.sense_nm_per_volt
 
 
 # --------------------------------------------------------------------------
@@ -674,6 +690,10 @@ def validate(cfg: RigConfig) -> list[str]:
             problems.append("cal.sense_nm_per_volt must be positive")
         if M.sense_ai_range_v <= 0:
             problems.append("channels.sense_ai_range_v must be positive")
+        if M.sense_terminal.lower() not in SENSE_TERMINALS:
+            problems.append(
+                f"channels.sense_terminal must be one of "
+                f"{sorted(SENSE_TERMINALS)}, not {M.sense_terminal!r}")
 
     # Sampling.
     if R.sample_rate_hz <= 0:

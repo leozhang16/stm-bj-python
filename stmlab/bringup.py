@@ -142,9 +142,11 @@ def step_devices(cfg: RigConfig) -> int:
                 # with the record. Commit only; never started.
                 try:
                     from nidaqmx.constants import TaskMode
+                    from .daq import sense_terminal_config
                     with nidaqmx.Task() as task:
                         task.ai_channels.add_ai_voltage_chan(
                             sense_path,
+                            terminal_config=sense_terminal_config(cfg.channels),
                             min_val=-cfg.channels.sense_ai_range_v,
                             max_val=cfg.channels.sense_ai_range_v)
                         task.timing.cfg_samp_clk_timing(
