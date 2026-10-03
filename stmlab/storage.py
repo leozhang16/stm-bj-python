@@ -255,6 +255,201 @@ def load_ibw(path: str | Path) -> np.ndarray:
     return np.asarray(binarywave.load(str(path))["wave"]["wData"])
 
 
+def write_ibw(path: str | Path, name: str, data: np.ndarray,
+              note: str = "", dx: float = 1.0, x0: float = 0.0,
+              data_units: str = "", x_units: str = "") -> Path:
+    """Write a numeric array as an Igor Binary Wave, format version 5.
+
+    Igor's own loader reads this (File -> Load Waves -> Load Igor Binary),
+    and so does ``igor2`` (see :func:`load_ibw`). Layout, from Igor's
+    Technical Note 003: a 64-byte BinHeader5, a 320-byte WaveHeader5, the
+    data, then the note. A 2-D array is written column-major, which is how
+    Igor stores a 2-D wave, so ``data[r, c]`` is Igor's ``w[r][c]``.
+
+    ``name`` must be a legal Igor wave name: letters, digits and underscores,
+    starting with a letter, at most 31 characters. ``dx``/``x0`` set the
+    row (x) scaling, ``data_units`` and ``x_units`` the units (3 chars max
+    in the header; longer units are dropped rather than truncated).
+    """
+    import struct
+
+    data = np.asarray(data)
+    if data.ndim not in (1, 2):
+        raise ValueError(f"an Igor wave of {data.ndim} dimensions is not "
+                         f"supported here (1 or 2)")
+    if not name or len(name) > 31 or not name[0].isalpha() or \
+            not all(ch.isalnum() or ch == "_" for ch in name):
+        raise ValueError(f"{name!r} is not a legal Igor wave name (letters, "
+                         f"digits, underscores; starts with a letter; <= 31)")
+
+    if data.dtype == np.float32:
+        igor_type, fmt_dtype = 2, "<f4"            # NT_FP32
+    elif data.dtype == np.float64:
+        igor_type, fmt_dtype = 4, "<f8"            # NT_FP64
+    elif np.issubdtype(data.dtype, np.integer):
+        igor_type, fmt_dtype = 0x20, "<i4"         # NT_I32
+        data = data.astype(np.int32)
+    else:
+        igor_type, fmt_dtype = 4, "<f8"
+        data = data.astype(np.float64)
+    payload = np.ascontiguousarray(data.ravel(order="F")).astype(fmt_dtype).tobytes()
+
+    n_dim = [0, 0, 0, 0]
+    n_dim[0] = int(data.shape[0])
+    if data.ndim == 2:
+        n_dim[1] = int(data.shape[1])
+    npnts = int(data.size)
+    note_bytes = note.encode("utf-8")
+    igor_epoch = 2082844800                       # 1904-01-01 -> 1970-01-01
+    now = int(time.time()) + igor_epoch
+
+    def units(s: str) -> bytes:
+        s = s.encode("ascii", "ignore")
+        return (s if len(s) <= 3 else b"").ljust(4, b"\0")
+
+    # WaveHeader5 (320 bytes before wData), little-endian, standard sizes.
+    wave_header = struct.pack(
+        "<L L L l h h 6s h 32s l L 4l 4d 4d 4s 16s h h d d L 4L 4L L 16l "
+        "h h h c c L l h h L L",
+        0,                      # next
+        now, now,               # creationDate, modDate
+        npnts,
+        igor_type,
+        0,                      # dLock
+        b"\0" * 6,              # whpad1
+        1,                      # whVersion
+        name.encode("ascii").ljust(32, b"\0"),
+        0,                      # whpad2
+        0,                      # dFolder
+        *n_dim,
+        float(dx), 1.0, 1.0, 1.0,         # sfA
+        float(x0), 0.0, 0.0, 0.0,         # sfB
+        units(data_units),
+        units(x_units) + b"\0" * 12,      # dimUnits[4][4]
+        0, 0,                             # fsValid, whpad3
+        0.0, 0.0,                         # top/botFullScale
+        0,                                # dataEUnits
+        0, 0, 0, 0,                       # dimEUnits
+        0, 0, 0, 0,                       # dimLabels
+        0,                                # waveNoteH
+        *([0] * 16),                      # whUnused
+        0, 0, 0,                          # aModified, wModified, swModified
+        b"\0", b"\0",                     # useBits, kindBits
+        0, 0, 0, 0, 0, 0)                 # formula, depID, whpad4, srcFldr,
+                                          # fileName, sIndices
+    assert len(wave_header) == 320, len(wave_header)
+
+    def bin_header(checksum: int) -> bytes:
+        return struct.pack(
+            "<h h l l l l 4l 4l l l l",
+            5,                            # version
+            checksum,
+            320 + len(payload),           # wfmSize
+            0,                            # formulaSize
+            len(note_bytes),              # noteSize
+            0,                            # dataEUnitsSize
+            0, 0, 0, 0,                   # dimEUnitsSize
+            0, 0, 0, 0,                   # dimLabelsSize
+            0, 0, 0)                      # sIndicesSize, optionsSize1/2
+
+    # Igor's checksum: the 16-bit words of the two headers (wData excluded)
+    # must sum to zero, modulo 2^16.
+    head = bin_header(0) + wave_header
+    total = sum(struct.unpack("<192h", head)) & 0xFFFF
+    checksum = (-total) & 0xFFFF
+    if checksum >= 0x8000:
+        checksum -= 0x10000
+    head = bin_header(checksum) + wave_header
+    assert sum(struct.unpack("<192h", head)) & 0xFFFF == 0
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(head)
+        fh.write(payload)
+        fh.write(note_bytes)
+    return path
+
+
+IGOR_PARAMETER_SLOTS = 20
+
+
+def igor_parameters(cfg: RigConfig, start_piezo_v: float = 0.0,
+                    timestamp: float | None = None) -> np.ndarray:
+    """The 20-entry parameter column Igor appended to every saved trace.
+
+    Slot layout from SavePullOut (Functions_STMBJ.ipf:501, 526-530), the
+    same one :func:`split_igor_block` reads back. Slots Igor used for things
+    this package does not have (6-8, 11, 14) are NaN.
+    """
+    R, C, K = cfg.ramp, cfg.cal, cfg.keithley
+    p = np.full(IGOR_PARAMETER_SLOTS, np.nan)
+    p[0] = R.pull_length_nm                        # pull length nm
+    p[1] = R.pull_rate_nm_per_s                    # pull rate nm/s
+    p[2] = R.approach_step_nm                      # approach step nm
+    p[3] = C.piezo_volts_to_nm(start_piezo_v)      # piezo offset nm (start)
+    p[4] = 0.0                                     # bias-save flag
+    p[5] = R.pull_length_nm                        # piezo travel nm
+    p[9] = 10.0 ** (6 - K.gain_exponent)           # current/volt, uA per V
+    p[10] = R.bias_v * 1e3                         # tip bias mV
+    p[12] = K.series_resistance_ohm                # series resistance
+    p[13] = R.engage_g0                            # conductance threshold
+    p[15] = 0.0                                    # Vzero
+    p[16] = 0.0                                    # Izero (Find Offset result)
+    t = time.time() if timestamp is None else timestamp
+    p[17] = t + 2082844800                         # Igor datetime (from 1904)
+    p[18] = cfg.echem.gate_mv                      # gate voltage
+    p[19] = K.suppress_const                       # current suppress
+    return p
+
+
+def save_igor_block(path: str | Path, cfg: RigConfig, traces_g0,
+                    start_piezo_v=None, timestamps=None,
+                    name: str | None = None) -> Path:
+    """Write conductance traces as one Igor block, Igor's SavePullOut layout.
+
+    One column per trace: the conductance in G0, two blank points (NaN),
+    then the 20 parameters. Loads straight into Igor and into the analysis
+    procedures that expect ``PullOut`` blocks; :func:`load_ibw` +
+    :func:`split_igor_block` read it back here. Single precision, as Igor's
+    waves were. ``name`` defaults to the file's stem.
+    """
+    traces = [np.asarray(t, dtype=float) for t in traces_g0]
+    if not traces:
+        raise ValueError("no traces to write")
+    n = traces[0].size
+    if any(t.size != n for t in traces):
+        raise ValueError("all traces in one block must have the same length")
+    n_traces = len(traces)
+    start_piezo_v = [0.0] * n_traces if start_piezo_v is None \
+        else list(start_piezo_v)
+    timestamps = [None] * n_traces if timestamps is None else list(timestamps)
+
+    block = np.full((n + 2 + IGOR_PARAMETER_SLOTS, n_traces), np.nan,
+                    dtype=np.float32)
+    for k, tr in enumerate(traces):
+        block[:n, k] = tr
+        block[n + 2:, k] = igor_parameters(cfg, start_piezo_v[k], timestamps[k])
+
+    path = Path(path)
+    wave_name = name or _igor_name(path.stem)
+    note = (f"stmlab conductance block, {n_traces} traces x {n} samples; "
+            f"rows: trace (G/G0), 2 blank, 20 parameters (SavePullOut layout); "
+            f"x = {cfg.ramp.pull_rate_nm_per_s / cfg.ramp.sample_rate_hz:.6g} "
+            f"nm per point")
+    return write_ibw(path, wave_name, block, note=note,
+                     dx=cfg.ramp.pull_rate_nm_per_s / cfg.ramp.sample_rate_hz,
+                     data_units="", x_units="nm")
+
+
+def _igor_name(stem: str) -> str:
+    """A legal Igor wave name made from a file stem."""
+    cleaned = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in stem)
+    if not cleaned or not cleaned[0].isalpha():
+        cleaned = "w_" + cleaned
+    return cleaned[:31]
+
+
 def split_igor_block(block: np.ndarray, n_parameters: int = 20
                      ) -> tuple[np.ndarray, np.ndarray]:
     """Split an Igor conductance block into (traces, parameters).
