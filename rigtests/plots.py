@@ -145,6 +145,41 @@ def plot_piezo(ax, cfg: RigConfig, t_s: np.ndarray, cmd_v: np.ndarray,
     ax.grid(True, alpha=0.3)
 
 
+def plot_readback(ax, cfg: RigConfig, t_s: np.ndarray, sense_v: np.ndarray,
+                  marks: dict | None = None, title: str = "piezo readback") -> None:
+    """The sense line alone, in nm, y axis fitted to the data.
+
+    No command line to hide behind: creep after a move, the lag on a ramp,
+    a step when something in the room changes, all at the scale they
+    happen on. The right-hand axis is the raw sense volts.
+    """
+    C = cfg.cal
+    ax.clear()
+    ok = np.isfinite(sense_v)
+    if not ok.any():
+        ax.set_title(f"{title}: no sense line", fontsize=9)
+        return
+    t, v = np.asarray(t_s)[ok], np.asarray(sense_v)[ok]
+    nm = C.sense_volts_to_nm(v)
+    ax.plot(t, nm, color=C_SENSE, lw=0.9)
+    lo, hi = float(nm.min()), float(nm.max())
+    span = max(hi - lo, 0.5)                   # never zoom below half a nm
+    pad = 0.08 * span
+    ax.set_ylim(lo - pad, hi + pad)
+    for label, when in (marks or {}).items():
+        ax.axvline(when, color="k", lw=0.5, ls=":", alpha=0.6)
+    ax.set_xlabel("time (s)", fontsize=8)
+    ax.set_ylabel("readback (nm)", fontsize=8, color=C_SENSE)
+    ax.tick_params(labelsize=8)
+    twin = _twin(ax)
+    twin.set_ylim((lo - pad) / C.sense_nm_per_volt + C.sense_zero_v,
+                  (hi + pad) / C.sense_nm_per_volt + C.sense_zero_v)
+    twin.set_ylabel("sense (V)", fontsize=8)
+    twin.tick_params(labelsize=8)
+    ax.set_title(f"{title}: {lo:.1f} .. {hi:.1f} nm", fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+
 def plot_approach(ax, cfg: RigConfig, piezo_v: np.ndarray, g0: np.ndarray,
                   railed: np.ndarray | None = None,
                   title: str = "approach") -> None:
@@ -230,6 +265,10 @@ def _twin(ax):
         ax._stm_twin = twin
     else:
         twin.clear()
+    # clear() forgets that this axis lives on the right; put it back.
+    twin.yaxis.tick_right()
+    twin.yaxis.set_label_position("right")
+    twin.yaxis.set_offset_position("right")
     return twin
 
 

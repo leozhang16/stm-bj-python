@@ -250,6 +250,8 @@ class Worker(threading.Thread):
         self.writer: storage.SessionWriter | None = None
         self.file_traces: list = []            # (g0, start_v, ts) for Igor export
         self.n_saved = 0
+        self.save_test_pulls = False           # into a TESTPULLS file, never data
+        self.writer_is_test = False
         self.accepted = 0
         self.attempts = 0
         self.rejections: dict[str, int] = {}
@@ -257,6 +259,7 @@ class Worker(threading.Thread):
         self.hist_centres = None
         self.hist_n = 0
         self.bias_dirty = True                 # set_bias before the next cycle
+        self.busy = False                      # a command is running
 
     # -- posting ------------------------------------------------------------
 
@@ -287,10 +290,13 @@ class Worker(threading.Thread):
             if self._quit.is_set():
                 break
             name, args = command[0], command[1:]
+            self.busy = True
             try:
                 getattr(self, "cmd_" + name, self.cmd_noop)(*args)
             except SafetyViolation as exc:
-                self.post("error", text=f"SAFETY: {exc}", fatal=True)
+                # Every SafetyViolation is a refusal made *before* the move,
+                # never a report of damage: show it, stop any run, carry on.
+                self.post("error", text=f"REFUSED: {exc}", fatal=False)
                 self.stop_flag.set()
             except ApproachError as exc:
                 self.post("error", text=f"approach: {exc}", fatal=False)
@@ -299,6 +305,7 @@ class Worker(threading.Thread):
                 self.post("error", text=f"{name}: {type(exc).__name__}: {exc}",
                           fatal=False)
             finally:
+                self.busy = False
                 self.readout()
         self.close_file()
 
@@ -312,7 +319,22 @@ class Worker(threading.Thread):
         zero = calibrate.measure_zero(self.rig)
         self.cfg.cal.current_zero_v = zero
         self.bias_dirty = True
-        self.status(f"preamp zero {zero * 1e6:+.2f} uV, written into cal")
+        text = f"preamp zero {zero * 1e6:+.2f} uV, written into cal"
+        # The sense line's zero drifts from day to day like any offset; the
+        # slope is the stable property. Re-measure the zero here, at whatever
+        # command the piezo sits at, assuming the config's slope.
+        sense = self.rig.last_sense_v
+        if sense is not None and sense.size:
+            C = self.cfg.cal
+            sense_v = float(np.mean(sense[sense.size // 2:]))
+            slope = C.piezo_nm_per_volt / C.sense_nm_per_volt   # sense V per command V
+            today = sense_v - slope * self.rig.piezo_v
+            was = C.sense_zero_v
+            C.sense_zero_v = today
+            text += (f"; sense zero today {today:.4f} V (config {was:.4f} V, "
+                     f"{(today - was) * C.sense_nm_per_volt:+.0f} nm of offset "
+                     f"removed for this session)")
+        self.status(text)
         self.post("zero", zero_v=zero)
 
     def cmd_bias(self) -> None:
@@ -366,9 +388,13 @@ class Worker(threading.Thread):
         if test:
             self.post("cycle", cycle=cycle, record=tr, g0=g0, disp=disp,
                       verdict=verdict)
-            self.status(f"test pull done (not saved, not counted); the "
-                        f"selector would say: {verdict.reason}; alignment "
-                        f"delay {tr.delay_samples} samples")
+            saved = ""
+            if self.save and self.save_test_pulls:
+                self._save(tr, verdict, test=True)
+                saved = f", saved to the TESTPULLS file ({self.n_saved})"
+            self.status(f"test pull done (not counted{saved}); the selector "
+                        f"would say: {verdict.reason}; alignment delay "
+                        f"{tr.delay_samples} samples")
             return verdict
         if verdict.accepted:
             self.accepted += 1
@@ -456,10 +482,20 @@ class Worker(threading.Thread):
             return None
         return self.hist_sum / self.hist_n
 
-    def _save(self, tr, verdict) -> None:
+    def _save(self, tr, verdict, test: bool = False) -> None:
+        """Append a trace to the session file, opening one if needed.
+
+        Test pulls go to a file whose name says TESTPULLS, and never into a
+        file holding real traces (nor the other way round): a file is either
+        data or a format test.
+        """
+        if self.writer is not None and self.writer_is_test != test:
+            self.close_file()
         if self.writer is None:
-            path = self.out_dir / f"rigtest02_{time.strftime('%Y%m%d_%H%M%S')}.h5"
+            tag = "rigtest02_TESTPULLS" if test else "rigtest02"
+            path = self.out_dir / f"{tag}_{time.strftime('%Y%m%d_%H%M%S')}.h5"
             self.writer = storage.SessionWriter(path, self.cfg).open()
+            self.writer_is_test = test
             self.file_traces = []
             self.post("file", path=str(path))
         self.writer.append(self.n_saved, tr, verdict)
@@ -562,12 +598,14 @@ def close_rig(guard: SafeSession, rig: Rig) -> None:
 # --------------------------------------------------------------------------
 
 def run_headless(cfg: RigConfig, n: int, out_dir: Path, igor_export: bool,
-                 require_engaged: bool, test_pull_v: float | None = None) -> int:
+                 require_engaged: bool, test_pull_v: float | None = None,
+                 save_test_pulls: bool = False) -> int:
     guard, rig = open_rig(cfg)
     mon = Monitor(rig)
     worker = Worker(cfg, rig, mon, save=True, out_dir=out_dir,
                     igor_export=igor_export)
     worker.require_engaged = require_engaged
+    worker.save_test_pulls = save_test_pulls
     try:
         worker.cmd_zero()
         if test_pull_v is not None:
@@ -613,7 +651,8 @@ def run_headless(cfg: RigConfig, n: int, out_dir: Path, igor_export: bool,
 # --------------------------------------------------------------------------
 
 def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
-            config_name: str, autoclose: float | None = None) -> int:
+            config_name: str, autoclose: float | None = None,
+            readback: bool = False) -> int:
     import tkinter as tk
     from tkinter import filedialog, ttk
 
@@ -767,13 +806,20 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                     variable=igor_var,
                     command=lambda: setattr(worker, "igor_export", igor_var.get())).grid(
         row=1, column=0, columnspan=2, sticky="w", padx=2)
+    tp_save_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(fb, text="save test pulls too, into a TESTPULLS file "
+                             "(format test, not data)",
+                    variable=tp_save_var,
+                    command=lambda: setattr(worker, "save_test_pulls",
+                                            tp_save_var.get())).grid(
+        row=2, column=0, columnspan=2, sticky="w", padx=2)
     ttk.Button(fb, text="New file", command=lambda: worker.send("newfile")).grid(
-        row=2, column=0, padx=2, pady=2, sticky="ew")
+        row=3, column=0, padx=2, pady=2, sticky="ew")
     ttk.Button(fb, text="Export Igor now", command=lambda: worker.send("export")).grid(
-        row=2, column=1, padx=2, pady=2, sticky="ew")
+        row=3, column=1, padx=2, pady=2, sticky="ew")
     file_lbl = tk.Label(fb, text="no file open", font=("Arial", 8), anchor="w",
                         wraplength=300, justify="left")
-    file_lbl.grid(row=3, column=0, columnspan=2, sticky="w", padx=2)
+    file_lbl.grid(row=4, column=0, columnspan=2, sticky="w", padx=2)
 
     # -- browse -----------------------------------------------------------------------
     bb = ttk.LabelFrame(left, text="Browse a saved session")
@@ -845,6 +891,42 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             side="left", padx=3)
     banner = tk.Label(top, text="", font=("Arial", 9, "bold"), fg="#b06000")
     banner.pack(side="right")
+    ttk.Button(top, text="Readback window",
+               command=lambda: open_readback()).pack(side="right", padx=8)
+
+    # -- the readback-only window ----------------------------------------------------
+    rb_state: dict = {"win": None}
+
+    def open_readback():
+        if rb_state["win"] is not None and rb_state["win"].winfo_exists():
+            rb_state["win"].lift()
+            return
+        win = tk.Toplevel(root)
+        win.title("piezo readback: " + (cfg.channels.piezo_sense_path or "no sense line"))
+        rb_state["win"] = win
+        fig2 = Figure(figsize=(7.0, 3.8), dpi=100)
+        ax_rb = fig2.add_subplot(111)
+        fig2.tight_layout(pad=2.0)
+        canvas2 = FigureCanvasTkAgg(fig2, master=win)
+        canvas2.get_tk_widget().pack(fill="both", expand=True)
+        note = ttk.Label(win, text="the sense line alone, this cycle, y axis "
+                                   "fitted to the data; redraws while a move runs",
+                         font=("Arial", 8))
+        note.pack(fill="x", padx=8, pady=(0, 6))
+
+        def refresh_rb():
+            if not win.winfo_exists():
+                rb_state["win"] = None
+                return
+            cyc = mon.snapshot()
+            if cyc.t:
+                plots.plot_readback(ax_rb, cfg, np.array(cyc.t), np.array(cyc.sense_v),
+                                    marks=cyc.marks)
+                fig2.tight_layout(pad=2.0)
+                canvas2.draw_idle()
+            win.after(300, refresh_rb)
+
+        refresh_rb()
 
     fig = Figure(figsize=(10.5, 6.6), dpi=100)
     axes = fig.subplots(2, 3)
@@ -962,6 +1044,22 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             draw_live()
             live["dirty"] = False
             banner.config(text="", fg="#b06000")
+        elif worker.busy and not live["paused"]:
+            # A move in progress: redraw the piezo and approach panels from
+            # the monitor every few polls, so the staircase grows as you watch.
+            live["tick"] = live.get("tick", 0) + 1
+            if live["tick"] % 3 == 0:
+                cyc = mon.snapshot()
+                if cyc.t:
+                    plots.plot_piezo(axes[1, 0], cfg, np.array(cyc.t),
+                                     np.array(cyc.piezo_v), np.array(cyc.sense_v),
+                                     marks=cyc.marks,
+                                     title="piezo in and out, this cycle (live)")
+                    if panel6.get() == "approach" and cyc.app_piezo_v:
+                        plots.plot_approach(axes[1, 2], cfg, cyc.app_piezo_v,
+                                            cyc.app_g0, cyc.app_railed,
+                                            title="approach (live)")
+                    canvas.draw_idle()
         if not live["paused"] and banner.cget("text").startswith("BROWSING"):
             banner.config(text="")
         root.after(150, poll)
@@ -988,6 +1086,8 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
 
     worker.send("noop")                              # first readout
     root.after(150, poll)
+    if readback:
+        root.after(400, open_readback)
     if autoclose is not None:
         root.after(300, lambda: worker.send("zero"))
         root.after(600, lambda: worker.send("run", 3))
@@ -1018,6 +1118,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="headless: instead of cycles, N pulls from this piezo "
                         "voltage with no approach and no contact (a rig with "
                         "no tip)")
+    p.add_argument("--readback", action="store_true",
+                   help="GUI: open the readback-only window at start")
+    p.add_argument("--save-test-pulls", action="store_true",
+                   help="headless with --test-pull: also save them to a "
+                        "TESTPULLS .h5 and export it for Igor (format test)")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--autoclose", type=float, help=argparse.SUPPRESS)
     args = p.parse_args(argv)
@@ -1033,10 +1138,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.headless is not None:
             return run_headless(cfg, args.headless, args.out, not args.no_igor,
-                                args.require_engaged, test_pull_v=args.test_pull)
+                                args.require_engaged, test_pull_v=args.test_pull,
+                                save_test_pulls=args.save_test_pulls)
         return run_gui(cfg, args.out, not args.no_igor,
                        args.config.name if args.config else "defaults",
-                       autoclose=args.autoclose)
+                       autoclose=args.autoclose, readback=args.readback)
     except (ConfigError, SafetyViolation) as exc:
         log.error("%s", exc)
         return 1
