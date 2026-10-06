@@ -200,12 +200,14 @@ class RampConfig:
     pull_rate_nm_per_s: float = 20.0        # G_PullOutRate
     bias_v: float = 0.100                   # G_TipBias, 100 mV
 
-    # Igor used 5 G0 (G_ConductanceThreshold), which at Rf = 1e6 V/A and
-    # 100 mV bias would need 38.7 V at the ADC -- unreachable on a +/-10 V
-    # input, which saturates at 1.29 G0. Igor's rig must have run the
-    # Keithley at a lower gain via SetGain. 0.5 G0 needs 3.87 V and is
-    # comfortably reachable; contact is additionally detected by preamp
-    # saturation, so a railed reading counts as engaged regardless.
+    # Igor used 5 G0 (G_ConductanceThreshold). Through the 106 kohm series
+    # resistor that is reachable: 0.92 V at the amplifier with 2.4 mV left
+    # across the junction (see amplifier_volts / junction_volts below).
+    # Without the resistor it would need 38.7 V and could never be seen.
+    # 0.5 G0 is a shallower contact, 0.76 V and 20 mV across the junction;
+    # whether to go back to Igor's 5 is a physics choice (how deep a
+    # contact each pull starts from), not a range problem. A railed
+    # amplifier counts as contact as well, where the amplifier can rail.
     engage_g0: float = 0.5                  # G_ConductanceThreshold
     break_g0: float = 5e-4                  # G_EndOfTraceNoiseThreshold
     approach_step_nm: float = 0.5           # G_MakeContactApproachStepSize
@@ -554,6 +556,53 @@ def _log_unknown(klass_name: str, keys: set[str]) -> None:
 
 
 # --------------------------------------------------------------------------
+# The current path: bias source, series resistor, junction, amplifier
+# --------------------------------------------------------------------------
+#
+# The bias is applied through ``keithley.series_resistance_ohm`` (Igor's
+# G_SeriesResistance, 106 kohm on this rig), so the current a junction of
+# conductance G draws is
+#
+#     I = V_bias / (R_series + 1/G)
+#
+# and the voltage left across the junction is V_bias / (1 + G R_series). The
+# conductance arithmetic never needs this: it divides the current by the
+# junction voltage *measured* on ai0, so the drop is in the data. But every
+# estimate of "what will the amplifier read at X G0" does, and without it the
+# validator believes 1 G0 is 7.75 V at the amplifier when it is 0.84 V, and
+# refuses biases and thresholds that are perfectly usable. Set the resistance
+# to 0 for a rig without the resistor.
+
+def amplifier_volts(cfg: RigConfig, g0: float) -> float:
+    """Amplifier output, in volts, for a junction of ``g0`` at the config's
+    bias, series resistor included (the zero not added)."""
+    g = g0 * G0_SIEMENS
+    rs = max(0.0, cfg.keithley.series_resistance_ohm)
+    current = cfg.ramp.bias_v * g / (1.0 + g * rs)
+    return cfg.cal.preamp_gain_v_per_a * current
+
+
+def junction_volts(cfg: RigConfig, g0: float) -> float:
+    """Voltage left across a junction of ``g0`` once the series resistor has
+    taken its share of the bias."""
+    g = g0 * G0_SIEMENS
+    rs = max(0.0, cfg.keithley.series_resistance_ohm)
+    return cfg.ramp.bias_v / (1.0 + g * rs)
+
+
+def conductance_at_amplifier_volts(cfg: RigConfig, v: float) -> float:
+    """The junction conductance, in G0, that puts ``v`` volts out of the
+    amplifier; inf when no junction can, because the series resistor caps the
+    current at bias / R_series."""
+    current = v / cfg.cal.preamp_gain_v_per_a
+    rs = max(0.0, cfg.keithley.series_resistance_ohm)
+    left = cfg.ramp.bias_v - current * rs
+    if left <= 0:
+        return float("inf")
+    return current / left / G0_SIEMENS
+
+
+# --------------------------------------------------------------------------
 # Validation
 # --------------------------------------------------------------------------
 
@@ -569,13 +618,18 @@ def validate(cfg: RigConfig) -> list[str]:
 
     C, R, L, M = cfg.cal, cfg.ramp, cfg.limits, cfg.channels
 
-    # THE range check: does 1 G0 fit in the AI range?
-    v_at_1g0 = C.g0_to_volts(1.0, R.bias_v)
+    # THE range check: does 1 G0 fit in the AI range? With a series resistor
+    # the current is capped at bias / R_series whatever the junction does, so
+    # on this rig (106 kohm) 1 G0 is 0.84 V at the amplifier, not 7.75 V, and
+    # nothing clips at 100 mV; the check matters again at high gain or bias,
+    # or on a rig with no resistor.
+    v_at_1g0 = amplifier_volts(cfg, 1.0)
+    g_at_range = conductance_at_amplifier_volts(cfg, M.ai_range_v)
     if v_at_1g0 > M.ai_range_v:
         problems.append(
             f"1 G0 produces {v_at_1g0:.3f} V but the AI range is "
             f"+/-{M.ai_range_v} V -- everything above "
-            f"{M.ai_range_v / v_at_1g0:.3g} G0 will CLIP. "
+            f"{g_at_range:.3g} G0 will CLIP. "
             f"Reduce preamp gain, reduce bias, or widen the range.")
     elif v_at_1g0 > L.preamp_saturation_v:
         warnings.append(
@@ -585,23 +639,34 @@ def validate(cfg: RigConfig) -> list[str]:
             f"science is in the retraction below 1 G0 -- but the engage "
             f"threshold cannot be trusted above that point.")
 
-    # Is the engage threshold reachable before the preamp rails? This is the
-    # check that Igor's defaults would have failed: an engage threshold above
-    # the saturation point makes the approach loop run the piezo to its
-    # ceiling and give up, with no indication of why.
-    v_at_engage = C.g0_to_volts(R.engage_g0, R.bias_v)
+    # Is the engage threshold reachable before the preamp rails? Without a
+    # series resistor an engage threshold above the saturation point makes
+    # the approach loop run the piezo to its ceiling and give up, with no
+    # indication of why. With the resistor the amplifier may never rail at
+    # all; then the question is whether enough voltage is left across the
+    # junction at the threshold for ai0 to judge it.
+    v_at_engage = amplifier_volts(cfg, R.engage_g0)
     v_saturation = min(L.preamp_saturation_v, M.ai_range_v)
+    g_saturation = conductance_at_amplifier_volts(cfg, v_saturation)
     if v_at_engage > v_saturation:
         warnings.append(
             f"engage threshold {R.engage_g0:g} G0 needs {v_at_engage:.1f} V "
             f"at the ADC but the input saturates at {v_saturation:.1f} V "
-            f"({C.volts_to_g0(v_saturation, R.bias_v):.2f} G0). Contact will "
+            f"({g_saturation:.2f} G0). Contact will "
             f"only ever be detected by saturation, never by the threshold. "
-            f"Lower engage_g0 below {C.volts_to_g0(v_saturation, R.bias_v):.2f}"
+            f"Lower engage_g0 below {g_saturation:.2f}"
             f" or reduce the preamp gain.")
+    vj_engage = junction_volts(cfg, R.engage_g0)
+    if vj_engage < 1e-3:
+        warnings.append(
+            f"at the engage threshold of {R.engage_g0:g} G0 the series "
+            f"resistor ({cfg.keithley.series_resistance_ohm:.0f} ohm) leaves "
+            f"only {vj_engage * 1e3:.2f} mV across the junction; contact is "
+            f"judged on that voltage, so ai0's noise matters. Lower "
+            f"engage_g0, or raise the bias.")
 
     # Can the break threshold be told apart from the noise floor?
-    v_at_break = C.g0_to_volts(R.break_g0, R.bias_v)
+    v_at_break = amplifier_volts(cfg, R.break_g0)
     if v_at_break < 5e-6:
         warnings.append(
             f"break threshold {R.break_g0:g} G0 is only {v_at_break * 1e6:.2f}"

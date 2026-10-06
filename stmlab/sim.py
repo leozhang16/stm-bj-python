@@ -18,6 +18,12 @@ to handle:
 * a fixed AI/AO group delay, so ``find_alignment_edge`` has something to find
 * a noise floor in the current channel, so the tunnelling tail bottoms out at
   a finite conductance instead of running to zero
+* the series resistor between the bias output and the junction
+  (``keithley.series_resistance_ohm``) and the card's 1 Mohm input: in
+  contact the current is capped at bias / R_series and the junction voltage
+  on ai0 collapses to a few mV, exactly as on the rig, so the record looks
+  like Igor's HighRes window and contact is found by the threshold, not by
+  a railed amplifier
 """
 
 from __future__ import annotations
@@ -43,6 +49,10 @@ class SimulatedDaqSession:
 
         self.group_delay = int(group_delay_samples)
         self.noise_v_rms = float(noise_v_rms)
+        # The card's input impedance on ai0: with the junction open it forms
+        # a divider with the series resistor, which is why a 100 mV bias
+        # reads about 90 mV on the rig.
+        self.ai_input_ohm = 1.0e6
         self.p_molecule = float(molecule_probability)
         self.molecule_log_g0 = float(molecule_log_g0)
 
@@ -110,12 +120,22 @@ class SimulatedDaqSession:
         # instrument layer's tracker believes, and it should.
         self.piezo_nm = float(waveform[0, -1] * cal.piezo_nm_per_volt)
 
-        junction_v = cal.voltage_input_sign * bias_v
-        current_a = g0 * G0_SIEMENS * junction_v
+        # The loop: bias output, series resistor, the junction (in parallel
+        # with the card's input impedance on ai0), the amplifier at virtual
+        # ground. The node between resistor and junction is what ai0 reads.
+        g = g0 * G0_SIEMENS                              # siemens
+        rs = max(0.0, self.cfg.keithley.series_resistance_ohm)
+        zin = self.ai_input_ohm
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r_j = np.where(g > 0, 1.0 / np.maximum(g, 1e-30), np.inf)
+            r_par = np.where(np.isinf(r_j), zin, r_j * zin / (r_j + zin))
+        node_v = bias_v * r_par / (rs + r_par)          # as the bias row sees it
+        junction_v = cal.voltage_input_sign * node_v
+        current_a = junction_v * g                       # through the junction
         current_v = current_a * cal.preamp_gain_v_per_a + cal.current_zero_v
 
         current_v += self.rng.normal(0.0, self.noise_v_rms, current_v.shape)
-        voltage_v = bias_v + self.rng.normal(0.0, self.noise_v_rms * 4,
+        voltage_v = node_v + self.rng.normal(0.0, self.noise_v_rms * 4,
                                              bias_v.shape)
 
         if self.cfg.channels.has_piezo_sense:
@@ -168,8 +188,13 @@ class SimulatedDaqSession:
 
             g0[single_atom] = 1.0 + 0.04 * self.rng.normal(
                 size=int(single_atom.sum()))
-            g0[metallic] = (1.0 + 4.0 * (penetration[metallic] - plateau)
-                            + 0.5 * self.rng.normal(size=int(metallic.sum())))
+            # Deeper in, the neck is a few atoms across and loses them one at
+            # a time as it is pulled: integer-ish steps every 0.125 nm with a
+            # slight slope within each, 5 % noise. A pull that starts 0.5 nm
+            # in shows 4, 3, 2, 1 G0 on the way out, as Igor's traces do.
+            x = 8.0 * (penetration[metallic] - plateau)
+            g0[metallic] = (1.0 + np.floor(x) + 0.3 * (x - np.floor(x))
+                            + 0.05 * self.rng.normal(size=int(metallic.sum())))
 
         broken = ~contact
         if not broken.any():

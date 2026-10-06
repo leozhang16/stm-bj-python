@@ -46,9 +46,11 @@ for _ in range(12):
     print(f"  {rig.piezo_v:10.4f} {rig.piezo_nm:11.1f} {g0:12.3e}  {railed}")
     if railed or g0 > cfg.ramp.engage_g0:
         print("  ^ contact. Note it is detected EITHER by crossing engage_g0")
-        print("    (0.5 G0) OR by the preamp railing: at Rf=1e6 and 100 mV the")
-        print("    input saturates at 1.23 G0, so hard contact reads as a rail")
-        print("    rather than as a big number. Rig.probe() returns both.")
+        print("    (0.5 G0) OR by the preamp railing. Through the 106 kohm series")
+        print("    resistor the current is capped at bias/R and the amplifier does")
+        print("    not rail at 100 mV, so the threshold does the work; on a rig")
+        print("    without the resistor the input saturates at 1.23 G0 and hard")
+        print("    contact reads as a rail. Rig.probe() returns both.")
         break
 
 rule("engage(): break contact first, then close in slowly")

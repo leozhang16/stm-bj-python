@@ -86,6 +86,81 @@ def test_monitor_sees_every_play_and_probe_without_changing_them(ap, cfg):
         rig.close()
 
 
+# -- moves made by hand: the slider and the step buttons -------------------------
+
+def test_a_ramped_move_lands_on_the_target_and_is_clamped(cfg):
+    rig = Rig(cfg, session=SimulatedDaqSession(cfg, seed=1)).open()
+    try:
+        rec = rig.piezo_ramp_to(2.0)
+        assert rig.piezo_v == pytest.approx(2.0)
+        assert rec.shape == (2, int(round(0.05 * rig.sample_rate_hz))
+                             + cfg.ramp.settle_samples)
+        # The bias row is untouched by a move.
+        assert rig.bias_v == pytest.approx(cfg.ramp.bias_v)
+        rig.piezo_ramp_to(25.0)                       # beyond the 10 V ceiling
+        assert rig.piezo_v == pytest.approx(cfg.limits.piezo_ao_max_v)
+    finally:
+        rig.close()
+
+
+def test_a_slider_move_into_contact_engages_and_a_pull_follows(ap, cfg, tmp_path):
+    """Igor's slider-then-measure: a contact made by hand can be pulled from."""
+    guard, rig = ap.open_rig(cfg)
+    mon = ap.Monitor(rig)
+    worker = ap.Worker(cfg, rig, mon, save=False, out_dir=tmp_path,
+                       igor_export=False)
+    try:
+        worker.cmd_goto(1.0)                           # far from the surface
+        assert rig.state is not ap.RigState.ENGAGED
+        # The simulated surface sits at 300 nm: go past it, by hand.
+        worker.cmd_goto(cfg.cal.nm_to_piezo_volts(300.5))
+        assert rig.state is ap.RigState.ENGAGED
+        events = []
+        while not worker.events.empty():
+            events.append(worker.events.get_nowait())
+        assert any(k == "moved" for k, _ in events)
+        assert any(k == "status" and "in contact" in p["text"] for k, p in events)
+        worker.cmd_pull()                              # allowed from a hand-made contact
+        assert worker.attempts == 1
+        # Stepping apart by hand leaves contact; the state says so.
+        worker.cmd_step(-200.0)
+        assert rig.state is not ap.RigState.ENGAGED
+    finally:
+        worker.close_file()
+        ap.close_rig(guard, rig)
+
+
+# -- the trace plot with the readback over it -----------------------------------
+
+def test_trace_plot_draws_the_readback_retraction_on_a_right_axis(ap, cfg):
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.figure import Figure
+    from stmlab import analysis
+
+    cfg.channels.low_res_device = "dev2"
+    n = cfg.ramp.n_pull_samples
+    disp = analysis.displacement_nm(n, cfg.ramp)
+    g0 = np.full(n, 1e-5)
+    # A readback that follows the command exactly: the piezo starts at 5 V
+    # and retracts by disp, so the sense line reads that position in nm.
+    pos_nm = cfg.cal.piezo_volts_to_nm(5.0) - disp
+    sense = pos_nm / cfg.cal.sense_nm_per_volt + cfg.cal.sense_zero_v
+
+    ax = Figure().add_subplot(111)
+    ap.plots.plot_trace(ax, cfg, g0, disp, None, sense_v=sense)
+    twin = ax._stm_twin
+    assert twin.get_visible()
+    retract = twin.lines[-1].get_ydata()
+    assert retract[0] == 0.0                                    # zeroed
+    assert retract[-1] == pytest.approx(disp[-1], abs=0.1)     # 5 nm back
+    assert retract[n // 2] == pytest.approx(disp[n // 2], abs=0.05)
+
+    # Without a readback the right axis is hidden, not left with stale lines.
+    ap.plots.plot_trace(ax, cfg, g0, disp, None, sense_v=None)
+    assert not ax._stm_twin.get_visible()
+
+
 # -- a headless cycle end to end --------------------------------------------------
 
 def test_headless_cycles_save_and_export(ap, cfg, tmp_path):

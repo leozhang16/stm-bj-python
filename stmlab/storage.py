@@ -164,6 +164,7 @@ class SessionWriter:
 
         self._n += 1
         if self._n % self.chunk_traces == 0:
+            h5.attrs["n_traces"] = self._n       # so a killed session still counts
             h5.flush()
 
     def write_summary(self, stats: dict) -> None:
@@ -187,6 +188,11 @@ class Session:
             json.loads(self._h5.attrs["config_json"]))
 
     def __len__(self) -> int:
+        # The dataset is the truth. The n_traces attribute is only final
+        # when the writer closed cleanly, so a file from a session that was
+        # killed, or one still being written, would otherwise read as empty.
+        if "current_v" in self._h5:
+            return int(self._h5["current_v"].shape[0])
         return int(self._h5.attrs.get("n_traces", 0))
 
     def __enter__(self) -> "Session":

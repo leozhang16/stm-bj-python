@@ -7,26 +7,45 @@
 The fine-piezo approach and the constant-bias pull, exactly as the experiment
 does them (``approach.engage`` and ``trace.single_trace``), driven by buttons
 instead of a loop, with the settings Igor's Inputs tab had, each change
-checked against the safety rules before it is accepted, and six live plots:
+checked against the safety rules before it is accepted, and four live plots:
 
     record          junction V and current during the last play (Igor HighRes)
-    trace           log G vs displacement, with the accept/reject verdict
-    gold level      G vs displacement, linear 0..5 (AuAuConductanceLevel)
+    trace           log G vs displacement with the accept/reject verdict, and
+                    over it, in grey on a right-hand axis, how far the piezo
+                    readback says the piezo retracted during that same pull
+                    (dotted diagonal = the command; a lag sits below it)
     piezo in/out    commanded position (and the readback) over the whole cycle
     histogram       counts per trace over the accepted traces so far
-    approach / I-V  conductance at each approach step vs piezo position,
-                    or current against junction voltage for the pull
+
+plus three more on request, each a checkbox ("also show") or ``--show``:
+
+    gold level      G vs displacement, linear 0..5 (AuAuConductanceLevel):
+                    the single-atom plateau as a flat step at exactly 1
+    approach        conductance at each approach step vs piezo position:
+                    where the junction closed
+    I-V             current against junction voltage for the pull
 
 Accepted traces are saved to the package's HDF5 session file as raw volts
 (``storage.SessionWriter``), and can be exported as Igor binary waves in the
 layout Igor's SavePullOut used, so Igor opens them. A saved session can be
 browsed in the same plots.
 
+The Piezo box is Igor's PiezoGroupbox: a slider over the piezo's whole
+voltage range (applies when the mouse is released, as Igor's did), Step
+closer / Step apart by Z nm, and under them Igor's readouts -- I (uA),
+V (mV), Piezo (V) and the sense line -- refreshed every 0.3 s while the rig
+is idle by the same quiet 10 ms hold the Monitor window uses (Igor's
+Background Sampling), with Igor's beep above 0.15 uA. A move made by hand
+is ramped over 50 ms, then the junction is probed: in contact, the state
+becomes ENGAGED and Pull once works from there; Approach + pull and Run N
+start from wherever the slider left the tip.
+
 WHAT THIS DOES NOT DO: the coarse approach. Bring the tip within the fine
 piezo's reach (620 nm) by hand or with Igor's actuator controls first. When
 this program starts it parks the piezo at 0 V, so whatever extension Igor
-left is undone; the approach then extends the piezo until contact. Close
-Igor's DAQ tasks (or Igor) before starting, or the card will be busy.
+left is undone; the approach (or the slider) then extends the piezo until
+contact. Close Igor's DAQ tasks (or Igor) before starting, or the card will
+be busy.
 """
 
 from __future__ import annotations
@@ -49,7 +68,7 @@ if str(_ROOT) not in sys.path:
 
 from stmlab import analysis, approach, calibrate, storage, trace   # noqa: E402
 from stmlab.approach import ApproachError                           # noqa: E402
-from stmlab.config import ConfigError, RigConfig, validate         # noqa: E402
+from stmlab.config import ConfigError, G0_SIEMENS, RigConfig, validate   # noqa: E402
 from stmlab.instrument import Rig                                   # noqa: E402
 from stmlab.safety import RigState, SafeSession, SafetyViolation    # noqa: E402
 
@@ -57,6 +76,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import plots                                                        # noqa: E402
 
 log = logging.getLogger("rigtests.approach_pull")
+
+# Shown in the window title and by --version, so a patch can say which
+# version it applies to and you can see which one you have.
+__version__ = "v24"
 
 
 # --------------------------------------------------------------------------
@@ -78,6 +101,11 @@ SETTINGS = [
     ("ramp.smash_in_nm", "Smash in", "", "nm", float, 1),
     ("ramp.smash_out_nm", "Smash out", "", "nm", float, 1),
     ("ramp.smash_every", "Smash every", "", "attempts (0 = never)", int, 1),
+    # Not a trajectory setting but a description of the wiring: the resistor
+    # between the bias output and the junction. The validator's amplifier
+    # estimates use it; the conductance itself does not (it divides by the
+    # measured junction voltage). 0 means there is no resistor.
+    ("keithley.series_resistance_ohm", "Series resistor", "G_SeriesResistance", "ohm", float, 1),
 ]
 
 
@@ -118,13 +146,22 @@ def check_settings(cfg: RigConfig, changes: dict) -> tuple[list[str], list[str]]
         problems.append("pads cannot be negative")
     if R.smash_every < 0:
         problems.append("smash every must be 0 or more")
+    if trial.keithley.series_resistance_ohm < 0:
+        problems.append("the series resistor cannot be negative (0 = none)")
     if problems:
         return problems, []
     try:
         warnings = validate(trial)
     except ConfigError as exc:
         return [str(exc)], []
-    return [], list(warnings)
+    # Only warnings the change *caused*: the validator also repeats its
+    # standing remarks about the config as a whole (the granted sample rate,
+    # the unmeasured driver gain), which are not news.
+    try:
+        standing = set(validate(cfg))
+    except ConfigError:
+        standing = set()
+    return [], [w for w in warnings if w not in standing]
 
 
 # --------------------------------------------------------------------------
@@ -141,6 +178,13 @@ class CycleLog:
     app_piezo_v: list = field(default_factory=list)   # at each probe
     app_g0: list = field(default_factory=list)
     app_railed: list = field(default_factory=list)
+    # What the inputs saw, play after play, on the same clock as ``t``: the
+    # whole cycle's junction voltage and amplifier output, raw volts, with a
+    # NaN between plays so the line breaks where nothing was recorded. A
+    # pull is kept whole; a hold is thinned to 100 points.
+    rec_t: list = field(default_factory=list)
+    rec_v: list = field(default_factory=list)
+    rec_i: list = field(default_factory=list)
     last_record: np.ndarray | None = None
     last_waveform: np.ndarray | None = None
 
@@ -157,6 +201,9 @@ class Monitor:
         self.lock = threading.Lock()
         self.cycle = CycleLog()
         self.t0 = time.monotonic()
+        # While True, plays update last_record (so the readout follows)
+        # but are kept out of the cycle log: the idle monitor's holds.
+        self.quiet = False
         self._play = rig.play
         self._probe = rig.probe
         rig.play = self.play            # instance attribute shadows the method
@@ -183,6 +230,10 @@ class Monitor:
             sense = None
         with self.lock:
             c = self.cycle
+            if self.quiet:
+                c.last_record = record
+                c.last_waveform = waveform
+                return record
             # The cycle clock: real time, but never running backwards and
             # never shorter than the plays themselves, so the picture is the
             # same on the rig (where a play takes n/fs seconds of wall time)
@@ -203,6 +254,17 @@ class Monitor:
                 c.piezo_v.append(float(waveform[0, -1]))
                 c.sense_v.append(float(np.mean(sense[-50:])) if sense is not None
                                  else float("nan"))
+            # The inputs, for the record panel: everything the card read
+            # this cycle, against the same clock.
+            M = self.rig.cfg.channels
+            ridx = np.arange(0, n, 1 if n > 2000 else max(1, n // 100))
+            if c.rec_t:
+                c.rec_t.append(float("nan"))
+                c.rec_v.append(float("nan"))
+                c.rec_i.append(float("nan"))
+            c.rec_t.extend((t_begin + ridx / fs).tolist())
+            c.rec_v.extend(record[M.ROW_VOLTAGE, ridx].tolist())
+            c.rec_i.extend(record[M.ROW_CURRENT, ridx].tolist())
             c.last_record = record
             c.last_waveform = waveform
         return record
@@ -233,7 +295,8 @@ class Monitor:
 class Worker(threading.Thread):
     """Executes commands from the window in order, on the rig, in its own
     thread, and posts events back. Commands: zero, bias, engage, pull,
-    run (n), withdraw, smash. ``stop`` interrupts a run between cycles."""
+    cycle, run (n), withdraw, smash, testpull (V), goto (V), step (nm),
+    monitor. ``stop`` interrupts a run between cycles."""
 
     def __init__(self, cfg: RigConfig, rig: Rig, monitor: Monitor,
                  save: bool, out_dir: Path, igor_export: bool):
@@ -260,6 +323,7 @@ class Worker(threading.Thread):
         self.hist_n = 0
         self.bias_dirty = True                 # set_bias before the next cycle
         self.busy = False                      # a command is running
+        self.current: str | None = None        # its name
 
     # -- posting ------------------------------------------------------------
 
@@ -291,6 +355,7 @@ class Worker(threading.Thread):
                 break
             name, args = command[0], command[1:]
             self.busy = True
+            self.current = name
             try:
                 getattr(self, "cmd_" + name, self.cmd_noop)(*args)
             except SafetyViolation as exc:
@@ -306,11 +371,64 @@ class Worker(threading.Thread):
                           fatal=False)
             finally:
                 self.busy = False
+                self.current = None
                 self.readout()
         self.close_file()
 
     def cmd_noop(self) -> None:
         return
+
+    def cmd_monitor(self) -> None:
+        """One quiet 10 ms hold at the present position and bias, for the
+        monitor window and the Piezo box's readouts: nothing moves, the
+        inputs are simply read (Igor's background sampling)."""
+        self.mon.quiet = True
+        try:
+            rec = self.rig.hold(n_samples=400)
+        finally:
+            self.mon.quiet = False
+        sense = self.rig.last_sense_v
+        sense_v = (float(np.mean(sense[sense.size // 2:]))
+                   if sense is not None and sense.size else None)
+        self.post("monitor", t=time.monotonic(), record=rec,
+                  piezo_v=self.rig.piezo_v, sense_v=sense_v)
+
+    # -- moves made by hand: the slider and the step buttons ----------------------
+
+    def cmd_goto(self, volts: float) -> None:
+        """Igor's SetPiezoBiasFromSlider: put the piezo at ``volts``.
+
+        Ramped over 50 ms rather than jumped, then the junction is probed and
+        the state follows what it reads, so a contact made by hand can be
+        pulled from with Pull once, as Igor's slider-then-measure could.
+        Approach + pull and Run N need no state: they separate first.
+        """
+        if self.bias_dirty:
+            self.cmd_bias()
+        c = self.mon.snapshot()
+        if not c.t or "end" in c.marks:
+            # A fresh picture for a fresh series of moves; a cycle that has
+            # pulled is finished, one that has not keeps accumulating.
+            self.mon.begin_cycle()
+            self.mon.mark("by hand")
+        was = self.rig.piezo_v
+        self.rig.piezo_ramp_to(volts)
+        g0, railed = self.rig.probe()
+        R = self.cfg.ramp
+        if railed or g0 > R.engage_g0:
+            self.rig.state = RigState.ENGAGED
+            word = "in contact"
+        else:
+            # Not parked, not engaged: the tip is wherever the hand left it.
+            self.rig.state = RigState.UNKNOWN
+            word = "open" if g0 < R.break_g0 else "tunnelling"
+        self.post("moved", cycle=self.mon.snapshot())
+        self.status(f"piezo {was:.4f} -> {self.rig.piezo_v:.4f} V "
+                    f"({self.rig.piezo_nm:.1f} nm): G = {g0:.3e} G0, {word}")
+
+    def cmd_step(self, delta_nm: float) -> None:
+        """Igor's PiezoStepCloser / PiezoStepApart: closer is +nm."""
+        self.cmd_goto(self.rig.piezo_v + self.cfg.cal.nm_to_piezo_volts(delta_nm))
 
     # -- the pieces of a cycle ---------------------------------------------------
 
@@ -561,12 +679,15 @@ class Worker(threading.Thread):
         else:
             v_mv = i_ua = g0 = float("nan")
             railed = False
+        sense = rig.last_sense_v
+        sense_v = (float(np.mean(sense[sense.size // 2:]))
+                   if sense is not None and sense.size else None)
         self.post("readout", state=rig.state.name, piezo_v=rig.piezo_v,
                   piezo_nm=rig.piezo_nm, bias_mv=rig.bias_v * 1e3,
                   junction_mv=v_mv, current_ua=i_ua, g0=g0, railed=railed,
-                  sense_nm=rig.sense_nm, accepted=self.accepted,
-                  attempts=self.attempts, saved=self.n_saved,
-                  zero_uv=C.current_zero_v * 1e6)
+                  sense_nm=rig.sense_nm, sense_v=sense_v,
+                  accepted=self.accepted, attempts=self.attempts,
+                  saved=self.n_saved, zero_uv=C.current_zero_v * 1e6)
 
 
 # --------------------------------------------------------------------------
@@ -652,7 +773,8 @@ def run_headless(cfg: RigConfig, n: int, out_dir: Path, igor_export: bool,
 
 def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             config_name: str, autoclose: float | None = None,
-            readback: bool = False) -> int:
+            readback: bool = False, show: set | None = None) -> int:
+    show = set(show or ())            # extra panels ticked at start
     import tkinter as tk
     from tkinter import filedialog, ttk
 
@@ -668,7 +790,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     worker.start()
 
     root = tk.Tk()
-    root.title("rigtests 02: approach and pull" +
+    root.title(f"rigtests 02: approach and pull  {__version__}" +
                ("  [simulate]" if cfg.simulate else f"  [{cfg.channels.device}]")
                + f"  {config_name}")
 
@@ -718,7 +840,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                                          pady=2, sticky="ew")
     ttk.Entry(rb, textvariable=tp_var, width=6).grid(row=3, column=2, padx=2)
 
-    ro = tk.Text(rb, width=38, height=9, font=("Courier", 9), relief="flat",
+    ro = tk.Text(rb, width=38, height=10, font=("Courier", 9), relief="flat",
                  state="disabled", background=root.cget("background"))
     ro.grid(row=4, column=0, columnspan=3, sticky="ew", padx=2, pady=(4, 2))
 
@@ -728,9 +850,120 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         widget.insert("1.0", text)
         widget.config(state="disabled")
 
+    # -- piezo: Igor's PiezoGroupbox, with Igor's readouts under it -----------------
+    # Step apart / Z (nm) / Step closer, a slider over the piezo's whole
+    # range that applies on mouse release (Igor's SetPiezoBiasFromSlider,
+    # live=0), and the readouts Igor kept at the bottom of its panel:
+    # I (uA), V (mV), Piezo, plus the sense line this rig has. They are
+    # refreshed by every command and, while idle, every 0.3 s by a quiet
+    # hold (Igor's Background Sampling) with Igor's beep above 0.15 uA.
+    C = cfg.cal
+    BEEP_UA = 0.15
+    pb = ttk.LabelFrame(left, text="Piezo (Igor's piezo controls)")
+    pb.pack(fill="x", pady=(0, 6))
+    lo_v, hi_v = cfg.limits.piezo_ao_min_v, cfg.limits.piezo_ao_max_v
+    z_var = tk.StringVar(value=f"{cfg.ramp.approach_step_nm:g}")
+
+    QUIET = ("monitor", "noop")      # commands that do not count as busy
+
+    def rig_is_free() -> bool:
+        """Nothing but idle sampling is running or queued."""
+        return ((not worker.busy or worker.current in QUIET)
+                and all(c[0] in QUIET for c in list(worker.commands.queue)))
+
+    def hand_move(*command) -> bool:
+        """Send a move made by hand, unless a command is already running:
+        a slider release in the middle of Run N must not queue up behind it."""
+        if not rig_is_free():
+            status.config(text="busy: wait for the current command to finish, "
+                               "or press Stop")
+            return False
+        worker.send(*command)
+        return True
+
+    def on_step(sign: int):
+        try:
+            nm = abs(float(z_var.get()))
+        except ValueError:
+            status.config(text=f"Z: '{z_var.get()}' is not a number")
+            return
+        hand_move("step", sign * nm)
+
+    ttk.Button(pb, text="Step apart", command=lambda: on_step(-1)).grid(
+        row=0, column=0, padx=2, pady=2, sticky="ew")
+    zf = ttk.Frame(pb)
+    zf.grid(row=0, column=1, padx=2)
+    ttk.Label(zf, text="Z (nm)", font=("Arial", 9)).pack(side="left")
+    ttk.Entry(zf, textvariable=z_var, width=6).pack(side="left", padx=2)
+    ttk.Button(pb, text="Step closer", command=lambda: on_step(+1)).grid(
+        row=0, column=2, padx=2, pady=2, sticky="ew")
+
+    slider_var = tk.DoubleVar(value=rig.piezo_v)
+    slide = {"dragging": False}
+    target_lbl = ttk.Label(pb, text="", font=("Arial", 8))
+
+    def on_slide(value):
+        v = float(value)
+        target_lbl.config(text=f"slider {v:.3f} V = {C.piezo_volts_to_nm(v):.1f} nm"
+                               + ("   (release to move)" if slide["dragging"] else
+                                  f"   (range {lo_v:g} to {hi_v:g} V)"))
+
+    scale = ttk.Scale(pb, from_=lo_v, to=hi_v, orient="horizontal",
+                      variable=slider_var, command=on_slide, length=300)
+    scale.grid(row=1, column=0, columnspan=3, sticky="ew", padx=4, pady=(6, 0))
+    target_lbl.grid(row=2, column=0, columnspan=3, sticky="w", padx=4)
+
+    def on_press(_e):
+        slide["dragging"] = True
+
+    def on_release(_e):
+        slide["dragging"] = False
+        v = float(slider_var.get())
+        if not hand_move("goto", v):
+            slider_var.set(rig.piezo_v)         # put it back where the piezo is
+        on_slide(slider_var.get())
+    scale.bind("<ButtonPress-1>", on_press)
+    scale.bind("<ButtonRelease-1>", on_release)
+
+    rof = ttk.Frame(pb)
+    rof.grid(row=3, column=0, columnspan=3, sticky="ew", padx=2, pady=(6, 2))
+    big: dict[str, tk.Label] = {}
+    for col, (key, title) in enumerate((("i", "I (uA)"), ("v", "V (mV)"),
+                                        ("p", "Piezo (V)"), ("s", "Sense (V)"))):
+        cell = ttk.Frame(rof, relief="groove", borderwidth=1)
+        cell.grid(row=0, column=col, padx=2, sticky="ew")
+        rof.columnconfigure(col, weight=1)
+        ttk.Label(cell, text=title, font=("Arial", 8)).pack()
+        big[key] = tk.Label(cell, text="--", font=("Courier", 13, "bold"), width=9)
+        big[key].pack()
+    bkgd_var = tk.BooleanVar(value=True)
+    beep_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(pb, text="background sampling while idle (Igor: Beep is ON)",
+                    variable=bkgd_var).grid(row=4, column=0, columnspan=2,
+                                            sticky="w", padx=2)
+    ttk.Checkbutton(pb, text=f"beep above {BEEP_UA:g} uA",
+                    variable=beep_var).grid(row=4, column=2, sticky="w", padx=2)
+
+    def show_big(i_ua, v_mv, piezo_v, sense_v, beep_ok: bool = False):
+        big["i"].config(text=f"{i_ua:9.4f}" if np.isfinite(i_ua) else "--")
+        big["v"].config(text=f"{v_mv:8.2f}" if np.isfinite(v_mv) else "--")
+        big["p"].config(text=f"{piezo_v:7.4f}")
+        big["s"].config(text=f"{sense_v:7.4f}" if sense_v is not None else "none")
+        if not slide["dragging"]:
+            slider_var.set(piezo_v)             # the slider follows every move
+            on_slide(piezo_v)
+        if beep_ok and beep_var.get() and np.isfinite(i_ua) and abs(i_ua) > BEEP_UA:
+            root.bell()
+
+    # The rest of the column is tabbed, as Igor's panel was, so that the Run
+    # and Piezo boxes stay in view on a 900-pixel screen: Settings, Saving,
+    # Browse.
+    nb = ttk.Notebook(left)
+    nb.pack(fill="both", expand=True)
+
     # -- settings --------------------------------------------------------------------
-    sb = ttk.LabelFrame(left, text="Settings (checked before they apply)")
-    sb.pack(fill="x", pady=(0, 6))
+    sb = ttk.Frame(nb)
+    nb.add(sb, text="Settings (checked before they apply)")
     svars: dict[str, tk.StringVar] = {}
     for row, (path, label, igor, unit, kind, scale) in enumerate(SETTINGS):
         ttk.Label(sb, text=f"{label} ({unit})" if unit else label,
@@ -794,8 +1027,8 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         return True
 
     # -- saving ---------------------------------------------------------------------
-    fb = ttk.LabelFrame(left, text="Saving")
-    fb.pack(fill="x", pady=(0, 6))
+    fb = ttk.Frame(nb)
+    nb.add(fb, text="Saving")
     save_var = tk.BooleanVar(value=True)
     ttk.Checkbutton(fb, text="save accepted traces (.h5, raw volts)",
                     variable=save_var,
@@ -822,8 +1055,8 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     file_lbl.grid(row=4, column=0, columnspan=2, sticky="w", padx=2)
 
     # -- browse -----------------------------------------------------------------------
-    bb = ttk.LabelFrame(left, text="Browse a saved session")
-    bb.pack(fill="x", pady=(0, 6))
+    bb = ttk.Frame(nb)
+    nb.add(bb, text="Browse a saved session")
     browse = {"session": None, "path": None, "n": 0, "hist": None}
     idx_var = tk.StringVar(value="0")
 
@@ -832,9 +1065,24 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                                           filetypes=[("session", "*.h5")])
         if not path:
             return
+        writer = worker.writer
+        if writer is not None and Path(path).resolve() == Path(writer.path).resolve():
+            status.config(text="that file is still being written: press New "
+                               "file to close it, then open it")
+            return
         if browse["session"] is not None:
             browse["session"].close()
-        s = storage.Session(path)
+            browse.update(session=None, path=None, n=0, hist=None)
+        try:
+            s = storage.Session(path)
+        except Exception as exc:                 # noqa: BLE001
+            status.config(text=f"could not open {Path(path).name}: {exc}")
+            return
+        if len(s) == 0:
+            s.close()
+            status.config(text=f"{Path(path).name} holds no traces")
+            blbl.config(text=f"{Path(path).name}: 0 traces")
+            return
         browse.update(session=s, path=path, n=len(s), hist=None)
         idx_var.set("0")
         blbl.config(text=f"{Path(path).name}: {len(s)} traces")
@@ -870,10 +1118,15 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         if browse["path"] is None:
             status.config(text="open a saved session first")
             return
-        fig2, info = plots.figure_for_session(browse["path"], int(idx_var.get()))
-        out = Path(browse["path"]).with_name(
-            f"{Path(browse['path']).stem}_trace{info['index']:04d}.png")
-        fig2.savefig(out, dpi=110)
+        try:
+            fig2, info = plots.figure_for_session(browse["path"],
+                                                  int(idx_var.get()))
+            out = Path(browse["path"]).with_name(
+                f"{Path(browse['path']).stem}_trace{info['index']:04d}.png")
+            fig2.savefig(out, dpi=110)
+        except Exception as exc:                 # noqa: BLE001
+            status.config(text=f"PNG not written: {exc}")
+            return
         status.config(text=f"wrote {out}")
     ttk.Button(bb, text="Save PNG of this trace", command=save_png).grid(
         row=1, column=1, columnspan=4, padx=2, pady=2, sticky="ew")
@@ -882,17 +1135,110 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     blbl.grid(row=2, column=0, columnspan=5, sticky="w", padx=2)
 
     # -- the plots --------------------------------------------------------------------
+    # Four panels always: the record, the trace with the readback over it,
+    # the piezo in and out, the histogram. Three more on request, each a
+    # checkbox: the gold level (the trace on a linear axis), the approach
+    # (G at each step against piezo position) and the pull's I-V. The
+    # figure is laid out again whenever a box changes.
     top = ttk.Frame(right)
     top.pack(fill="x")
-    panel6 = tk.StringVar(value="approach")
-    ttk.Label(top, text="bottom right:").pack(side="left")
-    for text, val in (("approach", "approach"), ("I-V", "iv")):
-        ttk.Radiobutton(top, text=text, value=val, variable=panel6).pack(
-            side="left", padx=3)
+    ttk.Label(top, text="also show:").pack(side="left")
+    extras = {key: tk.BooleanVar(value=key in show)
+              for key in ("gold", "approach", "iv")}
+    for key, text in (("gold", "gold level"), ("approach", "approach"),
+                      ("iv", "I-V")):
+        ttk.Checkbutton(top, text=text, variable=extras[key],
+                        command=lambda: rebuild()).pack(side="left", padx=3)
+    # Off by default, every panel redraws together once per trace, when the
+    # pull is in; on, the record, piezo and approach panels also redraw
+    # while a move is running (the staircase grows as you watch).
+    live_moving = tk.BooleanVar(value=False)
+    ttk.Checkbutton(top, text="redraw while moving", variable=live_moving).pack(
+        side="left", padx=(16, 3))
     banner = tk.Label(top, text="", font=("Arial", 9, "bold"), fg="#b06000")
     banner.pack(side="right")
     ttk.Button(top, text="Readback window",
                command=lambda: open_readback()).pack(side="right", padx=8)
+    ttk.Button(top, text="Axis limits",
+               command=lambda: open_limits()).pack(side="right", padx=4)
+    ttk.Button(top, text="Monitor",
+               command=lambda: open_monitor()).pack(side="right", padx=4)
+
+    # -- the monitor window: the junction while nothing is commanded ------------
+    # While it is open and the worker is idle, a quiet 10 ms hold is played
+    # every 0.3 s at wherever the piezo and bias are, and the junction
+    # voltage, the current and the conductance it read are added to three
+    # strip charts. Nothing moves; it is the same read the readout box uses.
+    from collections import deque
+    mon_state: dict = {"win": None, "on": None, "last": 0.0,
+                       "t": deque(maxlen=3000), "v": deque(maxlen=3000),
+                       "i": deque(maxlen=3000), "g": deque(maxlen=3000)}
+
+    def monitor_wants_sample() -> bool:
+        """Idle sampling runs for the Piezo box's readouts (its checkbox) or
+        for an open Monitor window with its own box ticked."""
+        if bkgd_var.get():
+            return True
+        win = mon_state["win"]
+        return (win is not None and win.winfo_exists()
+                and mon_state["on"] is not None and mon_state["on"].get())
+
+    def open_monitor():
+        if mon_state["win"] is not None and mon_state["win"].winfo_exists():
+            mon_state["win"].lift()
+            return
+        win = tk.Toplevel(root)
+        win.title("monitor: the junction while idle")
+        mon_state["win"] = win
+        mon_state["on"] = tk.BooleanVar(value=True)
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=8, pady=(6, 0))
+        ttk.Checkbutton(bar, text="sample while idle (a 10 ms hold every 0.3 s; "
+                                  "nothing moves)", variable=mon_state["on"]).pack(
+            side="left")
+        secs_var = tk.StringVar(value="30")
+        ttk.Label(bar, text="seconds shown").pack(side="left", padx=(12, 2))
+        ttk.Entry(bar, textvariable=secs_var, width=5).pack(side="left")
+        fig3 = Figure(figsize=(7.0, 5.2), dpi=100)
+        ax_v, ax_i, ax_g = fig3.subplots(3, 1, sharex=True)
+        canvas3 = FigureCanvasTkAgg(fig3, master=win)
+        canvas3.get_tk_widget().pack(fill="both", expand=True)
+        note = ttk.Label(win, text="", font=("Courier", 9), justify="left")
+        note.pack(fill="x", padx=8, pady=(0, 6))
+
+        def refresh_monitor():
+            if not win.winfo_exists():
+                mon_state["win"] = None
+                return
+            try:
+                secs = max(1.0, float(secs_var.get()))
+            except ValueError:
+                secs = 30.0
+            if mon_state["t"]:
+                t = np.array(mon_state["t"]); t = t - t[-1]
+                keep = t >= -secs
+                series = (("junction (mV)", ax_v, np.array(mon_state["v"])[keep], plots.C_V),
+                          ("current (uA)", ax_i, np.array(mon_state["i"])[keep], plots.C_I),
+                          ("log10 (G / G0)", ax_g, np.array(mon_state["g"])[keep], plots.C_G))
+                for label, a_, y, colour in series:
+                    a_.clear()
+                    a_.plot(t[keep], y, color=colour, lw=0.9)
+                    a_.set_ylabel(label, fontsize=8)
+                    a_.tick_params(labelsize=8)
+                    a_.grid(True, alpha=0.3)
+                ax_g.set_xlabel("seconds ago", fontsize=8)
+                ax_v.set_title("the junction while idle: every point is one 10 ms hold",
+                               fontsize=9)
+                fig3.tight_layout(pad=1.5)
+                canvas3.draw_idle()
+                v, i, g = (np.array(mon_state["v"])[keep], np.array(mon_state["i"])[keep],
+                           np.array(mon_state["g"])[keep])
+                note.config(text=f"last {secs:g} s: junction {v.mean():8.3f} mV "
+                                 f"(rms {v.std():.3f}), current {i.mean():9.5f} uA "
+                                 f"(rms {i.std():.5f}), G {10 ** np.nanmean(g):.3e} G0")
+            win.after(300, refresh_monitor)
+
+        refresh_monitor()
 
     # -- the readback-only window ----------------------------------------------------
     rb_state: dict = {"win": None}
@@ -929,8 +1275,6 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         refresh_rb()
 
     fig = Figure(figsize=(10.5, 6.6), dpi=100)
-    axes = fig.subplots(2, 3)
-    fig.tight_layout(pad=2.0)
     canvas = FigureCanvasTkAgg(fig, master=right)
     canvas.get_tk_widget().pack(fill="both", expand=True)
     status = ttk.Label(root, text="", font=("Arial", 9), anchor="w")
@@ -939,36 +1283,186 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     live = {"paused": False, "cycle": None, "trace": None, "hist": None,
             "dirty": False}
     C = cfg.cal
+    ax: dict = {}                      # panel name -> Axes, rebuilt on demand
+
+    # -- axis limits, per panel ---------------------------------------------------
+    # Each plot function picks its own limits; what is typed in the "Axis
+    # limits" window overrides them after every redraw. Blank means "leave
+    # the plot's own". y2 is the right-hand axis where a panel has one.
+    PANELS = [  # key, label, x unit, y unit, right-y unit (None = no right axis)
+        ("record", "record", "s", "junction mV", "current uA"),
+        ("trace", "trace", "nm", "log10 G/G0", "readback nm"),
+        ("piezo", "piezo in/out", "s", "piezo nm", None),
+        ("hist", "histogram", "log10 G/G0", "counts/trace", None),
+        ("gold", "gold level", "nm", "G/G0", "junction mV"),
+        ("approach", "approach", "piezo nm", "log10 G/G0", None),
+        ("iv", "I-V", "junction mV", "current uA", None),
+    ]
+    limits: dict = {}                  # key -> {"x": (lo, hi), "y": ..., "y2": ...}
+
+    def apply_limits():
+        for key, a_ in ax.items():
+            lim = limits.get(key)
+            if not lim:
+                continue
+            if lim.get("x"):
+                a_.set_xlim(*lim["x"])
+            if lim.get("y"):
+                a_.set_ylim(*lim["y"])
+            twin = getattr(a_, "_stm_twin", None)
+            if lim.get("y2") and twin is not None:
+                twin.set_ylim(*lim["y2"])
+
+    lim_state: dict = {"win": None, "vars": {}}
+
+    def open_limits():
+        if lim_state["win"] is not None and lim_state["win"].winfo_exists():
+            lim_state["win"].lift()
+            return
+        win = tk.Toplevel(root)
+        win.title("axis limits (blank = the plot's own)")
+        lim_state["win"] = win
+        grid_ = ttk.Frame(win)
+        grid_.pack(padx=8, pady=8)
+        for col, text in enumerate(("panel", "x from", "x to", "y from", "y to",
+                                    "right y from", "right y to")):
+            ttk.Label(grid_, text=text, font=("Arial", 9, "bold")).grid(
+                row=0, column=col, padx=4, pady=(0, 4))
+        vars_: dict = lim_state["vars"]
+        for row, (key, label, xu, yu, y2u) in enumerate(PANELS, start=1):
+            ttk.Label(grid_, text=f"{label}  (x: {xu}; y: {yu}"
+                                  + (f"; right: {y2u})" if y2u else ")"),
+                      font=("Arial", 9)).grid(row=row, column=0, sticky="w", padx=4)
+            vars_.setdefault(key, {})
+            for col, name in enumerate(("x0", "x1", "y0", "y1", "z0", "z1"), start=1):
+                if name.startswith("z") and not y2u:
+                    continue
+                var = vars_[key].setdefault(name, tk.StringVar(value=""))
+                ent = ttk.Entry(grid_, textvariable=var, width=8)
+                ent.grid(row=row, column=col, padx=2, pady=1)
+                ent.bind("<Return>", lambda _e: apply_from_window())
+        msg = ttk.Label(win, text="", font=("Arial", 8))
+        msg.pack(fill="x", padx=8)
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=8, pady=(4, 8))
+
+        def pair(key, lo, hi):
+            a, b = vars_[key][lo].get().strip(), vars_[key][hi].get().strip()
+            if not a and not b:
+                return None
+            if not a or not b:
+                raise ValueError(f"{key}: give both ends of the range or neither")
+            lo_v, hi_v = float(a), float(b)
+            if hi_v <= lo_v:
+                raise ValueError(f"{key}: 'to' must be above 'from'")
+            return (lo_v, hi_v)
+
+        def apply_from_window():
+            new: dict = {}
+            try:
+                for key, label, xu, yu, y2u in PANELS:
+                    entry = {"x": pair(key, "x0", "x1"), "y": pair(key, "y0", "y1")}
+                    if y2u:
+                        entry["y2"] = pair(key, "z0", "z1")
+                    if any(entry.values()):
+                        new[key] = entry
+            except ValueError as exc:
+                msg.config(text=str(exc), foreground="#b00000")
+                return
+            limits.clear()
+            limits.update(new)
+            msg.config(text=f"applied to {len(new)} panel(s)" if new
+                       else "all limits cleared", foreground="#006000")
+            redraw_now()
+
+        def clear_all():
+            for d in vars_.values():
+                for v in d.values():
+                    v.set("")
+            apply_from_window()
+
+        ttk.Button(bar, text="Apply", command=apply_from_window).pack(side="left", padx=2)
+        ttk.Button(bar, text="Clear all", command=clear_all).pack(side="left", padx=2)
+        ttk.Label(bar, text="Return in any box applies too",
+                  font=("Arial", 8)).pack(side="left", padx=8)
+
+    def redraw_now():
+        if live["paused"] and browse["session"] is not None:
+            draw_saved(browse["session"], int(idx_var.get()))
+        else:
+            draw_live()
+
+    def rebuild():
+        """Lay the figure out again: two columns of the main panels, then a
+        column for every two extras ticked. Everything is redrawn into the
+        new axes on the next poll (or at once while browsing)."""
+        fig.clear()
+        chosen = [k for k in ("gold", "approach", "iv") if extras[k].get()]
+        ncols = 2 + (len(chosen) + 1) // 2
+        # The figure keeps the canvas's size and the panels share it: with
+        # extras ticked they get narrower, and maximising the window gives
+        # them room. (Resizing the canvas from here left stale images of
+        # the previous layout on screen.)
+        grid = fig.subplots(2, ncols, squeeze=False)
+        ax.clear()
+        ax.update(record=grid[0, 0], trace=grid[0, 1],
+                  piezo=grid[1, 0], hist=grid[1, 1])
+        for i, key in enumerate(chosen):
+            ax[key] = grid[i % 2, 2 + i // 2]
+        used = set(id(a_) for a_ in ax.values())
+        for col in range(2, ncols):
+            for row in range(2):
+                if id(grid[row, col]) not in used:
+                    grid[row, col].set_visible(False)      # an odd slot
+        fig.tight_layout(pad=2.0, w_pad=3.0)   # room for the right-hand axes
+        if live["paused"] and browse["session"] is not None:
+            draw_saved(browse["session"], int(idx_var.get()))
+        else:
+            live["dirty"] = True
+            canvas.draw_idle()
+
+    def pull_frame(cyc):
+        """The default x range of the record panel: the pull, with a little
+        of the hold before it, or None for the whole cycle when no pull has
+        happened yet. The data behind the panel are always the whole cycle,
+        so the Axis limits window can widen the view."""
+        if "pull" in cyc.marks and "end" in cyc.marks:
+            t0, t1 = cyc.marks["pull"], cyc.marks["end"]
+            pad = 0.1 * max(t1 - t0, 1e-3)
+            return (t0 - pad, t1 + pad)
+        return None
 
     def draw_live():
         cyc, tr, hist = live["cycle"], live["trace"], live["hist"]
-        if cyc is not None and cyc.last_record is not None:
-            fs = rig.sample_rate_hz
-            sf = None
-            if tr is not None and tr.get("record") is not None:
-                try:
-                    sf = trace.build_ramp(cfg, tr["record"].start_piezo_v, fs).spike_front
-                except Exception:          # noqa: BLE001
-                    sf = None
-            plots.plot_record(axes[0, 0], cfg, cyc.last_record, fs, spike_front=sf,
-                              title="last play: junction V and current")
+        if cyc is not None and cyc.rec_t:
+            frame = pull_frame(cyc)
+            plots.plot_record_series(ax["record"], cfg, np.array(cyc.rec_t),
+                                     np.array(cyc.rec_v), np.array(cyc.rec_i),
+                                     marks=cyc.marks, frame=frame,
+                                     title="this cycle: junction V and current"
+                                           + (" (framed on the pull)" if frame
+                                              else ""))
         if tr is not None and tr.get("record") is not None:
             rec = tr["record"]
-            plots.plot_trace(axes[0, 1], cfg, tr["g0"], tr["disp"], tr["verdict"],
-                             title=f"trace {worker.attempts}")
-            plots.plot_gold_level(axes[0, 2], cfg, tr["g0"], tr["disp"])
-            if panel6.get() == "iv":
-                plots.plot_iv(axes[1, 2], cfg, rec.voltage_v, rec.current_v)
+            plots.plot_trace(ax["trace"], cfg, tr["g0"], tr["disp"], tr["verdict"],
+                             title=f"trace {worker.attempts}",
+                             sense_v=rec.piezo_sense_v)
+            if "gold" in ax:
+                plots.plot_gold_level(ax["gold"], cfg, tr["g0"], tr["disp"],
+                                      voltage_v=rec.voltage_v)
+            if "iv" in ax:
+                plots.plot_iv(ax["iv"], cfg, rec.voltage_v, rec.current_v)
         if cyc is not None and cyc.t:
-            plots.plot_piezo(axes[1, 0], cfg, np.array(cyc.t), np.array(cyc.piezo_v),
+            plots.plot_piezo(ax["piezo"], cfg, np.array(cyc.t), np.array(cyc.piezo_v),
                              np.array(cyc.sense_v), marks=cyc.marks,
                              title="piezo in and out, this cycle")
-            if panel6.get() == "approach" and cyc.app_piezo_v:
-                plots.plot_approach(axes[1, 2], cfg, cyc.app_piezo_v, cyc.app_g0,
-                                    cyc.app_railed)
+            if "approach" in ax and cyc.app_piezo_v:
+                plots.plot_approach(ax["approach"], cfg, cyc.app_piezo_v,
+                                    cyc.app_g0, cyc.app_railed)
         if hist is not None and hist["counts"] is not None:
-            plots.plot_histogram(axes[1, 1], cfg, hist["centres"], hist["counts"],
+            plots.plot_histogram(ax["hist"], cfg, hist["centres"], hist["counts"],
                                  hist["n"])
+        apply_limits()
         canvas.draw_idle()
 
     def draw_saved(s: storage.Session, i: int):
@@ -979,22 +1473,33 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         start_v = float(s.scalar("start_piezo_v")[i])
         disp = analysis.displacement_nm(voltage.size, scfg.ramp, fs)
         verdict = analysis.select_trace(g0, scfg.ramp)
-        plots.plot_record(axes[0, 0], scfg, np.stack([voltage, current]), fs,
-                          title=f"saved trace {i}: junction V and current")
-        plots.plot_trace(axes[0, 1], scfg, g0, disp, verdict, title=f"saved trace {i}")
-        plots.plot_gold_level(axes[0, 2], scfg, g0, disp)
+        sense = s.piezo_sense(i, in_nm=False)
+        plots.plot_record(ax["record"], scfg, np.stack([voltage, current]), fs,
+                          title=f"saved trace {i}: junction V and current "
+                                f"(the file keeps the trace only)")
+        plots.plot_trace(ax["trace"], scfg, g0, disp, verdict,
+                         title=f"saved trace {i}", sense_v=sense)
+        if "gold" in ax:
+            plots.plot_gold_level(ax["gold"], scfg, g0, disp, voltage_v=voltage)
         t = np.arange(voltage.size) / fs
         cmd = start_v - scfg.cal.nm_to_piezo_volts(disp)
-        plots.plot_piezo(axes[1, 0], scfg, t, cmd, s.piezo_sense(i, in_nm=False),
+        plots.plot_piezo(ax["piezo"], scfg, t, cmd, sense,
                          title="piezo during the saved pull")
         if browse["hist"] is None:
             browse["hist"] = analysis.log_histogram(s.conductances())
-        plots.plot_histogram(axes[1, 1], scfg, *browse["hist"], browse["n"],
+        plots.plot_histogram(ax["hist"], scfg, *browse["hist"], browse["n"],
                              title="histogram of the file")
-        plots.plot_iv(axes[1, 2], scfg, voltage, current)
+        if "iv" in ax:
+            plots.plot_iv(ax["iv"], scfg, voltage, current)
+        if "approach" in ax:
+            ax["approach"].clear()
+            ax["approach"].set_title("approach: not stored in the file", fontsize=9)
         banner.config(text=f"BROWSING {Path(browse['path']).name} trace {i}; "
                            f"live plots paused")
+        apply_limits()
         canvas.draw_idle()
+
+    rebuild()
 
     def poll():
         drew = False
@@ -1022,8 +1527,17 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                     f"G          {p['g0']:.3e} G0\n"
                     f"zero       {p['zero_uv']:+.1f} uV\n"
                     f"accepted   {p['accepted']} / {p['attempts']} attempts, "
-                    f"{p['saved']} saved"))
+                    f"{p['saved']} saved\n"
+                    f"file       {live.get('file') or 'none open'}"))
+                show_big(p["current_ua"], p["junction_mv"], p["piezo_v"],
+                         p["sense_v"])
             elif kind == "approach":
+                live["cycle"] = p["cycle"]
+                if live_moving.get():
+                    live["dirty"] = True       # else: wait for the pull
+            elif kind == "moved":
+                # A move made by hand is its own event: the piezo and record
+                # panels show it at once, whatever "redraw while moving" says.
                 live["cycle"] = p["cycle"]
                 live["dirty"] = True
             elif kind == "cycle":
@@ -1034,31 +1548,59 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                 live["hist"] = p
                 live["dirty"] = True
             elif kind == "file":
-                file_lbl.config(text=f"writing {Path(p['path']).name}" if p["path"]
+                live["file"] = Path(p["path"]).name if p["path"] else None
+                file_lbl.config(text=f"writing {live['file']}" if p["path"]
                                 else "no file open")
             elif kind == "saved":
-                file_lbl.config(text=f"writing {Path(p['path']).name}: {p['n']} traces")
+                live["file"] = Path(p["path"]).name
+                file_lbl.config(text=f"writing {live['file']}: {p['n']} traces")
             elif kind == "exported":
                 pass
+            elif kind == "monitor":
+                rec = p["record"]
+                M, C = cfg.channels, cfg.cal
+                tail = rec[:, rec.shape[1] // 2:]
+                v = float(C.voltage_input_sign * np.mean(tail[M.ROW_VOLTAGE]))
+                i = float(C.volts_to_amps(np.mean(tail[M.ROW_CURRENT])))
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    g = abs(i) / abs(v) / G0_SIEMENS if abs(v) > 1e-9 else float("inf")
+                mon_state["t"].append(p["t"])
+                mon_state["v"].append(v * 1e3)
+                mon_state["i"].append(i * 1e6)
+                mon_state["g"].append(float(np.log10(max(g, 1e-12))) if np.isfinite(g) else 3.0)
+                show_big(i * 1e6, v * 1e3, p["piezo_v"], p["sense_v"], beep_ok=True)
+        if (monitor_wants_sample() and not worker.busy and worker.commands.empty()
+                and time.monotonic() - mon_state["last"] > 0.3):
+            mon_state["last"] = time.monotonic()
+            worker.send("monitor")
         if live["dirty"] and not live["paused"]:
             draw_live()
             live["dirty"] = False
             banner.config(text="", fg="#b06000")
-        elif worker.busy and not live["paused"]:
-            # A move in progress: redraw the piezo and approach panels from
-            # the monitor every few polls, so the staircase grows as you watch.
+        elif worker.busy and not live["paused"] and live_moving.get():
+            # A move in progress: redraw the record, piezo and approach
+            # panels from the monitor every few polls, so the staircase
+            # grows as you watch. Only when asked: by default the panels
+            # change together, once per trace.
             live["tick"] = live.get("tick", 0) + 1
             if live["tick"] % 3 == 0:
                 cyc = mon.snapshot()
                 if cyc.t:
-                    plots.plot_piezo(axes[1, 0], cfg, np.array(cyc.t),
+                    plots.plot_piezo(ax["piezo"], cfg, np.array(cyc.t),
                                      np.array(cyc.piezo_v), np.array(cyc.sense_v),
                                      marks=cyc.marks,
                                      title="piezo in and out, this cycle (live)")
-                    if panel6.get() == "approach" and cyc.app_piezo_v:
-                        plots.plot_approach(axes[1, 2], cfg, cyc.app_piezo_v,
+                    if cyc.rec_t:
+                        plots.plot_record_series(
+                            ax["record"], cfg, np.array(cyc.rec_t),
+                            np.array(cyc.rec_v), np.array(cyc.rec_i),
+                            marks=cyc.marks,
+                            title="this cycle: junction V and current (live)")
+                    if "approach" in ax and cyc.app_piezo_v:
+                        plots.plot_approach(ax["approach"], cfg, cyc.app_piezo_v,
                                             cyc.app_g0, cyc.app_railed,
                                             title="approach (live)")
+                    apply_limits()
                     canvas.draw_idle()
         if not live["paused"] and banner.cget("text").startswith("BROWSING"):
             banner.config(text="")
@@ -1091,6 +1633,17 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     if autoclose is not None:
         root.after(300, lambda: worker.send("zero"))
         root.after(600, lambda: worker.send("run", 3))
+        root.after(900, open_limits)                 # smoke test: it must open
+        root.after(950, open_monitor)
+        root.after(1200, lambda: (limits.update(
+            gold={"x": (0.0, 2.0), "y": (0.0, 6.0), "y2": None}), redraw_now()))
+        root.after(3000, lambda: (lim_state["win"].destroy(),   # and close again
+                                  mon_state["win"].destroy()))
+        for ms, key in ((4000, "gold"), (6000, "approach"), (8000, "iv")):
+            root.after(ms, lambda k=key: (extras[k].set(True), rebuild()))
+        # The Piezo box: a slider move and a step by hand, after the run.
+        root.after(9000, lambda: worker.send("goto", 2.0))
+        root.after(9500, lambda: worker.send("step", 0.5))
         root.after(int(autoclose * 1000), on_close)
     try:
         root.mainloop()
@@ -1120,11 +1673,16 @@ def main(argv: list[str] | None = None) -> int:
                         "no tip)")
     p.add_argument("--readback", action="store_true",
                    help="GUI: open the readback-only window at start")
+    p.add_argument("--show", default="", metavar="PANELS",
+                   help="GUI: extra panels ticked at start, any of "
+                        "gold,approach,iv (default: none)")
     p.add_argument("--save-test-pulls", action="store_true",
                    help="headless with --test-pull: also save them to a "
                         "TESTPULLS .h5 and export it for Igor (format test)")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--autoclose", type=float, help=argparse.SUPPRESS)
+    p.add_argument("--version", action="version",
+                   version=f"rigtests 02 {__version__}")
     args = p.parse_args(argv)
 
     logging.basicConfig(
@@ -1140,9 +1698,15 @@ def main(argv: list[str] | None = None) -> int:
             return run_headless(cfg, args.headless, args.out, not args.no_igor,
                                 args.require_engaged, test_pull_v=args.test_pull,
                                 save_test_pulls=args.save_test_pulls)
+        show = {s.strip() for s in args.show.split(",") if s.strip()}
+        unknown = show - {"gold", "approach", "iv"}
+        if unknown:
+            p.error(f"--show: unknown panel(s) {sorted(unknown)}; "
+                    f"choose from gold, approach, iv")
         return run_gui(cfg, args.out, not args.no_igor,
                        args.config.name if args.config else "defaults",
-                       autoclose=args.autoclose, readback=args.readback)
+                       autoclose=args.autoclose, readback=args.readback,
+                       show=show)
     except (ConfigError, SafetyViolation) as exc:
         log.error("%s", exc)
         return 1

@@ -27,17 +27,24 @@ print(f"  second card       {M.low_res_device}   "
       f"<-- needed by experiments 06 and 07")
 
 rule("The one equation")
-print("    G/G0 = (V_ai1 - V_zero) / (Rf * V_bias * G0)")
+print("    G/G0 = (V_ai1 - V_zero) / (Rf * V_junction * G0)")
 print(f"\n  Rf = {C.preamp_gain_v_per_a:.3g} V/A, "
-      f"G0 = {G0_SIEMENS:.6e} S, bias = {R.bias_v * 1e3:.0f} mV\n")
-for g in (1.0, 0.5, 0.1, 1e-3, 10 ** -3.5, 5e-4, 1e-6):
-    v = C.g0_to_volts(g, R.bias_v)
+      f"G0 = {G0_SIEMENS:.6e} S, bias = {R.bias_v * 1e3:.0f} mV, "
+      f"series R = {cfg.keithley.series_resistance_ohm:.0f} ohm\n")
+print("  V_junction is MEASURED on ai0 every sample: the series resistor")
+print("  takes most of the bias once the junction conducts, so the current")
+print("  is capped at bias / R_series and the amplifier output is small.\n")
+from stmlab.config import amplifier_volts, junction_volts
+for g in (10.0, 5.0, 1.0, 0.5, 0.1, 1e-3, 10 ** -3.5, 5e-4, 1e-6):
+    v = amplifier_volts(cfg, g)
     flag = "  <-- CLIPS" if v > M.ai_range_v else \
         ("  <-- preamp railed" if v > L.preamp_saturation_v else "")
-    print(f"  {g:>10.3e} G0  ->  {v:>9.4f} V at ai1{flag}")
-print(f"\n  the input saturates at "
-      f"{C.volts_to_g0(min(L.preamp_saturation_v, M.ai_range_v), R.bias_v):.3f}"
-      f" G0 -- hard contact reads as a RAILED CHANNEL, not a big number")
+    print(f"  {g:>10.3e} G0  ->  {v:>9.4f} V at ai1, "
+          f"{junction_volts(cfg, g) * 1e3:7.2f} mV across the junction{flag}")
+print(f"\n  the current can never exceed bias / R_series = "
+      f"{R.bias_v / cfg.keithley.series_resistance_ohm * 1e6:.3f} uA, so at this")
+print("  bias the amplifier never rails: contact is judged on the measured")
+print("  junction voltage falling toward zero, not on a railed channel.")
 
 rule("The two piezos")
 print(f"  Z (ao0)   {C.piezo_nm_per_volt} nm/V, "

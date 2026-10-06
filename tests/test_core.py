@@ -50,11 +50,25 @@ def test_validator_catches_clipping(cfg):
         validate(cfg)
 
 
-def test_validator_catches_unreachable_engage_threshold(cfg):
-    """The mistake Igor's own defaults contain."""
-    cfg.ramp.engage_g0 = 5.0            # needs 38.7 V at the ADC
-    warnings = validate(cfg)
-    assert any("saturat" in w for w in warnings)
+def test_validator_knows_the_series_resistor_caps_the_current(cfg):
+    """Through the 106 kohm series resistor Igor's 5 G0 threshold is 0.92 V
+    at the amplifier and reachable; without the resistor it would need
+    38.7 V and the validator must say so."""
+    from stmlab.config import amplifier_volts, junction_volts
+    cfg.ramp.engage_g0 = 5.0
+    assert amplifier_volts(cfg, 1.0) == pytest.approx(0.840, abs=0.005)
+    assert amplifier_volts(cfg, 5.0) == pytest.approx(0.920, abs=0.005)
+    assert junction_volts(cfg, 1.0) == pytest.approx(0.0108, abs=0.0005)
+    assert not any("saturat" in w for w in validate(cfg))
+
+    cfg.keithley.series_resistance_ohm = 0.0
+    assert amplifier_volts(cfg, 1.0) == pytest.approx(7.748, abs=1e-3)
+    assert any("saturat" in w for w in validate(cfg))
+
+
+def test_validator_warns_when_the_resistor_leaves_too_little_junction_voltage(cfg):
+    cfg.ramp.engage_g0 = 20.0           # 0.47 mV across the junction
+    assert any("across the junction" in w for w in validate(cfg))
 
 
 def test_validator_catches_zero_bias(cfg):
@@ -325,6 +339,21 @@ def test_session_round_trips_raw_volts(rig, cfg, tmp_path):
         assert np.isfinite(current).all()
         assert session.cfg.cal.preamp_gain_v_per_a == \
             cfg.cal.preamp_gain_v_per_a
+
+
+def test_a_file_whose_writer_never_closed_still_counts_its_traces(rig, cfg,
+                                                                  tmp_path):
+    """The n_traces attribute is final only on a clean close; the count has
+    to come from the data, or a killed session reads as an empty file."""
+    import h5py
+    path = tmp_path / "session.h5"
+    with storage.SessionWriter(path, cfg) as writer:
+        trace.trace_loop(rig, n=3, on_trace=writer.append)
+    with h5py.File(path, "a") as h5:
+        del h5.attrs["n_traces"]                  # as a killed process leaves it
+    with storage.Session(path) as session:
+        assert len(session) == 3
+        assert session.conductance(2).size == cfg.ramp.n_pull_samples
 
 
 def test_reanalysis_with_a_corrected_gain_changes_the_answer(rig, cfg,

@@ -9,9 +9,10 @@ for a saved session. Run it on a file to get the figures as PNGs:
     python rigtests/plots.py data/rigtest02_20261006_1530.h5 --out figs # PNGs there
 
 Igor's windows, for orientation: ``HighRes`` is :func:`plot_record`,
-``PullOutLowG`` is :func:`plot_trace` on a log axis, ``AuAuConductanceLevel``
-is :func:`plot_gold_level`, ``SenseInDisplay`` is :func:`plot_piezo`,
-``LogHistOfBlock`` is :func:`plot_histogram`.
+``PullOutLowG`` is :func:`plot_trace` on a log axis (with the piezo readback
+of the same pull drawn over it in grey when the rig has one),
+``AuAuConductanceLevel`` is :func:`plot_gold_level`, ``SenseInDisplay`` is
+:func:`plot_piezo`, ``LogHistOfBlock`` is :func:`plot_histogram`.
 """
 
 from __future__ import annotations
@@ -31,42 +32,74 @@ from stmlab.config import RigConfig                          # noqa: E402
 
 C_CMD, C_SENSE = "#1f77b4", "#d62728"       # piezo command, piezo readback
 C_V, C_I = "#ff7f0e", "#2ca02c"             # junction voltage, current
-C_G, C_REJ = "#000000", "#999999"           # conductance, rejected trace
+C_G, C_REJ = "#000000", "#b08cc8"           # conductance, rejected trace (lilac)
+C_READ = "#8c8c8c"                          # the readback drawn over a trace (grey)
 
 
 # --------------------------------------------------------------------------
 # One record: what the inputs saw during a play
 # --------------------------------------------------------------------------
 
-def plot_record(ax, cfg: RigConfig, record: np.ndarray, fs: float,
-                spike_front: int | None = None, title: str = "record") -> None:
-    """Junction voltage (mV) and preamp current (uA) against time (ms).
+def plot_record_series(ax, cfg: RigConfig, t_s: np.ndarray, voltage_v: np.ndarray,
+                       current_v: np.ndarray, marks: dict | None = None,
+                       title: str = "record",
+                       frame: tuple[float, float] | None = None) -> None:
+    """Junction voltage (mV, left) and current (uA, right) against time (s).
 
-    ``record`` is the (2, n) array a play returned, raw volts; the voltage
-    sign and the preamp gain from the config turn it into mV and uA. The
-    alignment spike, if ``spike_front`` is given, is marked where it was
-    *written*; it appears in the data a group delay later.
+    ``voltage_v`` and ``current_v`` are raw volts, rows 0 and 1 of what the
+    card read; the voltage sign and the preamp gain from the config turn
+    them into mV and uA. NaN entries break the line, which is how the gaps
+    between the plays of a cycle are shown. ``marks`` is {label: time_s} for
+    the phases of a cycle; ``frame`` is an x range to show by default (the
+    window frames the pull), the data behind it staying the whole cycle so a
+    wider x range shows the approach too. Through the series resistor the
+    two lines cross at every make and break of contact: in contact the
+    junction voltage is a few mV and the current near bias / R; open, the
+    voltage is the full bias and the current is zero.
     """
-    M, C = cfg.channels, cfg.cal
-    n = record.shape[1]
-    t_ms = np.arange(n) / fs * 1e3
-    v_mv = C.voltage_input_sign * record[M.ROW_VOLTAGE] * 1e3
-    i_ua = C.volts_to_amps(record[M.ROW_CURRENT]) * 1e6
+    C = cfg.cal
+    t = np.asarray(t_s, dtype=float)
+    v_mv = C.voltage_input_sign * np.asarray(voltage_v, dtype=float) * 1e3
+    i_ua = C.volts_to_amps(np.asarray(current_v, dtype=float)) * 1e6
 
     ax.clear()
-    ax.plot(t_ms, v_mv, color=C_V, lw=0.8, label="junction V (mV)")
+    ax.plot(t, v_mv, color=C_V, lw=0.8, label="junction V (mV)")
     ax.set_ylabel("junction (mV)", color=C_V, fontsize=8)
     ax.tick_params(axis="y", colors=C_V, labelsize=8)
     ax.tick_params(axis="x", labelsize=8)
-    ax.set_xlabel("time (ms)", fontsize=8)
+    ax.set_xlabel("time (s)", fontsize=8)
     ax2 = _twin(ax)
-    ax2.plot(t_ms, i_ua, color=C_I, lw=0.8, label="current (uA)")
+    ax2.set_visible(True)
+    ax2.plot(t, i_ua, color=C_I, lw=0.8, label="current (uA)")
     ax2.set_ylabel("current (uA)", color=C_I, fontsize=8)
     ax2.tick_params(axis="y", colors=C_I, labelsize=8)
-    if spike_front is not None and 0 <= spike_front < n:
-        ax.axvline(spike_front / fs * 1e3, color="k", lw=0.5, ls="--", alpha=0.5)
+    ok = np.isfinite(t)
+    if frame is not None:
+        ax.set_xlim(*frame)                 # the caller's window, e.g. the pull
+    elif ok.any():
+        lo, hi = float(np.nanmin(t)), float(np.nanmax(t))
+        if hi > lo:
+            ax.set_xlim(lo, hi)
+    for label, when in (marks or {}).items():
+        ax.axvline(when, color="k", lw=0.5, ls=":", alpha=0.6)
+        ax.text(when, ax.get_ylim()[1], label, fontsize=7, rotation=90,
+                va="top", ha="right", alpha=0.7)
     ax.set_title(title, fontsize=9)
     ax.grid(True, alpha=0.3)
+
+
+def plot_record(ax, cfg: RigConfig, record: np.ndarray, fs: float,
+                spike_front: int | None = None, title: str = "record") -> None:
+    """One (2, n) record, raw volts, against time in seconds from its start;
+    the alignment spike, if ``spike_front`` is given, is marked where it was
+    *written* (it appears in the data a group delay later)."""
+    M = cfg.channels
+    n = record.shape[1]
+    marks = {}
+    if spike_front is not None and 0 <= spike_front < n:
+        marks["spike written"] = spike_front / fs
+    plot_record_series(ax, cfg, np.arange(n) / fs, record[M.ROW_VOLTAGE],
+                       record[M.ROW_CURRENT], marks=marks, title=title)
 
 
 # --------------------------------------------------------------------------
@@ -74,13 +107,24 @@ def plot_record(ax, cfg: RigConfig, record: np.ndarray, fs: float,
 # --------------------------------------------------------------------------
 
 def plot_trace(ax, cfg: RigConfig, g0: np.ndarray, disp_nm: np.ndarray,
-               verdict=None, title: str = "trace") -> None:
+               verdict=None, title: str = "trace",
+               sense_v: np.ndarray | None = None, smooth: int = 101) -> None:
     """log10(G/G0) against displacement, Igor's PullOutLowG.
 
     Horizontal lines at 1 G0 and at the break threshold; the title carries
     the selection verdict when one is given.
+
+    With ``sense_v`` (the piezo readback over the same samples, raw volts)
+    a right-hand axis carries, in grey, how far the readback says the piezo
+    has retracted since the pull began, in nm, against the same x. The
+    dotted diagonal is where that line lies when the piezo follows the
+    command exactly; a lag puts the grey line below it, creep bends it. The
+    readback is box-averaged over ``smooth`` samples first (101 = 2.5 ms at
+    40 kHz) because one sample of the 6361 is a 0.39 nm step, and zeroed at
+    the first averaged sample. Alignment is good to the card's group delay,
+    2.7 ms = 0.05 nm at 20 nm/s, which this scale cannot show.
     """
-    R = cfg.ramp
+    R, C = cfg.ramp, cfg.cal
     ax.clear()
     ok = verdict is None or getattr(verdict, "accepted", True)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -88,7 +132,8 @@ def plot_trace(ax, cfg: RigConfig, g0: np.ndarray, disp_nm: np.ndarray,
     ax.plot(disp_nm, y, color=C_G if ok else C_REJ, lw=0.8)
     ax.axhline(0.0, color=C_CMD, lw=0.6, ls="--", alpha=0.7)
     ax.axhline(np.log10(R.break_g0), color=C_SENSE, lw=0.6, ls=":", alpha=0.7)
-    ax.set_xlim(float(disp_nm[0]), float(disp_nm[-1]))
+    x0, x1 = float(disp_nm[0]), float(disp_nm[-1])
+    ax.set_xlim(x0, x1)
     ax.set_ylim(-7.5, 1.0)
     ax.set_xlabel("displacement (nm)", fontsize=8)
     ax.set_ylabel("log10 (G / G0)", fontsize=8)
@@ -99,21 +144,64 @@ def plot_trace(ax, cfg: RigConfig, g0: np.ndarray, disp_nm: np.ndarray,
     ax.set_title(title, fontsize=9)
     ax.grid(True, alpha=0.3)
 
+    retract = None
+    if sense_v is not None:
+        sv = np.asarray(sense_v, dtype=float)
+        if sv.size == np.asarray(disp_nm).size and np.isfinite(sv).any():
+            nm = C.sense_volts_to_nm(sv)
+            if smooth > 1:
+                nm = analysis.boxcar(nm, smooth)
+            retract = nm[0] - nm                # grows as the piezo pulls back
+    twin = _twin(ax)
+    if retract is None:
+        twin.set_visible(False)
+        return
+    twin.set_visible(True)
+    twin.plot([x0, x1], [x0, x1], ls=":", color=C_READ, lw=0.7, alpha=0.8,
+              label="command")
+    twin.plot(disp_nm, retract, color=C_READ, lw=0.8, label="readback")
+    pad = 0.1 * (x1 - x0) if x1 > x0 else 0.5
+    twin.set_ylim(x0 - pad, x1 + pad)
+    twin.set_ylabel("readback: retracted (nm)", color=C_READ, fontsize=8)
+    twin.tick_params(axis="y", colors=C_READ, labelsize=8)
+    twin.legend(fontsize=7, loc="upper right", frameon=False)
+
 
 def plot_gold_level(ax, cfg: RigConfig, g0: np.ndarray, disp_nm: np.ndarray,
-                    title: str = "gold level") -> None:
-    """G/G0 on a linear axis, 0 to 5, Igor's AuAuConductanceLevel: the
-    single-atom plateau is the flat step at 1."""
+                    title: str = "gold level",
+                    voltage_v: np.ndarray | None = None) -> None:
+    """G/G0 on a linear axis, Igor's PullOutGvsE / AuAuConductanceLevel: the
+    single-atom plateau is the flat step at 1, and the steps above it are
+    the neck losing atoms. The y axis runs from 0 to the trace's own top,
+    never less than 5. With ``voltage_v`` (row 0 of the trace, raw volts) the
+    measured junction voltage is drawn in grey on a right-hand axis in mV,
+    as Igor's window did: through the series resistor it sits at a few mV
+    while the junction conducts and jumps to the full bias when it opens.
+    """
+    C = cfg.cal
     ax.clear()
-    ax.plot(disp_nm, g0, color=C_G, lw=0.8)
+    g = np.asarray(g0, dtype=float)
+    ax.plot(disp_nm, g, color=C_G, lw=0.8)
     ax.axhline(1.0, color=C_CMD, lw=0.6, ls="--", alpha=0.7)
     ax.set_xlim(float(disp_nm[0]), float(disp_nm[-1]))
-    ax.set_ylim(-0.1, 5.0)
+    top = float(np.nanmax(g[np.isfinite(g)])) if np.isfinite(g).any() else 5.0
+    ax.set_ylim(-0.1, max(5.0, 1.1 * top))
     ax.set_xlabel("displacement (nm)", fontsize=8)
     ax.set_ylabel("G / G0", fontsize=8)
     ax.tick_params(labelsize=8)
     ax.set_title(title, fontsize=9)
     ax.grid(True, alpha=0.3)
+    twin = _twin(ax)
+    if voltage_v is None:
+        twin.set_visible(False)
+        return
+    twin.set_visible(True)
+    v_mv = C.voltage_input_sign * np.asarray(voltage_v, dtype=float) * 1e3
+    twin.plot(disp_nm, v_mv, color=C_READ, lw=0.7, alpha=0.9)
+    hi = float(np.nanmax(np.abs(v_mv))) if np.isfinite(v_mv).any() else 1.0
+    twin.set_ylim(-0.05 * hi, 1.15 * max(hi, 1e-3))
+    twin.set_ylabel("measured junction (mV)", color=C_READ, fontsize=8)
+    twin.tick_params(axis="y", colors=C_READ, labelsize=8)
 
 
 # --------------------------------------------------------------------------
@@ -299,15 +387,16 @@ def figure_for_session(path: str | Path, trace_index: int = 0):
     axes = fig.subplots(2, 3)
     record = np.stack([voltage, current])
     plot_record(axes[0, 0], cfg, record, fs, title=f"trace {i} of {n}: record")
-    plot_trace(axes[0, 1], cfg, g0, disp, verdict, title=f"trace {i}")
-    plot_gold_level(axes[0, 2], cfg, g0, disp)
+    plot_trace(axes[0, 1], cfg, g0, disp, verdict, title=f"trace {i}",
+               sense_v=sense)
+    plot_gold_level(axes[0, 2], cfg, g0, disp, voltage_v=voltage)
     t = np.arange(voltage.size) / fs
     cmd = start_v - cfg.cal.nm_to_piezo_volts(disp)
     plot_piezo(axes[1, 0], cfg, t, cmd, sense, title="piezo during the pull")
     plot_histogram(axes[1, 1], cfg, centres, counts, n)
     plot_iv(axes[1, 2], cfg, voltage, current)
     fig.suptitle(str(Path(path).name), fontsize=10)
-    fig.tight_layout()
+    fig.tight_layout(w_pad=3.0)
     return fig, {"n": n, "index": i, "verdict": verdict}
 
 

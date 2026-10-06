@@ -170,6 +170,26 @@ class Rig:
         target = self._piezo_v + self.cfg.cal.nm_to_piezo_volts(delta_nm)
         return self.hold(piezo_v=target)
 
+    def piezo_ramp_to(self, volts: float, ramp_s: float = 0.05) -> np.ndarray:
+        """Move the fine piezo to ``volts`` along a short linear ramp, then
+        hold there for the usual settle time; returns the record of both.
+
+        ``hold`` jumps in one sample, which is right for the approach's small
+        steps. This is for moves a person makes by hand -- the panel's slider
+        or its step buttons, Igor's SetPiezoBiasFromSlider -- where the move
+        can be large: a 50 ms ramp is kinder to the stage, and the record
+        shows the junction closing or opening as the tip travels. The clamp,
+        the bias check and the tracker are ``hold``'s, through ``play``.
+        """
+        R = self.cfg.ramp
+        safety.check_bias(self.cfg, self._bias_v)
+        target = safety.clamp_piezo(self.cfg, volts)
+        n_ramp = max(2, int(round(ramp_s * self.sample_rate_hz)))
+        piezo = np.concatenate([np.linspace(self._piezo_v, target, n_ramp),
+                                np.full(R.settle_samples, target)])
+        bias = np.full(piezo.size, self.cfg.cal.bias_output_sign * self._bias_v)
+        return self.play(np.stack([piezo, bias]))
+
     def set_bias(self, volts: float) -> None:
         safety.check_bias(self.cfg, volts)
         self.hold(bias_v=volts)
@@ -188,12 +208,16 @@ class Rig:
     def probe(self, n_samples: int | None = None) -> tuple[float, bool]:
         """(conductance in G0, whether the preamp railed).
 
-        The second value matters because metallic contact is usually *past*
-        the top of the measurable range: at Rf = 1e6 V/A and 100 mV bias the
-        input saturates around 1.3 G0, so solid contact reads as a railed
-        channel rather than a large number. Treating saturation as contact is
-        what makes the approach terminate at all -- and the returned
-        conductance is then a floor, not a measurement.
+        The second value matters on a rig without a series resistor, where
+        metallic contact is *past* the top of the measurable range: at
+        Rf = 1e6 V/A and 100 mV bias the input saturates around 1.3 G0, so
+        solid contact reads as a railed channel rather than a large number,
+        and treating saturation as contact is what makes the approach
+        terminate at all; the returned conductance is then a floor, not a
+        measurement. Through this rig's 106 kohm series resistor the current
+        is capped at bias / R and the amplifier does not rail at 100 mV, so
+        contact is the first value, the conductance from the measured
+        junction voltage, crossing ``ramp.engage_g0``.
         """
         record = self.hold(n_samples=n_samples)
         return self.conductance_of(record), self.is_saturated(record)
