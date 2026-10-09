@@ -87,7 +87,7 @@ log = logging.getLogger("rigtests.approach_pull")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v28"
+__version__ = "v30"
 
 
 # --------------------------------------------------------------------------
@@ -1019,9 +1019,24 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         target_lbl.config(text=f"slider {v:.3f} V = {C.piezo_volts_to_nm(v):.1f} nm"
                                + ("   (release to move)" if slide["dragging"] else
                                   f"   (range {lo_v:g} to {hi_v:g} V)"))
+        if slide["dragging"]:
+            # Igor's readouts kept ticking under a held mouse. Tk's timers
+            # should too, but a drag floods the event queue with motion
+            # events, so drive the refresh from the drag itself: every
+            # 150 ms of dragging, one pass of the window's heartbeat and a
+            # repaint, same as the timer would have done.
+            if time.monotonic() - live.get("last_poll", 0.0) > 0.15:
+                poll_body()
+                root.update_idletasks()
 
-    scale = ttk.Scale(pb, from_=lo_v, to=hi_v, orient="horizontal",
-                      variable=slider_var, command=on_slide, length=300)
+    # The classic Tk scale, not the themed one: it has a knob you can see,
+    # a 1 mV resolution when dragged, a 0.1 V step for a click beside the
+    # knob (the themed scale jumped a whole volt per click), the value shown
+    # over the knob and a tick every volt, which is what Igor's looked like.
+    scale = tk.Scale(pb, from_=lo_v, to=hi_v, orient="horizontal",
+                     variable=slider_var, command=on_slide, length=360,
+                     resolution=0.001, bigincrement=0.1, tickinterval=1.0,
+                     showvalue=True, sliderlength=18, font=("Arial", 8))
     scale.grid(row=1, column=0, columnspan=3, sticky="ew", padx=4, pady=(6, 0))
     target_lbl.grid(row=2, column=0, columnspan=3, sticky="w", padx=4)
 
@@ -1706,6 +1721,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
 
     def poll_body():
         M, C = cfg.channels, cfg.cal
+        live["last_poll"] = time.monotonic()
         while True:
             try:
                 kind, p = worker.events.get_nowait()
