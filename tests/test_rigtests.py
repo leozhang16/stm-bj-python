@@ -175,6 +175,41 @@ def test_quitting_the_worker_mid_run_returns_promptly_and_leaves_the_rig_usable(
         ap.close_rig(guard, rig)
 
 
+# -- the Keithley tab, on the simulated amplifier ----------------------------------
+
+def test_keithley_commands_track_the_amplifier_state(ap, cfg, tmp_path):
+    guard, rig = ap.open_rig(cfg)
+    mon = ap.Monitor(rig)
+    worker = ap.Worker(cfg, rig, mon, save=False, out_dir=tmp_path,
+                       igor_export=False)
+    try:
+        worker.cmd_keithley("connect")
+        k = worker.keithley
+        assert k.commands == []                       # joined without touching it
+        assert worker.k_state["zero_check"] is None   # unknown until a button
+        worker.cmd_keithley("zero_check", True)
+        assert k.commands[-1] == "C1X" and worker.k_state["zero_check"] is True
+        worker.cmd_keithley("find_suppress")          # refused: zero check on
+        assert worker.k_state["suppress"] is None
+        worker.cmd_keithley("zero_correct")           # on, correct, off
+        assert k.commands[-3:] == ["C1X", "C2X", "C0X"]
+        assert worker.k_state["zero_check"] is False
+        worker.cmd_keithley("find_suppress")
+        assert worker.k_state["suppress"] is True
+        assert k.commands[-1] == "N1X"
+        assert rig.bias_v == pytest.approx(cfg.ramp.bias_v)   # bias restored
+        worker.cmd_keithley("gain", 7)
+        assert cfg.keithley.gain_exponent == 7
+        assert cfg.cal.preamp_gain_v_per_a == pytest.approx(1e7)
+        events = [kind for kind, _ in list(worker.events.queue)]
+        assert events.count("keithley") >= 4
+        worker.close_keithley()
+        assert "C1B0N0X" not in k.commands             # never left in zero check
+    finally:
+        worker.close_file()
+        ap.close_rig(guard, rig)
+
+
 # -- the trace plot with the readback over it -----------------------------------
 
 def test_trace_plot_draws_the_readback_retraction_on_a_right_axis(ap, cfg):

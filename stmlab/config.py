@@ -449,6 +449,11 @@ class KeithleyConfig:
     Igor: SetUpGPIB_Keithley.ipf (address 22) and SetGain/SetCurrentSuppress
     in Controls_STMBJ.ipf:290-311, 460-477."""
     resource: str = "GPIB0::22::INSTR"
+    # Which VISA library pyvisa opens: "" is the default (NI-VISA, if it is
+    # installed); "@py" is pyvisa-py, which on Windows reaches an NI GPIB
+    # card through gpib-ctypes and the NI-488.2 driver Igor already uses, so
+    # nothing from NI has to be installed or changed.
+    visa_backend: str = ""
     gain_exponent: int = 6              # G_CurrentVoltGain, log10(V/A)
     suppress_const: float = 0.0         # G_CurrentSuppressConst
     series_resistance_ohm: float = 106130.0   # G_SeriesResistance

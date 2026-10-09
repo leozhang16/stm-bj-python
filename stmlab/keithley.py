@@ -77,22 +77,37 @@ class Keithley428:
 
     # -- lifecycle --------------------------------------------------------
 
-    def open(self) -> "Keithley428":
+    def open(self, init: bool = True) -> "Keithley428":
+        """Open the GPIB resource. With ``init`` (Igor's SetUpGPIB_Keithley)
+        the amplifier is put in its inert state -- zero check ON, filter,
+        bias and suppress off. ``init=False`` only opens the connection and
+        leaves the amplifier exactly as it is, for a program that joins a
+        session already in progress (rig test 02)."""
         import pyvisa
-        rm = pyvisa.ResourceManager()
+        rm = pyvisa.ResourceManager(self.cfg.visa_backend or "")
         self._inst = rm.open_resource(self.cfg.resource)
         self._inst.timeout = 5000
-        self.write("C1P0B0N0X")          # Igor's init: safe, inert state
-        log.info("Keithley 428 at %s: zero-check on, filter/bias/suppress "
-                 "off", self.cfg.resource)
+        if init:
+            self.write("C1P0B0N0X")          # Igor's init: safe, inert state
+            log.info("Keithley 428 at %s: zero-check on, filter/bias/suppress "
+                     "off", self.cfg.resource)
+        else:
+            log.info("Keithley 428 at %s: connected, state left as it was",
+                     self.cfg.resource)
         return self
 
-    def close(self) -> None:
+    def close(self, inert: bool = True) -> None:
+        """Close the connection. ``inert`` (Igor's Kill Tasks) first puts the
+        amplifier in zero check with bias and suppress off -- which also
+        means it reads nothing until someone turns zero check off again, so
+        a program that hands the amplifier on to the next one passes
+        ``inert=False``."""
         if self._inst is not None:
-            try:
-                self.write("C1B0N0X")    # leave it inert
-            except Exception:
-                pass
+            if inert:
+                try:
+                    self.write("C1B0N0X")
+                except Exception:
+                    pass
             self._inst.close()
             self._inst = None
 
@@ -175,12 +190,14 @@ class SimulatedKeithley(Keithley428):
         super().__init__(cfg)
         self.commands: list[str] = []
 
-    def open(self) -> "SimulatedKeithley":
-        self.write("C1P0B0N0X")
+    def open(self, init: bool = True) -> "SimulatedKeithley":
+        if init:
+            self.write("C1P0B0N0X")
         return self
 
-    def close(self) -> None:
-        return
+    def close(self, inert: bool = True) -> None:
+        if inert:
+            self.write("C1B0N0X")
 
     def write(self, command: str) -> None:
         self.commands.append(command)

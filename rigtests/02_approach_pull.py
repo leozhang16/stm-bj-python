@@ -40,6 +40,14 @@ is ramped over 50 ms, then the junction is probed: in contact, the state
 becomes ENGAGED and Pull once works from there; Approach + pull and Run N
 start from wherever the slider left the tip.
 
+The Keithley 428 tab is Igor's Keithley Controls over GPIB: zero check on
+or off, Zero correct, Suppress I on or off, Find suppress (Igor's
+TestVirtualGround sweep at 0 V bias) and the gain. The amplifier is
+connected only when you press Connect, its state is left exactly as it is
+(Igor's Kill Tasks leaves zero check ON, which makes the amplifier read
+nothing -- the banner says so once the program knows), and on exit the
+connection is closed without touching the amplifier.
+
 WHAT THIS DOES NOT DO: the coarse approach. Bring the tip within the fine
 piezo's reach (620 nm) by hand or with Igor's actuator controls first. When
 this program starts it parks the piezo at 0 V, so whatever extension Igor
@@ -79,7 +87,7 @@ log = logging.getLogger("rigtests.approach_pull")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v27"
+__version__ = "v28"
 
 
 # --------------------------------------------------------------------------
@@ -326,6 +334,12 @@ class Worker(threading.Thread):
         self.bias_dirty = True                 # set_bias before the next cycle
         self.busy = False                      # a command is running
         self.current: str | None = None        # its name
+        # The Keithley 428, opened on the first Keithley command. What the
+        # program knows of its state: None = unknown until a button sets it.
+        self.keithley = None
+        self.k_state: dict = {"connected": False, "zero_check": None,
+                              "suppress": None, "suppress_ua": None,
+                              "gain": cfg.keithley.gain_exponent}
 
     # -- posting ------------------------------------------------------------
 
@@ -378,6 +392,7 @@ class Worker(threading.Thread):
                 self.current = None
                 self.readout()
         self.close_file()
+        self.close_keithley()
 
     def cmd_noop(self) -> None:
         return
@@ -396,6 +411,100 @@ class Worker(threading.Thread):
                    if sense is not None and sense.size else None)
         self.post("monitor", t=time.monotonic(), record=rec,
                   piezo_v=self.rig.piezo_v, sense_v=sense_v)
+
+    # -- the Keithley 428 ----------------------------------------------------------
+
+    def _keithley(self):
+        if self.keithley is None:
+            from stmlab import keithley as kmod
+            k = kmod.make_keithley(self.cfg)
+            k.open(init=False)             # join the session; change nothing
+            self.keithley = k
+            self.k_state["connected"] = True
+        return self.keithley
+
+    def close_keithley(self) -> None:
+        if self.keithley is not None:
+            try:
+                self.keithley.close(inert=False)   # leave it as it is
+            except Exception:
+                pass
+            self.keithley = None
+
+    def cmd_keithley(self, action: str, *args) -> None:
+        """Igor's Keithley Controls. Every action reports the state it left
+        the amplifier in, and the window shows it."""
+        K = self.cfg.keithley
+        try:
+            k = self._keithley()
+        except Exception as exc:                 # noqa: BLE001
+            self.status(f"Keithley: could not open {K.resource}: {exc}. "
+                        "pyvisa and a VISA backend are needed (see the "
+                        "Keithley tab); the front-panel buttons do the same.")
+            return
+        sim = " (simulated)" if self.cfg.simulate else ""
+        if action == "connect":
+            self.status(f"Keithley 428 at {K.resource} connected{sim}; its "
+                        "state is unknown until a button sets it")
+        elif action == "zero_check":
+            on = bool(args[0])
+            k.zero_check(on)
+            self.k_state["zero_check"] = on
+            self.status("zero check ON: the amplifier's input is shorted and it "
+                        "reads nothing until you turn it off" if on else
+                        "zero check OFF: the amplifier is live")
+        elif action == "zero_correct":
+            k.zero_check(True)
+            k.zero_correct()
+            time.sleep(0.5)
+            k.zero_check(False)
+            self.k_state["zero_check"] = False
+            self.status("zero corrected (zero check on, correct, off): the "
+                        "amplifier is live. Press Calibrate zero next so the "
+                        "software zero matches the new hardware zero.")
+        elif action == "suppress":
+            on = bool(args[0])
+            k.suppress_enable(on)
+            self.k_state["suppress"] = on
+            self.status(f"current suppress {'ON' if on else 'OFF'}"
+                        + (f" ({k.suppress_ua:+.4f} uA)" if on else ""))
+        elif action == "find_suppress":
+            if self.k_state["zero_check"]:
+                self.status("find suppress refused: zero check is ON, the "
+                            "amplifier would read nothing. Turn it off first.")
+                return
+            if self.rig.state is RigState.ENGAGED:
+                self.status("find suppress refused: the tip is in contact; it "
+                            "must be out of contact (Withdraw, or step apart)")
+                return
+            from stmlab import keithley as kmod
+            self.status("finding the suppress: 21 points from -1 to +1 uA at "
+                        "0 V bias, about 3 s ...")
+            was = self.rig.bias_v
+            self.mon.quiet = True
+            try:
+                value, sweep, readings = kmod.find_suppress(self.rig, k)
+                self.rig.hold(bias_v=was)
+            finally:
+                self.mon.quiet = False
+            k.suppress_enable(True)
+            self.k_state.update(suppress=True, suppress_ua=float(value))
+            self.bias_dirty = True
+            self.status(f"current suppress set to {value:+.4f} uA and ON "
+                        f"(output {readings.min() * 1e3:+.2f} to "
+                        f"{readings.max() * 1e3:+.2f} mV across the sweep). "
+                        "Press Calibrate zero next.")
+        elif action == "gain":
+            n = int(args[0])
+            k.set_gain(n)
+            K.gain_exponent = n
+            self.cfg.cal.preamp_gain_v_per_a = 10.0 ** n
+            self.k_state["gain"] = n
+            self.close_file()                  # the config travels with the data
+            self.status(f"gain set to 1e{n} V/A on the amplifier and in cal "
+                        "(preamp_gain_v_per_a); the session file was closed so "
+                        "the next one carries the new gain")
+        self.post("keithley", **self.k_state)
 
     # -- moves made by hand: the slider and the step buttons ----------------------
 
@@ -843,7 +952,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                                          pady=2, sticky="ew")
     ttk.Entry(rb, textvariable=tp_var, width=6).grid(row=3, column=2, padx=2)
 
-    ro = tk.Text(rb, width=38, height=10, font=("Courier", 9), relief="flat",
+    ro = tk.Text(rb, width=50, height=11, font=("Courier", 9), relief="flat",
                  state="disabled", background=root.cget("background"))
     ro.grid(row=4, column=0, columnspan=3, sticky="ew", padx=2, pady=(4, 2))
 
@@ -1136,6 +1245,87 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     blbl = tk.Label(bb, text="", font=("Arial", 8), anchor="w", wraplength=300,
                     justify="left")
     blbl.grid(row=2, column=0, columnspan=5, sticky="w", padx=2)
+
+    # -- the Keithley 428: Igor's Keithley Controls, as a tab --------------------------
+    kb = ttk.Frame(nb)
+    nb.add(kb, text="Keithley 428")
+    k_lbl = tk.Label(kb, text="not connected", font=("Arial", 9), anchor="w")
+    ttk.Button(kb, text="Connect",
+               command=lambda: worker.send("keithley", "connect")).grid(
+        row=0, column=0, padx=2, pady=4, sticky="ew")
+    k_lbl.grid(row=0, column=1, columnspan=2, sticky="w", padx=4)
+    zc_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(kb, text="Zero check (Igor: ZeroCheckBox)", variable=zc_var,
+                    command=lambda: worker.send("keithley", "zero_check",
+                                                zc_var.get())).grid(
+        row=1, column=0, columnspan=2, sticky="w", padx=2)
+    ttk.Button(kb, text="Zero correct",
+               command=lambda: worker.send("keithley", "zero_correct")).grid(
+        row=1, column=2, padx=2, pady=2, sticky="ew")
+    sup_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(kb, text="Suppress I (Igor: SuppressCheckBox)", variable=sup_var,
+                    command=lambda: worker.send("keithley", "suppress",
+                                                sup_var.get())).grid(
+        row=2, column=0, columnspan=2, sticky="w", padx=2)
+    ttk.Button(kb, text="Find suppress",
+               command=lambda: worker.send("keithley", "find_suppress")).grid(
+        row=2, column=2, padx=2, pady=2, sticky="ew")
+    sup_lbl = tk.Label(kb, text="suppress value: unknown", font=("Arial", 8),
+                       anchor="w")
+    sup_lbl.grid(row=3, column=0, columnspan=3, sticky="w", padx=4)
+    gf = ttk.Frame(kb)
+    gf.grid(row=4, column=0, columnspan=3, sticky="w", padx=2, pady=(6, 2))
+    ttk.Label(gf, text="Gain 10^").pack(side="left")
+    gain_var = tk.StringVar(value=str(cfg.keithley.gain_exponent))
+    ttk.Entry(gf, textvariable=gain_var, width=4).pack(side="left", padx=2)
+    ttk.Label(gf, text="V/A").pack(side="left")
+
+    def on_gain():
+        try:
+            n = int(gain_var.get())
+        except ValueError:
+            status.config(text=f"gain: '{gain_var.get()}' is not a whole number")
+            return
+        if not 3 <= n <= 11:
+            status.config(text="gain exponent must be 3 to 11")
+            return
+        worker.send("keithley", "gain", n)
+    ttk.Button(gf, text="Set gain", command=on_gain).pack(side="left", padx=6)
+    tk.Label(kb, justify="left", anchor="w", wraplength=330, font=("Arial", 8),
+             fg="#444", text=(
+                 "Igor's routine after Start Writing: zero check off, Zero correct, "
+                 "Find suppress (tip out of contact). Igor's Kill Tasks leaves the "
+                 "amplifier in zero check, where it reads nothing: untick it here "
+                 "or on the front panel. Connect changes nothing; Zero correct "
+                 "ends with zero check off; Find suppress turns Suppress I on. "
+                 "After either, press Calibrate zero.\n\n"
+                 f"GPIB: {cfg.keithley.resource}, VISA backend "
+                 f"'{cfg.keithley.visa_backend or 'default (NI-VISA)'}'. Needs "
+                 "pip install pyvisa; without NI-VISA, also pyvisa-py and "
+                 "gpib-ctypes with \"visa_backend\": \"@py\" in the config.")).grid(
+        row=5, column=0, columnspan=3, sticky="w", padx=4, pady=(8, 2))
+
+    def keithley_line() -> str:
+        k = live.get("keithley")
+        if not k or not k["connected"]:
+            return "not connected (front panel rules)"
+        word = {None: "?", True: "ON", False: "off"}
+        return (f"zero check {word[k['zero_check']]}, suppress "
+                f"{word[k['suppress']]}, gain 1e{k['gain']}")
+
+    def show_keithley(k: dict):
+        live["keithley"] = k
+        sim = " (simulated)" if cfg.simulate else ""
+        k_lbl.config(text=(f"connected{sim}: {cfg.keithley.resource}"
+                           if k["connected"] else "not connected"))
+        if k["zero_check"] is not None:
+            zc_var.set(k["zero_check"])
+        if k["suppress"] is not None:
+            sup_var.set(k["suppress"])
+        sup_lbl.config(text=("suppress value: unknown" if k["suppress_ua"] is None
+                             else f"suppress value: {k['suppress_ua']:+.4f} uA")
+                            + f"    gain 1e{k['gain']} V/A")
+        gain_var.set(str(k["gain"]))
 
     # -- the plots --------------------------------------------------------------------
     # Four panels always: the record, the trace with the readback over it,
@@ -1542,7 +1732,8 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                     f"zero       {p['zero_uv']:+.1f} uV\n"
                     f"accepted   {p['accepted']} / {p['attempts']} attempts, "
                     f"{p['saved']} saved\n"
-                    f"file       {live.get('file') or 'none open'}"))
+                    f"file       {live.get('file') or 'none open'}\n"
+                    f"keithley   {keithley_line()}"))
                 show_big(p["current_ua"], p["junction_mv"], p["piezo_v"],
                          p["sense_v"])
             elif kind == "approach":
@@ -1554,6 +1745,8 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                 # panels show it at once, whatever "redraw while moving" says.
                 live["cycle"] = p["cycle"]
                 live["dirty"] = True
+            elif kind == "keithley":
+                show_keithley(p)
             elif kind == "cycle":
                 live["cycle"] = p["cycle"]
                 live["trace"] = p if p.get("record") is not None else None
@@ -1645,6 +1838,14 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                     canvas.draw_idle()
         if not live["paused"] and banner.cget("text").startswith("BROWSING"):
             banner.config(text="")
+        # The one amplifier state that silently ruins a session: say so in
+        # red for as long as the program knows it is on.
+        k = live.get("keithley")
+        zc_text = "ZERO CHECK ON: the amplifier reads nothing"
+        if k is not None and k["zero_check"] and not banner.cget("text"):
+            banner.config(text=zc_text, fg="#b00000")
+        elif banner.cget("text") == zc_text and not (k is not None and k["zero_check"]):
+            banner.config(text="")
 
     closed = {"done": False}
 
@@ -1692,6 +1893,13 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         # The Piezo box: a slider move and a step by hand, after the run.
         root.after(9000, lambda: worker.send("goto", 2.0))
         root.after(9500, lambda: worker.send("step", 0.5))
+        # The Keithley tab, on the simulated amplifier.
+        root.after(9600, lambda: worker.send("keithley", "connect"))
+        root.after(9700, lambda: worker.send("keithley", "zero_check", True))
+        root.after(9800, lambda: worker.send("keithley", "zero_correct"))
+        root.after(10400, lambda: worker.send("keithley", "find_suppress"))
+        root.after(10500, lambda: worker.send("keithley", "gain", 7))
+        root.after(10600, lambda: nb.select(kb))
         root.after(int(autoclose * 1000), on_close)
     try:
         root.mainloop()
