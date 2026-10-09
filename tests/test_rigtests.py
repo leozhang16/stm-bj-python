@@ -130,6 +130,51 @@ def test_a_slider_move_into_contact_engages_and_a_pull_follows(ap, cfg, tmp_path
         ap.close_rig(guard, rig)
 
 
+def test_a_stop_flag_ends_an_approach_between_steps(cfg):
+    """The Stop button and the window's close both set this flag; the
+    approach must end at once, cleanly, and run again once it is cleared."""
+    import threading
+    from stmlab.safety import RigState
+    rig = Rig(cfg, session=SimulatedDaqSession(cfg, seed=2)).open()
+    try:
+        flag = threading.Event()
+        flag.set()
+        with pytest.raises(approach.ApproachError, match="stopped by request"):
+            approach.engage(rig, stop_flag=flag)
+        assert rig.piezo_v == pytest.approx(cfg.ramp.piezo_park_v)   # no step taken
+        flag.clear()
+        assert approach.engage(rig, stop_flag=flag) is RigState.ENGAGED
+    finally:
+        rig.close()
+
+
+def test_quitting_the_worker_mid_run_returns_promptly_and_leaves_the_rig_usable(
+        ap, cfg, tmp_path):
+    """What closing the window does while Run N is going: the stop flag ends
+    the approach between steps, the worker thread exits, and only then are
+    the cards closed -- no write lands on a closed task."""
+    import time
+    guard, rig = ap.open_rig(cfg)
+    mon = ap.Monitor(rig)
+    worker = ap.Worker(cfg, rig, mon, save=False, out_dir=tmp_path,
+                       igor_export=False)
+    worker.start()
+    try:
+        worker.send("run", 100000)
+        time.sleep(0.5)                      # well into the run
+        t0 = time.monotonic()
+        worker.stop_flag.set()
+        worker.quit()
+        worker.join(timeout=60)
+        assert not worker.is_alive()
+        assert time.monotonic() - t0 < 10
+        rig.withdraw()                       # the cards are still open and sane
+        assert rig.piezo_v == pytest.approx(cfg.ramp.piezo_park_v)
+    finally:
+        worker.close_file()
+        ap.close_rig(guard, rig)
+
+
 # -- the trace plot with the readback over it -----------------------------------
 
 def test_trace_plot_draws_the_readback_retraction_on_a_right_axis(ap, cfg):

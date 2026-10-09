@@ -32,13 +32,23 @@ def _headroom_ok(cfg: RigConfig, piezo_v: float) -> bool:
     return piezo_v - need >= floor
 
 
-def separate(rig) -> None:
+def _check_stop(rig, stop_flag, what: str) -> None:
+    """A long loop that can be interrupted from outside: the Stop button, or
+    the window closing. Raising here, between two steps, leaves the rig in a
+    consistent state (the tracker is true, no play is in flight) -- which is
+    exactly what closing the cards under a running loop does not."""
+    if stop_flag is not None and stop_flag.is_set():
+        raise ApproachError(f"{what} stopped by request at {rig.piezo_v:.4f} V")
+
+
+def separate(rig, stop_flag=None) -> None:
     """Retract until the junction is open. Igor's first loop."""
     cfg: RigConfig = rig.cfg
     R, L = cfg.ramp, cfg.limits
 
     log.debug("breaking contact in %.1f nm steps", R.retract_step_nm)
     while True:
+        _check_stop(rig, stop_flag, "separate")
         # Only the bound being travelled toward can block. Retracting from the
         # top of the range is fine; it is the floor that ends this loop.
         if rig.piezo_v <= L.piezo_ao_min_v:
@@ -52,12 +62,13 @@ def separate(rig) -> None:
             return
 
 
-def close_in(rig) -> None:
+def close_in(rig, stop_flag=None) -> None:
     """Approach in small steps until contact. Igor's second loop."""
     cfg: RigConfig = rig.cfg
     R, L = cfg.ramp, cfg.limits
 
     while True:
+        _check_stop(rig, stop_flag, "approach")
         if rig.piezo_v >= L.piezo_ao_max_v:
             raise ApproachError(
                 f"could not make contact: piezo is at the "
@@ -68,12 +79,15 @@ def close_in(rig) -> None:
             return
 
 
-def engage(rig) -> RigState:
+def engage(rig, stop_flag=None) -> RigState:
     """Break any existing contact, then make a fresh one.
 
     Returns ``RigState.ENGAGED`` on success. Raises ApproachError if the piezo
     runs out of range in either direction -- Igor returned -2 and -3 for those
-    two cases and terminated the run (Functions_STMBJ.ipf:1297, 1336).
+    two cases and terminated the run (Functions_STMBJ.ipf:1297, 1336) -- or,
+    when a ``stop_flag`` (a ``threading.Event``) is given and set, between
+    two steps: an approach over the whole range takes two minutes, and the
+    person waiting must be able to end it cleanly.
 
     Also refuses to report success from a position with no room left for the
     pull. On a unipolar piezo, contact made low in the range cannot be pulled
@@ -84,9 +98,9 @@ def engage(rig) -> RigState:
     rig.state = RigState.APPROACHING
 
     if rig.in_contact():
-        separate(rig)
+        separate(rig, stop_flag)
 
-    close_in(rig)
+    close_in(rig, stop_flag)
 
     if not _headroom_ok(cfg, rig.piezo_v):
         raise ApproachError(

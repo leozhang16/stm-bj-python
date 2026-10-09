@@ -79,7 +79,7 @@ log = logging.getLogger("rigtests.approach_pull")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v24"
+__version__ = "v27"
 
 
 # --------------------------------------------------------------------------
@@ -296,7 +296,9 @@ class Worker(threading.Thread):
     """Executes commands from the window in order, on the rig, in its own
     thread, and posts events back. Commands: zero, bias, engage, pull,
     cycle, run (n), withdraw, smash, testpull (V), goto (V), step (nm),
-    monitor. ``stop`` interrupts a run between cycles."""
+    monitor. The stop flag interrupts a run between cycles and an approach
+    between two steps; every command clears it as it starts, so a Stop
+    pressed earlier does not kill the next command."""
 
     def __init__(self, cfg: RigConfig, rig: Rig, monitor: Monitor,
                  save: bool, out_dir: Path, igor_export: bool):
@@ -354,6 +356,8 @@ class Worker(threading.Thread):
             if self._quit.is_set():
                 break
             name, args = command[0], command[1:]
+            if name not in ("monitor", "noop"):
+                self.stop_flag.clear()         # Stop applies to what is running
             self.busy = True
             self.current = name
             try:
@@ -468,8 +472,8 @@ class Worker(threading.Thread):
             self.cmd_bias()
         self.mon.begin_cycle()
         self.mon.mark("approach")
-        self.status("approaching ...")
-        state = approach.engage(self.rig)
+        self.status("approaching ... (Stop ends it between two steps)")
+        state = approach.engage(self.rig, stop_flag=self.stop_flag)
         self.mon.mark("contact")
         self.post("approach", cycle=self.mon.snapshot())
         self.status(f"engaged at {self.rig.piezo_v:.4f} V = "
@@ -556,7 +560,6 @@ class Worker(threading.Thread):
         self._pull(test=True)
 
     def cmd_run(self, n: int) -> None:
-        self.stop_flag.clear()
         done = 0
         R = self.cfg.ramp
         while done < n and not self.stop_flag.is_set():
@@ -1502,13 +1505,24 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     rebuild()
 
     def poll():
-        drew = False
+        """The window's heartbeat, every 150 ms. An error in one tick is
+        logged and the next tick still comes: the loop must not die while
+        the rig is in use."""
+        try:
+            poll_body()
+        except Exception:                       # noqa: BLE001
+            log.exception("window update failed")
+        root.after(150, poll)
+
+    def poll_body():
+        M, C = cfg.channels, cfg.cal
         while True:
             try:
                 kind, p = worker.events.get_nowait()
             except queue.Empty:
                 break
             if kind == "status":
+                live["status"] = p["text"]
                 status.config(text=p["text"])
             elif kind == "error":
                 status.config(text=p["text"])
@@ -1558,7 +1572,6 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                 pass
             elif kind == "monitor":
                 rec = p["record"]
-                M, C = cfg.channels, cfg.cal
                 tail = rec[:, rec.shape[1] // 2:]
                 v = float(C.voltage_input_sign * np.mean(tail[M.ROW_VOLTAGE]))
                 i = float(C.volts_to_amps(np.mean(tail[M.ROW_CURRENT])))
@@ -1569,6 +1582,34 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                 mon_state["i"].append(i * 1e6)
                 mon_state["g"].append(float(np.log10(max(g, 1e-12))) if np.isfinite(g) else 3.0)
                 show_big(i * 1e6, v * 1e3, p["piezo_v"], p["sense_v"], beep_ok=True)
+        if worker.busy and worker.current not in QUIET:
+            # Igor's slider and readouts followed every write. While a
+            # command runs, follow the tracker and the last play's record,
+            # so the slider walks up the staircase and down the pull and
+            # the readouts show the junction closing, as Igor's did.
+            cyc = mon.snapshot()
+            rec = cyc.last_record
+            if rec is not None and rec.shape[1] >= 4:
+                tail = rec[:, rec.shape[1] // 2:]
+                v_mv = float(C.voltage_input_sign * np.mean(tail[M.ROW_VOLTAGE])) * 1e3
+                i_ua = float(C.volts_to_amps(np.mean(tail[M.ROW_CURRENT]))) * 1e6
+            else:
+                v_mv = i_ua = float("nan")
+            sense = rig.last_sense_v
+            sense_v = (float(np.mean(sense[sense.size // 2:]))
+                       if sense is not None and sense.size else None)
+            show_big(i_ua, v_mv, rig.piezo_v, sense_v)
+            # A heartbeat on the status line, so a two-minute approach with
+            # the plots standing still does not look like a frozen window.
+            if live.get("busy_since") is None:
+                live["busy_since"] = time.monotonic()
+            elapsed = time.monotonic() - live["busy_since"]
+            status.config(text=f"{live.get('status', '')}   |   {worker.current} "
+                               f"running {elapsed:4.0f} s: piezo {rig.piezo_v:.3f} V, "
+                               f"junction {v_mv:.1f} mV, {i_ua:.3f} uA"
+                               "   (Stop ends an approach between steps)")
+        else:
+            live["busy_since"] = None
         if (monitor_wants_sample() and not worker.busy and worker.commands.empty()
                 and time.monotonic() - mon_state["last"] > 0.3):
             mon_state["last"] = time.monotonic()
@@ -1604,17 +1645,24 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                     canvas.draw_idle()
         if not live["paused"] and banner.cget("text").startswith("BROWSING"):
             banner.config(text="")
-        root.after(150, poll)
 
     closed = {"done": False}
 
     def shutdown():
+        """Stop whatever is running, wait for the worker to let go of the
+        cards, and only then close them. Closing the tasks under a running
+        approach made the worker's next write fail and left the outputs to
+        the emergency park; the stop flag ends the approach between two
+        steps instead, within a tenth of a second."""
         if closed["done"]:
             return
         closed["done"] = True
         worker.stop_flag.set()
         worker.quit()
-        worker.join(timeout=15)
+        worker.join(timeout=60)
+        if worker.is_alive():
+            log.error("the rig worker has not finished in 60 s; closing the "
+                      "cards under it")
         if browse["session"] is not None:
             browse["session"].close()
         close_rig(guard, rig)

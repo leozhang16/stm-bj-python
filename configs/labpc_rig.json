@@ -44,7 +44,8 @@
   "cal": {
     "preamp_gain_v_per_a": 1000000.0,
     "current_zero_v": 0.0,
-    "piezo_nm_per_volt": 62.0,
+    "piezo_nm_per_volt": 39.97,
+    "sense_nm_per_volt": 314.0,
     "hv_amp_gain": null,
     "bias_output_sign": -1.0,
     "voltage_input_sign": -1.0,
