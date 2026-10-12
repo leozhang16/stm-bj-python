@@ -167,6 +167,13 @@ class SessionWriter:
             h5.attrs["n_traces"] = self._n       # so a killed session still counts
             h5.flush()
 
+    def describe(self, **attrs) -> None:
+        """Record who, what and why in the file's header: operator,
+        experiment, notes. Strings only; written at once."""
+        for key, value in attrs.items():
+            self._h5.attrs[key] = "" if value is None else str(value)
+        self._h5.flush()
+
     def write_summary(self, stats: dict) -> None:
         if self._h5 is not None:
             self._h5.attrs["run_stats_json"] = json.dumps(stats, indent=2,
@@ -446,6 +453,63 @@ def save_igor_block(path: str | Path, cfg: RigConfig, traces_g0,
     return write_ibw(path, wave_name, block, note=note,
                      dx=cfg.ramp.pull_rate_nm_per_s / cfg.ramp.sample_rate_hz,
                      data_units="", x_units="nm")
+
+
+def save_txt_block(path: str | Path, cfg: RigConfig, traces_g0,
+                   start_piezo_v=None, timestamps=None,
+                   header_lines=()) -> tuple[Path, Path]:
+    """Write conductance traces as a plain-text table for Python or MATLAB.
+
+    First column the displacement in nm, then one column per trace in
+    G/G0, tab-separated, with a ``#`` header naming the run and the settings
+    that made it. Traces of different lengths are padded with NaN. A second
+    file, ``<stem>_info.txt``, has one row per trace: index, the piezo
+    voltage at contact, the timestamp. Reads back with ``numpy.loadtxt``
+    (comments are skipped by default) or MATLAB's
+    ``readmatrix(file, 'CommentStyle', '#')``.
+
+    Returns (data path, info path).
+    """
+    from . import analysis
+    traces = [np.asarray(t, dtype=float) for t in traces_g0]
+    if not traces:
+        raise ValueError("no traces to write")
+    n = max(t.size for t in traces)
+    fs = cfg.cal.granted_sample_rate_hz or cfg.ramp.sample_rate_hz
+    disp = analysis.displacement_nm(n, cfg.ramp, fs)
+    table = np.full((n, len(traces) + 1), np.nan)
+    table[:, 0] = disp
+    for k, tr in enumerate(traces):
+        table[:tr.size, k + 1] = tr
+
+    path = Path(path)
+    R, C, K = cfg.ramp, cfg.cal, cfg.keithley
+    header = list(header_lines) + [
+        f"{len(traces)} accepted traces, {n} points each",
+        f"bias_v={R.bias_v:g} pull_rate_nm_per_s={R.pull_rate_nm_per_s:g} "
+        f"pull_length_nm={R.pull_length_nm:g} sample_rate_hz={fs:g} "
+        f"piezo_nm_per_volt={C.piezo_nm_per_volt:g} "
+        f"preamp_gain_v_per_a={C.preamp_gain_v_per_a:g} "
+        f"series_resistance_ohm={K.series_resistance_ohm:g}",
+        "columns: displacement_nm, then trace_1 ... trace_N in G/G0 "
+        "(0 nm = where the pull began, at contact)",
+        "read: numpy.loadtxt(file) | MATLAB readmatrix(file, 'CommentStyle', '#')",
+    ]
+    np.savetxt(path, table, fmt="%.6e", delimiter="\t",
+               header="\n".join(header), comments="# ")
+
+    info = path.with_name(path.stem + "_info.txt")
+    sv = [0.0] * len(traces) if start_piezo_v is None else list(start_piezo_v)
+    ts = [float("nan")] * len(traces) if timestamps is None else list(timestamps)
+    with open(info, "w") as f:
+        f.write("# index\tstart_piezo_v\ttimestamp_unix\tlocal_time\n")
+        for k, (v, t) in enumerate(zip(sv, ts)):
+            t = float("nan") if t is None else float(t)
+            when = (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+                    if np.isfinite(t) else "")
+            f.write(f"{k + 1}\t{float(v):.6f}\t{t:.3f}\t{when}\n")
+    log.info("wrote %s (%d traces) and %s", path.name, len(traces), info.name)
+    return path, info
 
 
 def _igor_name(stem: str) -> str:

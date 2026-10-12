@@ -1,5 +1,7 @@
 # python_code_entire_igor_w_GUI — the complete Igor setup, with its panels
 
+**The experiment:** `python pullout.py --config configs/labpc_rig.json` is the day-to-day pull-out program (simulate with `--simulate`); see its docstring and `rigtests/README.md`.
+
 Everything the Igor procedures in `../igor_code/` could run, as one Python
 folder — **including the GUI**. This is `../python_code_entire_igor/`
 (the complete command-line translation: `stmlab/`, eight `experiments/`,

@@ -1,10 +1,13 @@
-"""The parts of rigtests/02_approach_pull.py that decide things: the settings
-check that stands between a typed number and the rig, and the monitor that
-watches every play. No window, simulator only."""
+"""The parts of pullout.py that decide things: the settings check that stands
+between a typed number and the rig, the monitor that watches every play, the
+worker's experiments, the Keithley and actuator commands, the histogram
+windows. No hardware, simulator only; the window tests skip without a
+display."""
 
 from __future__ import annotations
 
-import importlib.util
+import re
+import time
 from pathlib import Path
 
 import numpy as np
@@ -15,22 +18,10 @@ from stmlab.config import RigConfig
 from stmlab.instrument import Rig
 from stmlab.sim import SimulatedDaqSession
 
-_HERE = Path(__file__).resolve().parents[1] / "rigtests"
-
-
-def _load(name: str):
-    """Import a rigtests script by file name (they start with a digit)."""
-    import sys
-    spec = importlib.util.spec_from_file_location(name, _HERE / f"{name}.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module          # dataclasses look the module up
-    spec.loader.exec_module(module)
-    return module
-
-
 @pytest.fixture(scope="module")
 def ap():
-    return _load("02_approach_pull")
+    import pullout
+    return pullout
 
 
 @pytest.fixture
@@ -175,6 +166,264 @@ def test_quitting_the_worker_mid_run_returns_promptly_and_leaves_the_rig_usable(
         ap.close_rig(guard, rig)
 
 
+# -- saving: one experiment per run ----------------------------------------------
+
+def test_a_run_files_its_traces_under_date_name_experiment(ap, cfg, tmp_path):
+    guard, rig = ap.open_rig(cfg)
+    mon = ap.Monitor(rig)
+    worker = ap.Worker(cfg, rig, mon, save=True, out_dir=tmp_path,
+                       igor_export=False)
+    try:
+        worker.cmd_zero()
+        worker.cmd_cycle()                       # a single cycle: not saved
+        assert list(tmp_path.rglob("*.h5")) == []
+        worker.cmd_run(2, {"folder": tmp_path, "name": "Leo Z",
+                           "experiment": "clean gold", "txt": True})
+        folder = tmp_path / time.strftime("%Y-%m-%d") / "Leo_Z"
+        h5 = list(folder.glob("clean_gold_*_2traces.h5"))
+        assert len(h5) == 1
+        txt = h5[0].with_suffix(".txt")
+        assert txt.exists()
+        table = np.loadtxt(txt)                  # comments skipped
+        assert table.shape[1] == 3               # displacement + 2 traces
+        assert table[0, 0] == 0.0 and table[-1, 0] == pytest.approx(
+            cfg.ramp.pull_length_nm, rel=0.01)
+        assert np.all(np.isfinite(table[:, 1:]))
+        info = h5[0].with_name(h5[0].stem + "_info.txt").read_text()
+        assert info.count("\n") == 3                # header + 2 rows
+        # The run's counters started fresh.
+        assert worker.accepted == 2
+        # A second run is a second experiment, its own file.
+        worker.cmd_run(1, {"experiment": "OPE3"})
+        assert len(list(folder.glob("OPE3_*_1traces.h5"))) == 1
+    finally:
+        worker.close_file()
+        ap.close_rig(guard, rig)
+
+
+def test_every_run_adds_a_row_to_the_experiment_log(ap, cfg, tmp_path):
+    import csv
+    import h5py
+    cfg.ramp.engage_g0 = 2.0          # a solid contact, as the lab's 5 G0 gives
+    guard, rig = ap.open_rig(cfg)
+    mon = ap.Monitor(rig)
+    worker = ap.Worker(cfg, rig, mon, save=True, out_dir=tmp_path,
+                       igor_export=False)
+    worker.config_name = "labpc_rig.json"
+    try:
+        worker.cmd_zero()
+        worker.cmd_run(2, {"folder": tmp_path, "name": "Leo", "experiment": "au",
+                           "notes": "fresh tip, toluene", "txt": True})
+        worker.cmd_run(1, {"experiment": "OPE3"})
+    finally:
+        worker.close_file()
+        ap.close_rig(guard, rig)
+    log = tmp_path / "experiment_log.csv"           # one file, every day
+    with open(log, newline="") as f:
+        lines = list(csv.reader(f))
+    # A header, then two lines per experiment: the facts, then the path alone.
+    assert lines[0] == ["date", "start_time", "name", "experiment", "traces",
+                        "notes", "auto_notes"]
+    assert len(lines) == 1 + 2 * 2
+    first, path_line = lines[1], lines[2]
+    assert first[0] == time.strftime("%Y-%m-%d")
+    assert first[2:6] == ["Leo", "au", "2", "fresh tip, toluene"]
+    # The automatic note: the bias set and the junction voltage measured,
+    # open (through the series resistor, ~90 mV) and in contact (a few mV).
+    auto = first[6]
+    m = re.search(r"junction measured ([\d.]+) mV open, ([\d.]+) mV at pull start", auto)
+    assert auto.startswith("bias set 100 mV; ") and m
+    assert 85 < float(m.group(1)) < 95
+    assert 0 < float(m.group(2)) < 15                  # in contact, G >= 2 G0
+    assert "series resistor 106130 ohm" in auto and "gain 1e+06 V/A" in auto
+    assert len(path_line) == 1
+    data_path = Path(path_line[0])
+    assert data_path.is_absolute() and data_path.exists()
+    assert data_path.name.startswith("au_") and data_path.name.endswith("_2traces.h5")
+    assert lines[3][3] == "OPE3" and len(lines[4]) == 1
+    r = {"data_path": str(data_path)}
+    # The file header carries the same who / what / notes.
+    with h5py.File(r["data_path"]) as h:
+        assert h.attrs["operator"] == "Leo"
+        assert h.attrs["experiment"] == "au"
+        assert h.attrs["notes"] == "fresh tip, toluene"
+        assert h.attrs["auto_notes"].startswith("bias set 100 mV")
+        assert h.attrs["program"].startswith("pullout v")
+
+
+def test_saving_settings_are_remembered(ap, tmp_path):
+    f = tmp_path / "s.json"
+    ap.save_saving(f, {"folder": tmp_path / "d", "name": "leo",
+                       "experiment": "x", "txt": True, "igor": False})
+    back = ap.load_saving(f)
+    assert back["name"] == "leo" and back["txt"] is True
+    assert Path(back["folder"]) == tmp_path / "d"
+    assert ap.load_saving(tmp_path / "missing.json") == {}
+
+
+def test_stop_pauses_a_run_and_continue_finishes_it_in_the_same_file(ap, cfg, tmp_path):
+    guard, rig = ap.open_rig(cfg)
+    mon = ap.Monitor(rig)
+    worker = ap.Worker(cfg, rig, mon, save=True, out_dir=tmp_path,
+                       igor_export=False)
+    try:
+        worker.stop_flag.set()                   # as if Stop were pressed at once
+        worker.cmd_run(4, {"folder": tmp_path, "name": "leo", "experiment": "au"})
+        assert worker.paused == {"remaining": 4}
+        assert worker.run_stem is not None       # the experiment stays open
+        assert list(tmp_path.rglob("*traces.h5")) == []
+        worker.stop_flag.clear()                 # (the worker loop does this per command)
+        worker.cmd_cycle()                       # a single cycle while paused
+        assert worker.n_saved == 0               # is not written into the file
+        worker.cmd_continue()
+        assert worker.paused is None and worker.run_stem is None
+        files = list(tmp_path.rglob("au_*_4traces.h5"))
+        assert len(files) == 1
+        with storage.Session(files[0]) as sess:
+            assert len(sess) == 4
+        # The note says where the run was stopped and that it was continued.
+        import csv
+        import h5py
+        with open(tmp_path / "experiment_log.csv", newline="") as f:
+            lines = list(csv.reader(f))
+        assert "Stop after trace 0 at " in lines[1][6] and ", continued " in lines[1][6]
+        with h5py.File(files[0]) as h:
+            assert "Stop after trace 0" in h.attrs["auto_notes"]
+        worker.cmd_continue()                    # nothing to continue
+    finally:
+        worker.close_file()
+        ap.close_rig(guard, rig)
+
+
+def test_a_settings_change_finishes_a_paused_experiment(ap, cfg, tmp_path):
+    guard, rig = ap.open_rig(cfg)
+    mon = ap.Monitor(rig)
+    worker = ap.Worker(cfg, rig, mon, save=True, out_dir=tmp_path,
+                       igor_export=False)
+    try:
+        worker.cmd_run(1, {"folder": tmp_path, "name": "leo", "experiment": "au"})
+        worker.stop_flag.set()
+        worker.cmd_run(3, {"experiment": "au2"})     # pauses at once, 0 taken
+        worker.stop_flag.clear()
+        worker.cmd_newfile()                         # what Apply sends
+        assert worker.paused is None and worker.run_stem is None
+        assert len(list(tmp_path.rglob("au_*_1traces.h5"))) == 1
+    finally:
+        worker.close_file()
+        ap.close_rig(guard, rig)
+
+
+# -- the coarse actuator, simulated ------------------------------------------------
+
+def test_coarse_steps_go_through_the_interlock(ap, cfg, tmp_path):
+    from stmlab.safety import SafetyViolation
+    cfg.actuator.kind = "simulated"
+    guard, rig = ap.open_rig(cfg)
+    mon = ap.Monitor(rig)
+    worker = ap.Worker(cfg, rig, mon, save=False, out_dir=tmp_path,
+                       igor_export=False)
+    try:
+        worker.cmd_coarse_step(True)             # parked: allowed
+        assert rig.coarse_steps == 1
+        worker.cmd_goto(2.0)                     # piezo extended
+        with pytest.raises(SafetyViolation):
+            worker.cmd_coarse_step(True)         # refused before the move
+        assert rig.coarse_steps == 1
+        events = [k for k, _ in list(worker.events.queue)]
+        assert "actuator" in events
+    finally:
+        worker.close_file()
+        ap.close_rig(guard, rig)
+
+
+def test_without_an_actuator_the_buttons_only_explain(ap, cfg, tmp_path):
+    guard, rig = ap.open_rig(cfg)                # actuator.kind == "none"
+    mon = ap.Monitor(rig)
+    worker = ap.Worker(cfg, rig, mon, save=False, out_dir=tmp_path,
+                       igor_export=False)
+    try:
+        worker.cmd_coarse_step(True)
+        worker.cmd_coarse_approach()
+        texts = [p["text"] for k, p in list(worker.events.queue) if k == "status"]
+        assert any("no actuator configured" in t for t in texts)
+        assert rig.coarse_steps == 0
+    finally:
+        worker.close_file()
+        ap.close_rig(guard, rig)
+
+
+# -- histograms of a saved session --------------------------------------------------
+
+def test_histogram_2d_aligns_each_trace_at_the_break(cfg):
+    from stmlab import analysis
+    n = 2000
+    disp = analysis.displacement_nm(n, cfg.ramp)
+    # Two traces: a 1 G0 plateau that breaks at different points, then a
+    # tunnelling decay. Aligned at 0.5 G0 the breaks must coincide at 0 nm.
+    traces = []
+    for k_break in (600, 1200):
+        g = np.where(np.arange(n) < k_break, 1.0,
+                     10.0 ** (-10.0 * (disp - disp[k_break])))
+        traces.append(g)
+    counts, xe, ye = analysis.histogram_2d(traces, disp, align_at_g0=0.5,
+                                           x_range=(-0.5, 1.0), n_x=150,
+                                           y_range=(-7, 1), n_y=160)
+    assert counts.shape == (150, 160)
+    # The plateau column (log G = 0) is filled only at x < 0 for both traces
+    # and the two traces' plateaus end in the same x bin: the alignment.
+    j0 = np.searchsorted(ye, 0.0) - 1
+    filled = np.flatnonzero(counts[:, j0] > 0)
+    assert xe[filled[-1] + 1] <= 0.0 + 1e-9
+    # Unaligned, 0 nm is the pull's start and the plateaus sit at x > 0.
+    counts2, xe2, _ = analysis.histogram_2d(traces, disp, align_at_g0=None,
+                                            x_range=(-0.5, 1.0), n_x=150,
+                                            y_range=(-7, 1), n_y=160)
+    assert np.flatnonzero(counts2[:, j0] > 0).min() >= np.searchsorted(xe2, 0.0) - 1
+
+
+def test_histogram_windows_draw_and_redraw(ap, cfg, tmp_path):
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip(f"no Tk display: {exc}")
+    from tkinter import ttk
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
+    guard, rig = ap.open_rig(cfg)
+    mon = ap.Monitor(rig)
+    worker = ap.Worker(cfg, rig, mon, save=True, out_dir=tmp_path,
+                       igor_export=False)
+    try:
+        worker.cmd_run(3, {"folder": tmp_path, "name": "leo", "experiment": "au"})
+    finally:
+        worker.close_file()
+        ap.close_rig(guard, rig)
+    h5 = list(tmp_path.rglob("*traces.h5"))[0]
+    status = ttk.Label(root)
+    try:
+        with storage.Session(h5) as sess:
+            for kind in ("1d", "2d"):
+                win = tk.Toplevel(root)
+                ctl = ap.hist_window(win, sess, h5.stem, kind, tk, ttk,
+                                     FigureCanvasTkAgg, Figure, status)
+                if kind == "1d":
+                    ctl["lw"].set("2.5")
+                    ctl["color"].set("tab:blue")
+                    ctl["logy"].set(True)
+                else:
+                    ctl["cmap"].set("magma")
+                    ctl["align"].set("")
+                    ctl["vmax"].set("5")
+                ctl["redraw"]()
+                root.update()
+                win.destroy()
+    finally:
+        root.destroy()
+
+
 # -- the Keithley tab, on the simulated amplifier ----------------------------------
 
 def test_keithley_commands_track_the_amplifier_state(ap, cfg, tmp_path):
@@ -254,12 +503,16 @@ def test_headless_cycles_save_and_export(ap, cfg, tmp_path):
     finally:
         worker.close_file()
         ap.close_rig(guard, rig)
-    h5 = list(tmp_path.glob("*.h5"))
+    h5 = list(tmp_path.rglob("*.h5"))
     assert len(h5) == 1
+    # <folder>/<date>/<name>/<experiment>_<HHMMSS>_<N>traces.h5
+    assert h5[0].parent.name == "unknown"
+    assert h5[0].parent.parent.name == time.strftime("%Y-%m-%d")
+    assert h5[0].name.endswith(f"_{worker.accepted}traces.h5")
     with storage.Session(h5[0]) as s:
         assert len(s) == worker.accepted >= 1
     pytest.importorskip("igor2")
-    ibw = list(tmp_path.glob("*.ibw"))
+    ibw = list(tmp_path.rglob("*.ibw"))
     assert len(ibw) == 1
     traces, params = storage.split_igor_block(storage.load_ibw(ibw[0]))
     assert traces.shape == (worker.accepted, cfg.ramp.n_pull_samples)

@@ -334,6 +334,51 @@ def log_histogram(traces,
     return centres, counts
 
 
+def histogram_2d(traces, disp_nm: np.ndarray,
+                 align_at_g0: float | None = 0.5,
+                 x_range: tuple[float, float] = (-0.5, 2.0), n_x: int = 200,
+                 y_range: tuple[float, float] = (-7.0, 1.0), n_y: int = 300,
+                 keep_fraction: float = 0.95,
+                 smooth_width: int = 11) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Conductance against displacement over many traces: the 2D histogram.
+
+    Per trace: keep the first ``keep_fraction`` of the points (the tail
+    holds the alignment spike), box-smooth, take log10. The displacement of
+    each trace is shifted so that 0 nm is where its conductance first drops
+    below ``align_at_g0`` (0.5 G0: the gold contact breaking), which is how
+    the community draws these; ``None`` leaves 0 nm at the start of the
+    pull. Returns ``(counts, x_edges, y_edges)`` with counts per trace,
+    ``counts[i, j]`` for displacement bin i and log-conductance bin j.
+    """
+    x_edges = np.linspace(x_range[0], x_range[1], n_x + 1)
+    y_edges = np.linspace(y_range[0], y_range[1], n_y + 1)
+    counts = np.zeros((n_x, n_y), dtype=float)
+    disp_nm = np.asarray(disp_nm, dtype=float)
+    n_used = 0
+    for trace in traces:
+        g0 = np.asarray(trace, dtype=float)
+        if g0.size == 0:
+            continue
+        keep = max(1, int(g0.size * keep_fraction))
+        g0 = boxcar(g0[:keep], smooth_width)
+        x = disp_nm[:keep]
+        if align_at_g0 is not None:
+            below = np.flatnonzero(g0 < align_at_g0)
+            if below.size == 0:
+                continue                      # never broke: no zero to align to
+            x = x - x[below[0]]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            logs = np.log10(g0)
+        ok = np.isfinite(logs)
+        if not ok.any():
+            continue
+        counts += np.histogram2d(x[ok], logs[ok], bins=(x_edges, y_edges))[0]
+        n_used += 1
+    if n_used:
+        counts /= n_used
+    return counts, x_edges, y_edges
+
+
 def peak_position(centres: np.ndarray, counts: np.ndarray,
                   around: float = 0.0, window: float = 0.5,
                   refine: float = 0.15) -> float:
