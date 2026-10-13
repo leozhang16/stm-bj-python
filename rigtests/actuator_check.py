@@ -2,23 +2,23 @@
 serial port can be held by one program at a time).
 
     python rigtests/actuator_check.py                 # list ports, probe both
-    python rigtests/actuator_check.py --port COM1     # one port, both protocols
-    python rigtests/actuator_check.py --agilis-move -5 --port COM4
-                                              # a WATCHED Agilis move: 5 steps APART
+    python rigtests/actuator_check.py --port COM4     # one port, both protocols
+    python rigtests/actuator_check.py --agilis-move -20 --port COM4
+                                              # one Agilis move, 20 steps APART, with
+                                              # the step counter read before and after
+    python rigtests/actuator_check.py --listen --port COM4
+                                              # three apart moves at amplitude 23, 35, 50
 
 Two Newport controllers do this job and are told apart by how they talk:
 
-    NanoPZ (PZC200)      19200 baud, read/write: answers 0TS?, 0TP?
-    Agilis (AG-UC2/UC8)  921600 baud over NI-VISA, WRITE-ONLY: it accepts
-                         mr / 1SU.. / 1PR.. / ml but answers nothing, so a
-                         read probe cannot see it even when it is working.
+    NanoPZ (PZC200)      19200 baud over pyserial: answers 0TS?, 0TP?
+    Agilis (AG-UC2/UC8)  921600 baud over NI-VISA: answers VE, TE, 1TS, 1TP
 
-So: the read probe below finds a NanoPZ. For an Agilis the only proof is a
-move you watch -- --agilis-move sends ONE move through the real driver (a
-NEGATIVE count is APART, away from the sample, the safe direction) and asks
-you to watch the stage. This lab's Igor (Actuator_VISA_functions.ipf) drives
-an Agilis on the "Newport AG-UC2-UC8" port, so that is almost certainly what
-you have.
+This lab's actuator is an Agilis AG-UC2 on the "Newport AG-UC2-UC8" port
+(COM4 = ASRL4::INSTR), the one Igor's Actuator_VISA_functions.ipf drives.
+If it answers nothing at all, it is switched off or asleep: its USB port
+shows up in Windows either way, and a Step from Igor's panel has woken it.
+A NEGATIVE count is APART, away from the sample, the safe direction.
 
 Paste the whole output into the chat.
 """
@@ -33,36 +33,81 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 SKIP = ("Intel(R) Active Management",)      # a virtual port on the motherboard
 
 
-def _agilis_move(port: str, steps: int, amplitude: int) -> int:
-    """One watched move through the real VISA driver. Negative = apart."""
+def _agilis_open(port: str, amplitude: int, steps: int):
+    """The real driver on the port, with the link proved first."""
     from stmlab.config import RigConfig
     from stmlab.actuator import AgilisActuator, ActuatorError
     cfg = RigConfig()
     cfg.actuator.step_amplitude = amplitude
     cfg.actuator.step_size = abs(steps)
+    try:
+        act = AgilisActuator(cfg, port=port)
+        ident = act.identify()
+    except ActuatorError as exc:
+        print(f"  could not talk to the Agilis: {exc}")
+        return None
+    print(f"  {ident['version']} at {ident['resource']}: status {ident['status']!r} "
+          f"(0 = ready), step counter {ident['position']}")
+    return act
+
+
+def _agilis_move(port: str, steps: int, amplitude: int) -> int:
+    """One move through the real VISA driver, the step counter read before
+    and after. Negative = apart."""
     way = "APART (away from the sample)" if steps < 0 else "CLOSER (TOWARD the sample)"
-    print(f"\nopening the Agilis on {port} and moving {abs(steps)} steps at "
-          f"amplitude {amplitude}, {way} ...")
+    print(f"\nAgilis on {port}: {abs(steps)} steps at amplitude {amplitude}, {way} ...")
     if steps >= 0:
         print("  WARNING: a positive count moves TOWARD the sample. Make sure "
               "the tip is withdrawn first. Ctrl-C now to abort.")
-    try:
-        act = AgilisActuator(cfg, port=port)
-    except ActuatorError as exc:
-        print(f"  could not open: {exc}")
+    act = _agilis_open(port, amplitude, steps)
+    if act is None:
         return 1
     try:
+        before = act.position()
         act.step(closer=(steps > 0))
-    finally:
+        after = act.position()
+    except Exception as exc:                          # noqa: BLE001
+        print(f"  FAILED: {exc}")
         act.close()
-    print("  sent. WATCH THE STAGE: did the Z actuator move "
-          + ("apart" if steps < 0 else "closer") + "?")
-    print("  - if yes, it works; in the window choose Agilis and this port, "
-          "Connect.")
-    print("  - if it moved the WRONG way, set actuator.closer_sign to the "
-          "opposite sign.")
-    print("  - if nothing moved: wrong port, controller off, or Igor/another "
-          "program holds the port.")
+        return 1
+    act.close()
+    delta = None if before is None or after is None else after - before
+    print(f"  step counter {before} -> {after}"
+          + (f" (changed by {delta:+d}; asked for {steps:+d})" if delta is not None else ""))
+    if delta == steps:
+        print("  the controller did exactly what was asked. In the window: "
+              "Agilis, this port, Connect.")
+    elif delta is not None and delta == -steps:
+        print("  it moved the OTHER way: set actuator.closer_sign to the "
+              "opposite sign.")
+    else:
+        print("  the counter did not change as expected: tell me these numbers.")
+    return 0
+
+
+def _agilis_listen(port: str, steps: int = 3) -> int:
+    """Three moves apart, at rising step amplitudes, with a pause between
+    them: a piezo motor below its threshold amplitude does not step at all
+    (no click), so this finds the amplitude this stage needs."""
+    import time
+    print(f"\nthree moves APART on {port}, {abs(steps)} steps each, amplitude "
+          "23 then 35 then 50, 3 s between them. LISTEN for the clicks.")
+    for amp in (23, 35, 50):
+        print(f"  ... amplitude {amp} NOW")
+        act = _agilis_open(port, amp, -abs(steps))
+        if act is None:
+            return 1
+        try:
+            before = act.position()
+            act.step(closer=False)
+            print(f"      counter {before} -> {act.position()}")
+        finally:
+            act.close()
+        time.sleep(3.0)
+    print("  done. Which amplitude(s) clicked? That is the smallest amplitude "
+          "that moves this stage: put it in actuator.step_amplitude (and in "
+          "the Amplitude box). None at all: tell me, and check that Igor's "
+          "own Step button clicks right now with the controller on.")
     return 0
 
 
@@ -77,6 +122,9 @@ def main(argv=None) -> int:
     p.add_argument("--amplitude", type=int, default=23,
                    help="Agilis step amplitude for --agilis-move (1-50, "
                         "default 23, Igor's value)")
+    p.add_argument("--listen", action="store_true",
+                   help="three Agilis moves APART at amplitude 23, 35, 50 with "
+                        "3 s between: listen for which one clicks (needs --port)")
     p.add_argument("--deep", action="store_true",
                    help="a silent NanoPZ port: also try CR and LF endings, the "
                         "wake-up command first, XON/XOFF, a longer wait, and "
@@ -100,6 +148,10 @@ def main(argv=None) -> int:
     if not ports:
         print("    NONE. Check Device Manager -> Ports (COM & LPT).")
 
+    if args.listen:
+        if not args.port:
+            p.error("--listen needs --port (e.g. --port COM4)")
+        return _agilis_listen(args.port)
     if args.agilis_move is not None:
         if not args.port:
             p.error("--agilis-move needs --port (e.g. --port COM4)")
@@ -125,6 +177,19 @@ def main(argv=None) -> int:
                 continue
         for kind in kinds:
             baud = PROBES[kind]["baud"]
+            if kind == "agilis":
+                # Through NI-VISA, as Igor and the driver: pyserial is not
+                # the road this box is proven on.
+                print(f"\n{port} as agilis at {baud} baud over NI-VISA ...")
+                act = _agilis_open(port, 23, 1)
+                if act is not None:
+                    act.close()
+                    found.append((port, kind))
+                elif agilis_port:
+                    print("    (this IS the Newport port: the box is switched off "
+                          "or asleep -- press a Step on Igor's panel once, close "
+                          "Igor, and run this again)")
+                continue
             print(f"\n{port} as {kind} at {baud} baud ...")
             try:
                 replies = probe_port(port, kind)
@@ -137,11 +202,6 @@ def main(argv=None) -> int:
                 answered = answered or bool(raw.strip())
             if answered:
                 found.append((port, kind))
-            elif kind == "agilis" and agilis_port:
-                print("    nothing came back -- EXPECTED: the Agilis is "
-                      "write-only. Confirm it with a watched move:")
-                print(f"      python rigtests/actuator_check.py --agilis-move "
-                      f"-5 --port {port}")
             else:
                 print("    nothing came back")
 
@@ -152,10 +212,9 @@ def main(argv=None) -> int:
                   f"\"actuator\": \"kind\": \"{kind}\", \"port\": \"{port}\".")
     agilis = [q.device for q in ports if "AG-UC" in q.description.upper()]
     if agilis and not any(k == "agilis" for _, k in found):
-        print(f"A Newport Agilis is on {', '.join(agilis)} but is write-only, so "
-              "it will not answer the probe. Confirm it with:")
-        print(f"      python rigtests/actuator_check.py --agilis-move -5 "
-              f"--port {agilis[0]}")
+        print(f"A Newport Agilis is on {', '.join(agilis)} but did not answer: "
+              "it is switched off or asleep (its USB port shows up either way). "
+              "A Step from Igor's panel wakes it; then close Igor and rerun.")
     return 0
 
 

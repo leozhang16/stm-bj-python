@@ -1,19 +1,19 @@
 """Coarse approach actuator: a Newport NanoPZ (PZC200) or a Newport Agilis
 (AG-UC2 / AG-UC8) over a serial port.
 
-Two controllers, two languages. The NanoPZ is what Igor's procedures drove
-and what the notes below describe. The Agilis is the other Newport
-piezo-motor controller a lab may have on the same job: it appears in
-Windows as "Newport AG-UC2-UC8 USB Serial Port", talks at a fixed 921600
-baud, and its commands are ``MR`` (remote mode, required first), ``ML``
-(local mode), ``<axis>PR<n>`` (relative move, n steps), ``<axis>TP`` (tell
-the step count), ``<axis>TS`` (status: 0 ready, 1 stepping, 2 jogging, 3
-moving to a limit), ``<axis>ST`` (stop), ``CC<n>`` (channel 1-4, AG-UC8
-only), ``TE`` (error of the previous command, 0 = none) and ``VE``
-(firmware version). Axis is 1 or 2; commands end in CR LF; replies carry
-the command back in front of the value (``1TP-12``). Which sign of ``PR``
-moves the tip toward the sample depends on the mounting:
-``actuator.closer_sign``.
+Two controllers, two languages. The NanoPZ is what the older Igor
+procedures drove and what the notes below describe. The Agilis is what
+this lab's Igor drives today (Actuator_VISA_functions.ipf, an AG-UC2 at
+``ASRL4::INSTR``): it appears in Windows as "Newport AG-UC2-UC8 USB Serial
+Port", talks at a fixed 921600 baud through NI-VISA, and its commands are
+``mr`` (remote mode, required before a move), ``ml`` (local mode),
+``<axis>SU<amp>`` (step amplitude 1-50), ``<axis>PR<n>`` (relative move,
+n steps), ``<axis>TP`` (the step count), ``<axis>TS`` (status: 0 ready, 1
+stepping, 2 jogging, 3 moving to a limit), ``<axis>ST`` (stop), ``CC<n>``
+(channel 1-4, AG-UC8 only), ``TE`` (error of the previous command, 0 =
+none) and ``VE`` (firmware version). Commands end in CR LF; replies carry
+the command back in front of the value (``1TP2066``). On this rig +PR is
+toward the sample (``actuator.closer_sign`` = +1).
 
 The controller speaks RS-232. Connected by USB it appears as a virtual COM
 port (either through the controller's own USB, or a USB-to-serial adapter),
@@ -300,21 +300,29 @@ def com_to_visa(port: str) -> str:
     return f"ASRL{digits}::INSTR" if digits else p
 
 
+AGILIS_ERRORS = {0: "no error", -1: "unknown command", -2: "axis out of range",
+                 -3: "wrong format for parameter", -4: "parameter out of range",
+                 -5: "not allowed in local mode", -6: "not allowed in current state"}
+
+
 class AgilisActuator(Actuator):
     """A Newport Agilis AG-UC2 / AG-UC8, driven the way this lab's Igor does
-    (Actuator_VISA_functions.ipf): through NI-VISA, at 921600 baud, 8N1, no
-    flow control, and WRITE-ONLY. The controller is not read back -- Igor
-    never does, and the AG-UC does not answer status or position queries on
-    this link -- so ``position`` is None and a move is confirmed by watching
-    the stage, not by the program.
+    (Actuator_VISA_functions.ipf): through NI-VISA, 921600 baud, 8N1, no
+    flow control, and the same four strings per move -- ``mr`` (remote),
+    ``<axis>SU<amp>`` (step amplitude), ``<axis>PR<n>`` (n steps), ``ml``
+    (local). Closer to the sample is +PR on this rig (``closer_sign`` = +1);
+    apart is -PR, as Igor's StepActuatorApart. Verified on the rig: the
+    controller's step counter moved by exactly the count sent.
 
-    Each move mirrors Igor's button exactly: ``mr`` (remote) then
-    ``<axis>SU<amp>`` (set the step amplitude) then ``<axis>PR<n>`` (move n
-    steps) then ``ml`` (back to local). Closer to the sample is +PR on this
-    rig (``closer_sign`` = +1); apart is -PR, as Igor's StepActuatorApart.
+    Where this goes beyond Igor: the controller answers, so every command
+    is followed by ``TE`` (its error code) and refused loudly if it was not
+    accepted, a move waits for ``TS`` = 0 (ready) instead of a fixed sleep,
+    ``VE`` proves the link on Connect, and ``TP`` (the net step count since
+    power-on) is the position shown in the window.
     """
 
     BAUD = 921600
+    GAP_S = 0.05                  # after a command before the next
     connected = True
     kind = "agilis"
 
@@ -325,6 +333,7 @@ class AgilisActuator(Actuator):
         self.axis = int(A.axis) if int(A.axis) in (1, 2) else 1
         self.port_name = port or A.port
         self.resource = resource or A.visa_resource or com_to_visa(self.port_name)
+        self.version: str | None = None
 
         if rm_factory is None:
             try:
@@ -351,22 +360,23 @@ class AgilisActuator(Actuator):
             raise ActuatorError(
                 f"could not open the Agilis at {self.resource} "
                 f"(from {self.port_name}): {exc}. Is Igor still holding the "
-                "port, is the controller powered on, and is NI-VISA installed?"
-            ) from exc
+                "port, and is NI-VISA installed?") from exc
 
-        log.info("Agilis open at %s (%s), axis %d, write-only",
-                 self.resource, self.port_name, self.axis)
-        # Remote mode, and the channel on an AG-UC8 (Igor's Z sends no CC).
-        self.write("mr\r")
+        log.info("Agilis open at %s (%s), axis %d", self.resource,
+                 self.port_name, self.axis)
+        # As Igor: nothing is sent on open; ``mr`` goes out around each move.
+        # An AG-UC8 channel, if configured, is selected once here.
         if int(A.channel) > 0:
-            self.write(f"CC{int(A.channel)}\r")
+            self.write("mr")
+            self.write(f"CC{int(A.channel)}")
+            self.write("ml")
 
     def _configure(self) -> None:
         """NI-VISA serial attributes, matching Igor's SetupVISASerialPort."""
         inst = self.inst
         inst.baud_rate = self.BAUD
         inst.data_bits = 8
-        inst.timeout = 300
+        inst.timeout = 500
         inst.write_termination = ""
         inst.read_termination = ""
         pv = self._pyvisa
@@ -378,20 +388,67 @@ class AgilisActuator(Actuator):
             except Exception:                    # some backends name it differently
                 pass
 
-    # -- protocol (write-only) -------------------------------------------
+    # -- protocol ---------------------------------------------------------
 
-    def write(self, command: str) -> None:
-        self.inst.write_raw(command.encode("ascii"))
+    def write(self, command: str, gap_s: float | None = None) -> None:
+        """One command, CR LF, then the gap the controller needs."""
+        self.inst.write_raw((command + "\r\n").encode("ascii"))
+        time.sleep(self.GAP_S if gap_s is None else gap_s)
+
+    def query(self, command: str, wait_s: float = 0.4) -> str | None:
+        """Send a query and return its reply line, or None when nothing
+        comes back within ``wait_s`` (an unpowered box answers nothing)."""
+        waiting = int(getattr(self.inst, "bytes_in_buffer", 0) or 0)
+        if waiting:
+            self.inst.read_bytes(waiting)        # drop anything stale
+        self.inst.write_raw((command + "\r\n").encode("ascii"))
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < wait_s:
+            time.sleep(0.03)
+            waiting = int(getattr(self.inst, "bytes_in_buffer", 0) or 0)
+            if waiting:
+                time.sleep(0.03)                 # the rest of the line
+                waiting = int(getattr(self.inst, "bytes_in_buffer", 0) or waiting)
+                raw = self.inst.read_bytes(waiting)
+                return raw.decode("ascii", errors="replace").strip()
+        return None
+
+    def error(self) -> int | None:
+        """``TE``: the controller's error code for the previous command."""
+        reply = self.query("TE")
+        if reply is None:
+            return None
+        digits = "".join(c for c in reply.split("TE")[-1] if c.isdigit() or c == "-")
+        try:
+            return int(digits)
+        except ValueError:
+            return None
+
+    def _checked(self, command: str) -> None:
+        """Send a command and refuse to go on if the controller did not
+        accept it -- a parameter out of range or a wrong state would
+        otherwise pass silently, as it did in Igor."""
+        self.write(command)
+        code = self.error()
+        if code not in (0, None):
+            raise ActuatorError(
+                f"the Agilis refused {command!r}: TE{code} "
+                f"({AGILIS_ERRORS.get(code, 'unknown error')})")
 
     def identify(self) -> dict:
-        """No readback: the Agilis does not answer here. A harmless remote ->
-        local round-trip proves writes do not error; that, plus a watched
-        Step, is all the confirmation this controller gives."""
-        self.write("mr\r")
-        self.write("ml\r")
-        return {"status": "write-only", "position": None,
+        """Prove the link: VE (firmware), the axis status and step count.
+        Raises when nothing answers -- the box's USB port shows up in
+        Windows even when the controller is switched off."""
+        self.version = self.query("VE")
+        status = self.status()
+        if self.version is None and status is None:
+            raise ActuatorError(
+                f"nothing at {self.resource} answers VE or TS: the Agilis "
+                "is switched off or asleep (its USB port shows up in Windows "
+                "either way), or Igor is still holding the port")
+        return {"status": status, "position": self.position(),
                 "port": self.port_name, "resource": self.resource,
-                "kind": "agilis", "version": None}
+                "kind": "agilis", "version": self.version}
 
     # -- motion -----------------------------------------------------------
 
@@ -401,21 +458,51 @@ class AgilisActuator(Actuator):
         count = max(1, int(A.step_size))
         toward = 1 if int(A.closer_sign) >= 0 else -1     # +PR is closer on this rig
         sign = toward if closer else -toward
-        self.write("mr\r")                                # Igor wraps every move
-        self.write(f"{self.axis}SU{'' if sign > 0 else '-'}{amp}\r\n")
-        self.write(f"{self.axis}PR{sign * count}\r\n")
-        self.write("ml\r")
+        self._checked("mr")                                # Igor wraps every move
+        self._checked(f"{self.axis}SU{'' if sign > 0 else '-'}{amp}")
+        self._checked(f"{self.axis}PR{sign * count}")
+        self.wait_ready(timeout=2.0 + 0.02 * count)
+        self._checked("ml")
         time.sleep(A.settle_s)
 
+    def wait_ready(self, timeout: float = 5.0) -> None:
+        """Block until the axis reports ready (TS = 0), or the timeout."""
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            st = self.status()
+            if st is None or st == "0":
+                return
+            time.sleep(0.05)
+        log.warning("Agilis axis %d still busy after %.1f s", self.axis, timeout)
+
     def stop(self) -> None:
-        self.write(f"{self.axis}ST\r")
+        self.write(f"{self.axis}ST")
+
+    # -- feedback ---------------------------------------------------------
+
+    def status(self) -> str | None:
+        """``TS``: '0' ready, '1' stepping, '2' jogging, '3' to a limit."""
+        reply = self.query(f"{self.axis}TS")
+        if reply is None:
+            return None
+        return reply.split("TS")[-1].strip()
 
     def position(self) -> int | None:
-        return None                              # write-only: no step counter here
+        """``TP``: the controller's net step count since power-on (or the
+        last ZP) -- a counter, not a calibrated position."""
+        reply = self.query(f"{self.axis}TP")
+        if reply is None:
+            return None
+        digits = "".join(c for c in reply.split("TP")[-1] if c.isdigit() or c == "-")
+        try:
+            return int(digits)
+        except ValueError:
+            log.warning("could not parse the step count from %r", reply)
+            return None
 
     def close(self) -> None:
         try:
-            self.write("ml\r")                   # the front panel works again
+            self.write("ml")                     # the front panel works again
         except Exception:
             pass
         try:

@@ -433,31 +433,72 @@ def test_nanopz_protocol_on_a_fake_port(cfg):
 
 
 class FakeVisa:
-    """A Newport Agilis on a string, through a pyvisa-shaped object: it is
-    write-only (``write_raw`` records bytes), as the real one is over this
-    link, and the ResourceManager just hands it back."""
+    """The lab's AG-UC2 on a string, through a pyvisa-shaped object: it
+    answers VE, TE, TS and TP exactly as the real one did on the rig
+    (``AG-UC2 v2.2.1``, ``TE0``, ``1TS0``, ``1TP2086``), keeps a step
+    counter that PR moves, refuses a move in local mode with TE-5, and
+    records every byte written. The ResourceManager just hands it back."""
 
-    def __init__(self):
+    def __init__(self, awake: bool = True):
         self.resource = None
         self.raw: list[bytes] = []
         self.attrs: dict = {}
         self.closed = False
+        self.awake = awake
+        self.counter = 2086
+        self.remote = False
+        self.last_error = 0
+        self.pending = b""
+        self.ignore_mr = False                  # a box that will not go remote
 
-    # pyvisa ResourceManager surface
     def open_resource(self, resource):
         self.resource = resource
         return self
 
-    # pyvisa Resource surface
     def write_raw(self, data: bytes):
         self.raw.append(bytes(data))
+        if not self.awake:
+            return
+        cmd = data.decode().strip()
+        reply = None
+        if cmd == "VE":
+            reply = "AG-UC2 v2.2.1 "
+        elif cmd == "TE":
+            reply = f"TE{self.last_error}"
+        elif cmd.endswith("TS"):
+            reply = f"{cmd}0"
+        elif cmd.endswith("TP"):
+            reply = f"{cmd}{self.counter}"
+        elif cmd == "mr":
+            if not self.ignore_mr:
+                self.remote = True
+            self.last_error = 0
+        elif cmd == "ml":
+            self.remote, self.last_error = False, 0
+        elif "PR" in cmd:
+            if self.remote:
+                self.counter += int(cmd.split("PR")[1]); self.last_error = 0
+            else:
+                self.last_error = -5
+        elif "SU" in cmd or cmd.startswith("CC") or cmd.endswith("ST"):
+            self.last_error = 0 if self.remote or cmd.endswith("ST") else -5
+        if reply is not None:
+            self.pending += (reply + "\r\n").encode()
+
+    @property
+    def bytes_in_buffer(self) -> int:
+        return len(self.pending)
+
+    def read_bytes(self, n: int) -> bytes:
+        out, self.pending = self.pending[:n], self.pending[n:]
+        return out
 
     def close(self):
         self.closed = True
 
-    # attributes the driver sets (baud_rate, timeout, write_termination, ...)
     def __setattr__(self, name, value):
-        if name in ("resource", "raw", "attrs", "closed"):
+        if name in ("resource", "raw", "attrs", "closed", "awake", "counter",
+                    "remote", "last_error", "pending", "ignore_mr"):
             object.__setattr__(self, name, value)
         else:
             self.attrs[name] = value
@@ -466,49 +507,69 @@ class FakeVisa:
     def sent(self) -> list[str]:
         return [b.decode("ascii").strip() for b in self.raw]
 
+    def moves(self) -> list[str]:
+        """What was sent, without the TE/TS/TP queries the driver adds."""
+        return [c for c in self.sent if c not in ("TE", "1TS", "1TP", "2TS", "2TP", "VE")]
 
-def test_agilis_is_write_only_and_matches_igor(cfg):
-    """The Agilis driver sends exactly Igor's byte sequence: remote, set
-    amplitude, move, local -- closer is +PR on this rig, apart is -PR --
-    and it never reads back (write-only, as Igor is)."""
-    from stmlab.actuator import AgilisActuator, com_to_visa
+
+def test_agilis_matches_igor_and_reads_the_controller_back(cfg, monkeypatch):
+    """Igor's byte sequence per move (remote, amplitude, PR, local; +PR is
+    toward the sample on this rig), each command checked with TE, the
+    move waited out with TS, and TP as the position -- as verified on
+    the rig, where the counter fell by exactly the count sent."""
+    from stmlab.actuator import AgilisActuator, ActuatorError, com_to_visa
+    monkeypatch.setattr(AgilisActuator, "GAP_S", 0.0)
     assert com_to_visa("COM4") == "ASRL4::INSTR"
     assert com_to_visa("ASRL4::INSTR") == "ASRL4::INSTR"
 
-    cfg.actuator.step_size = 3                           # PR count
-    cfg.actuator.step_amplitude = 23                     # SU, Igor's value
+    cfg.actuator.step_size = 20                          # PR count
+    cfg.actuator.step_amplitude = 50                     # SU
     cfg.actuator.closer_sign = 1                         # +PR = closer (this rig)
     fake = FakeVisa()
     act = AgilisActuator(cfg, port="COM4", rm_factory=lambda backend: fake)
     assert fake.resource == "ASRL4::INSTR"
     assert fake.attrs["baud_rate"] == 921600             # fixed, whatever the json says
-    assert fake.sent == ["mr"]                           # remote mode on open, no CC on a UC2
+    assert fake.sent == []                               # as Igor: nothing on open
 
-    ident = act.identify()                               # a harmless round-trip, no read
-    assert ident["status"] == "write-only" and ident["position"] is None
-    assert ident["kind"] == "agilis" and ident["resource"] == "ASRL4::INSTR"
-    assert act.position() is None                        # there is no readback
+    ident = act.identify()
+    assert ident["version"] == "AG-UC2 v2.2.1" and ident["status"] == "0"
+    assert ident["position"] == 2086 and ident["kind"] == "agilis"
 
+    fake.raw.clear()
+    act.step(closer=False)                               # 20 apart, as on the rig
+    assert fake.moves() == ["mr", "1SU-50", "1PR-20", "ml"]
+    assert act.position() == 2066                        # 2086 - 20, the rig's numbers
     fake.raw.clear()
     act.step(closer=True)
-    assert fake.sent == ["mr", "1SU23", "1PR3", "ml"]    # toward the sample: +PR
-    fake.raw.clear()
-    act.step(closer=False)
-    assert fake.sent == ["mr", "1SU-23", "1PR-3", "ml"]  # apart: -PR, -amplitude
+    assert fake.moves() == ["mr", "1SU50", "1PR20", "ml"]
+    assert act.position() == 2086
 
     cfg.actuator.closer_sign = -1                        # actuator mounted the other way
     fake.raw.clear()
     act.step(closer=True)
-    assert fake.sent == ["mr", "1SU-23", "1PR-3", "ml"]  # now closer is -PR
+    assert fake.moves() == ["mr", "1SU-50", "1PR-20", "ml"]
+
+    # A refused command is an error, not a silent no-move (TE-5: local mode).
+    fake.remote = False
+    fake.ignore_mr = True
+    with pytest.raises(ActuatorError, match="TE-5"):
+        act.step(closer=False)
+    fake.ignore_mr = False
     act.close()
-    assert "ml" in fake.sent[-1:] or fake.closed
+    assert fake.closed
+
+    # A box that is switched off answers nothing, and Connect says so.
+    asleep = FakeVisa(awake=False)
+    dead = AgilisActuator(cfg, port="COM4", rm_factory=lambda backend: asleep)
+    with pytest.raises(ActuatorError, match="switched off or asleep"):
+        dead.identify()
 
     # An AG-UC8 selects its channel on open (Igor's Z sends no CC: channel 0).
     cfg.actuator.channel = 2
     cfg.actuator.axis = 2
     fake8 = FakeVisa()
     AgilisActuator(cfg, port="COM4", rm_factory=lambda backend: fake8)
-    assert fake8.sent == ["mr", "CC2"]
+    assert fake8.sent == ["mr", "CC2", "ml"]
 
 
 def test_connect_picks_the_controller_kind(ap, cfg, tmp_path):

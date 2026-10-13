@@ -362,9 +362,10 @@ class ActuatorConfig:
 
     The Agilis is what this lab's Igor drives (Actuator_VISA_functions.ipf):
     opened through NI-VISA by a resource name (``ASRL4::INSTR`` for COM4),
-    at 921600 baud, and spoken to write-only -- Igor never reads it back, so
-    neither do we; a move is confirmed by watching the stage. Each move is
-    ``mr`` (remote) / ``<axis>SU<amp>`` (step amplitude, Igor's 23) /
+    at 921600 baud. Igor only ever wrote to it; the controller does answer,
+    and the Python driver uses that (error code after every command,
+    "ready" before going on, the step counter as the position). Each move
+    is ``mr`` (remote) / ``<axis>SU<amp>`` (step amplitude, Igor's 23) /
     ``<axis>PR<n>`` (n steps) / ``ml`` (local). Its fields: ``axis`` (1 for
     the Z/approach actuator), ``step_amplitude`` (the SU value, 1-50, how
     far each step moves; Igor's working value is 23), ``channel`` (AG-UC8
@@ -372,7 +373,8 @@ class ActuatorConfig:
     override; otherwise COMn -> ASRLn::INSTR) and ``closer_sign`` (+1 =
     toward the sample is positive, as Igor's Z is; -1 flips it if the
     actuator is mounted the other way). For the NanoPZ, ``step_size`` is the
-    controller-step count; for the Agilis it is the ``PR`` step count.
+    controller-step count; for the Agilis it is the ``PR`` step count
+    (Igor's button sends 1).
     """
 
     kind: str = "none"

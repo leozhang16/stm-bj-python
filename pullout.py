@@ -48,18 +48,18 @@ connection is closed without touching the amplifier.
 
 The Coarse approach box is Igor's Actuator Controls: a Newport controller,
 chosen with the port -- a NanoPZ PZC200 (19200 baud, read/write) or an
-Agilis AG-UC2/AG-UC8 (NI-VISA, 921600 baud, write-only, this lab's) --
-Connect, then Step closer / Step apart, or Start approach, which steps the
-sample in until the current passes the stop level and then backs off one
-step so the piezo Approach can make the contact from below; or, with a
-screw by hand, a contact light and beep at the contact current. The Agilis
-does not report back (Igor never reads it either), so Connect only opens
-the link and the first watched Step is the real confirmation; toward the
-sample is +PR (closer_sign = +1). The port is opened by Connect, not at
-start-up, so a wrong port costs a message and nothing else;
-rigtests/actuator_check.py finds the port and the controller (and moves an
-Agilis once so you can watch it). Every coarse step passes the interlock:
-the piezo must be parked first (Withdraw).
+Agilis AG-UC2/AG-UC8 (NI-VISA, 921600 baud, this lab's) -- Connect, then
+Step closer / Step apart, or Start approach, which steps the sample in
+until the current passes the stop level and then backs off one step so
+the piezo Approach can make the contact from below; or, with a screw by
+hand, a contact light and beep at the contact current. The Agilis
+answers, so Connect asks it for its firmware and step counter, every
+command is checked against its error code, and a move waits for "ready";
+toward the sample is +PR (closer_sign = +1). The port is opened by
+Connect, not at start-up, so a wrong port costs a message and nothing
+else; rigtests/actuator_check.py finds the port and the controller and
+moves an Agilis once with the counter read before and after. Every coarse
+step passes the interlock: the piezo must be parked first (Withdraw).
 
 When this program starts it parks the piezo at 0 V, so whatever extension
 Igor left is undone; the approach (or the slider) then extends the piezo
@@ -99,7 +99,7 @@ log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v43"
+__version__ = "v45"
 
 
 # --------------------------------------------------------------------------
@@ -613,19 +613,12 @@ class Worker(threading.Thread):
             self.cfg.actuator.kind = kind              # the config travels with the data
             self.a_state.update(port=port, controller=kind)
             where = reply.get("resource") or port
-            if reply["status"] == "write-only":
-                # The Agilis gives no readback; the first watched Step is the
-                # real confirmation, so say so instead of a false all-clear.
-                self.status(f"{name} opened at {where} (write-only: it does not "
-                            "report back, so press Withdraw, then Step apart and "
-                            "watch the stage move before Start approach). Toward "
-                            f"the sample is +PR; if Step closer goes the wrong "
-                            "way, set closer_sign to -1")
-            else:
-                self.status(f"{name} connected on {port}: status "
-                            f"{reply['status']!r}, position {reply['position']}"
-                            + (f", {reply['version']}" if reply.get("version") else "")
-                            + ". The piezo must be parked (Withdraw) before a step")
+            self.status(f"{name} connected at {where}"
+                        + (f": {reply['version']}" if reply.get("version") else "")
+                        + f", status {reply['status']!r}, step counter "
+                          f"{reply['position']}. The piezo must be parked "
+                          "(Withdraw) before a step; Step apart first and watch "
+                          "the counter fall")
             self._post_actuator()
             return
         self.status(f"actuator: unknown action {action!r}")
