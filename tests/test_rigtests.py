@@ -7,6 +7,8 @@ display."""
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -141,7 +143,7 @@ def test_a_stop_flag_ends_an_approach_between_steps(cfg):
 
 def test_quitting_the_worker_mid_run_returns_promptly_and_leaves_the_rig_usable(
         ap, cfg, tmp_path):
-    """What closing the window does while Run N is going: the stop flag ends
+    """What closing the window does while Start N is going: the stop flag ends
     the approach between steps, the worker thread exits, and only then are
     the cards closed -- no write lands on a closed task."""
     import time
@@ -422,6 +424,28 @@ def test_histogram_windows_draw_and_redraw(ap, cfg, tmp_path):
                 win.destroy()
     finally:
         root.destroy()
+
+
+def test_the_whole_window_opens_runs_and_closes(tmp_path):
+    """pullout.py as typed at the prompt, on the simulator, closing itself
+    after a few seconds: it must lay out every widget, start the smoke run
+    and shut down without a traceback. The only test that builds the whole
+    window, so a layout mistake (a widget packed into a frame that no longer
+    exists, say) fails here rather than at the rig."""
+    tk = pytest.importorskip("tkinter")
+    try:
+        tk.Tk().destroy()
+    except tk.TclError as exc:
+        pytest.skip(f"no Tk display: {exc}")
+    root_dir = Path(__file__).resolve().parents[1]
+    cmd = [sys.executable, str(root_dir / "pullout.py"), "--simulate",
+           "--out", str(tmp_path), "--autoclose", "4"]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=180,
+                         cwd=root_dir)
+    assert res.returncode == 0, res.stderr[-3000:]
+    assert "Traceback" not in res.stderr, res.stderr[-3000:]
+    # The window remembers its Saving tab in the --out folder, not in data/.
+    assert (tmp_path / "pullout_saving.json").exists()
 
 
 # -- the Keithley tab, on the simulated amplifier ----------------------------------

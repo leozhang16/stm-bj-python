@@ -17,15 +17,7 @@ checked against the safety rules before it is accepted, and four live plots:
     piezo in/out    commanded position (and the readback) over the whole cycle
     histogram       counts per trace over the accepted traces so far
 
-plus three more on request, each a checkbox ("also show") or ``--show``:
-
-    gold level      G vs displacement, linear 0..5 (AuAuConductanceLevel):
-                    the single-atom plateau as a flat step at exactly 1
-    approach        conductance at each approach step vs piezo position:
-                    where the junction closed
-    I-V             current against junction voltage for the pull
-
-Saving is per experiment: every Run N is one experiment, filed under
+Saving is per experiment: every Start N is one experiment, filed under
 <data folder>/<date>/<your name>/<experiment>_<HHMMSS of the click>, and
 when the run ends the files are renamed with the number of traces they hold
 (``..._<N>traces``). The .h5 always (raw volts, the config, per-trace
@@ -43,7 +35,7 @@ V (mV), Piezo (V) and the sense line -- refreshed every 0.3 s while the rig
 is idle by the same quiet 10 ms hold the Monitor window uses (Igor's
 Background Sampling), with Igor's beep above 0.15 uA. A move made by hand
 is ramped over 50 ms, then the junction is probed: in contact, the state
-becomes ENGAGED and Pull once works from there; Approach + pull and Run N
+becomes ENGAGED and Pull once works from there; Approach + pull and Start N
 start from wherever the slider left the tip.
 
 The Keithley 428 tab is Igor's Keithley Controls over GPIB: zero check on
@@ -93,7 +85,7 @@ log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v37"
+__version__ = "v39"
 
 
 # --------------------------------------------------------------------------
@@ -582,7 +574,7 @@ class Worker(threading.Thread):
         Ramped over 50 ms rather than jumped, then the junction is probed and
         the state follows what it reads, so a contact made by hand can be
         pulled from with Pull once, as Igor's slider-then-measure could.
-        Approach + pull and Run N need no state: they separate first.
+        Approach + pull and Start N need no state: they separate first.
         """
         if self.bias_dirty:
             self.cmd_bias()
@@ -742,12 +734,12 @@ class Worker(threading.Thread):
 
         Stop ends the loop between cycles and leaves the experiment open
         ("paused"): Continue (``resume``) carries on into the same file for
-        the traces still owed. A new Run N, a settings change or closing
+        the traces still owed. A new Start N, a settings change or closing
         the window finishes the paused experiment first.
         """
         if resume:
             if self.paused is None:
-                self.status("nothing to continue: press Run N to start an "
+                self.status("nothing to continue: press Start N to start an "
                             "experiment")
                 return
             n = self.paused["remaining"]
@@ -786,7 +778,7 @@ class Worker(threading.Thread):
             self.post("paused", remaining=n - done)
             self.status(f"run paused with {n - done} of {n} traces still to "
                         f"take ({self.accepted} accepted so far). Continue "
-                        "carries on into the same file; Run N starts a new "
+                        "carries on into the same file; Start N starts a new "
                         "experiment")
             return
         files = self.end_experiment()
@@ -797,7 +789,7 @@ class Worker(threading.Thread):
     def cmd_continue(self) -> None:
         self.cmd_run(0, resume=True)
 
-    # -- experiments: one per Run N -------------------------------------------------
+    # -- experiments: one per Start N -------------------------------------------------
 
     @staticmethod
     def _safe(text: str, fallback: str) -> str:
@@ -1040,7 +1032,7 @@ class Worker(threading.Thread):
             return
         if self.run_stem is not None:
             files = self.end_experiment()
-            self.status(f"paused experiment finished: {files}; the next Run N "
+            self.status(f"paused experiment finished: {files}; the next Start N "
                         "starts a new one")
         else:
             self.close_file()
@@ -1348,9 +1340,8 @@ def save_saving(path: Path, saving: dict) -> None:
 
 def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             config_name: str, autoclose: float | None = None,
-            readback: bool = False, show: set | None = None,
+            readback: bool = False,
             saving_file: Path | None = None) -> int:
-    show = set(show or ())            # extra panels ticked at start
     saving_file = saving_file or (_ROOT / "data" / "pullout_saving.json")
     import tkinter as tk
     from tkinter import filedialog, ttk
@@ -1374,8 +1365,58 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
 
     outer = ttk.Frame(root)
     outer.pack(fill="both", expand=True, padx=6, pady=6)
-    left = ttk.Frame(outer)
-    left.pack(side="left", fill="y", padx=(0, 8))
+    # The left column scrolls: on a 1080-pixel screen it just fits, on a
+    # laptop it does not, so it lives on a canvas with a scrollbar and the
+    # mouse wheel works wherever the pointer is over it. The column keeps
+    # its natural width; only its height is cut to what the screen allows.
+    left_outer = ttk.Frame(outer)
+    left_outer.pack(side="left", fill="y", padx=(0, 8))
+    # The status box: what the last click or command did, in plain words,
+    # under the tabs. It sits outside the scrolling part, so it is always
+    # in view; the second line is the heartbeat while a command runs.
+    stb = ttk.LabelFrame(left_outer, text="Status: the last action")
+    stb.pack(side="bottom", fill="x", pady=(6, 0))
+    status = tk.Label(stb, text="", font=("Arial", 10), wraplength=560,
+                      justify="left", anchor="nw", height=3)
+    status.pack(fill="x", padx=6, pady=(2, 0))
+    status2 = tk.Label(stb, text="", font=("Arial", 9), fg="#555", wraplength=560,
+                       justify="left", anchor="w", height=1)
+    status2.pack(fill="x", padx=6, pady=(0, 4))
+    left_canvas = tk.Canvas(left_outer, highlightthickness=0, borderwidth=0,
+                            yscrollincrement=24)
+    left_bar = ttk.Scrollbar(left_outer, orient="vertical", command=left_canvas.yview)
+    left_canvas.configure(yscrollcommand=left_bar.set)
+    left_bar.pack(side="right", fill="y")
+    left_canvas.pack(side="left", fill="y")
+    left = ttk.Frame(left_canvas)
+    left_canvas.create_window((0, 0), window=left, anchor="nw")
+
+    def left_resized(_e=None):
+        left_canvas.configure(scrollregion=left_canvas.bbox("all"),
+                              width=left.winfo_reqwidth())
+    left.bind("<Configure>", left_resized)
+
+    def over_left(widget) -> bool:
+        while widget is not None:
+            if widget is left_canvas:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
+    def on_wheel(e):
+        # Windows and macOS send <MouseWheel> with delta (120 per notch on
+        # Windows, small integers on macOS); X11 sends Button-4 / Button-5.
+        if not over_left(root.winfo_containing(e.x_root, e.y_root)):
+            return
+        num = getattr(e, "num", None)
+        delta = getattr(e, "delta", 0)
+        if num == 4 or delta > 0:
+            left_canvas.yview_scroll(-1, "units")
+        elif num == 5 or delta < 0:
+            left_canvas.yview_scroll(1, "units")
+    root.bind_all("<MouseWheel>", on_wheel, add="+")
+    root.bind_all("<Button-4>", on_wheel, add="+")
+    root.bind_all("<Button-5>", on_wheel, add="+")
     right = ttk.Frame(outer)
     right.pack(side="right", fill="both", expand=True)
 
@@ -1384,6 +1425,8 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     rb.pack(fill="x", pady=(0, 6))
     n_var = tk.StringVar(value="3" if autoclose is not None else "10")
     svars: dict[str, tk.StringVar] = {}        # settings entries, by config path
+    for c in range(3):
+        rb.columnconfigure(c, weight=1, uniform="run")
     ttk.Button(rb, text="Calibrate zero", command=lambda: worker.send("zero")).grid(
         row=0, column=0, padx=2, pady=2, sticky="ew")
     ttk.Button(rb, text="Approach", command=lambda: worker.send("engage")).grid(
@@ -1392,6 +1435,10 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         row=0, column=2, padx=2, pady=2, sticky="ew")
     ttk.Button(rb, text="Approach + pull", command=lambda: worker.send("cycle")).grid(
         row=1, column=0, padx=2, pady=2, sticky="ew")
+    ttk.Button(rb, text="Withdraw", command=lambda: worker.send("withdraw")).grid(
+        row=1, column=1, padx=2, pady=2, sticky="ew")
+    ttk.Button(rb, text="Smash now", command=lambda: worker.send("smash")).grid(
+        row=1, column=2, padx=2, pady=2, sticky="ew")
 
     def on_run():
         try:
@@ -1401,25 +1448,49 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         sv = saving_now()
         if not sv["name"].strip() or not sv["experiment"].strip():
             status.config(text="type your name and an experiment name in the "
-                               "Saving tab first; every Run N is one experiment")
+                               "Saving tab first; every Start N is one experiment")
             nb.select(fb)
             return
         save_saving(saving_file, sv)
         worker.send("run", n, sv)
-    ttk.Button(rb, text="Run N", command=on_run).grid(row=1, column=1, padx=2,
-                                                      pady=2, sticky="ew")
-    ttk.Entry(rb, textvariable=n_var, width=6).grid(row=1, column=2, padx=2)
-    cont_btn = ttk.Button(rb, text="Continue", state="disabled",
-                          command=lambda: worker.send("continue"))
-    cont_btn.grid(row=2, column=0, padx=2, pady=2, sticky="ew")
-    ttk.Button(rb, text="Stop", command=worker.stop_flag.set).grid(
-        row=2, column=1, padx=2, pady=2, sticky="ew")
-    ttk.Button(rb, text="Withdraw", command=lambda: worker.send("withdraw")).grid(
-        row=2, column=2, padx=2, pady=2, sticky="ew")
-    ttk.Button(rb, text="Smash now", command=lambda: worker.send("smash")).grid(
-        row=3, column=0, padx=2, pady=2, sticky="ew")
+    # The experiment's start button, and the two that pause and resume it,
+    # are the big coloured ones. Classic tk.Buttons: the themed buttons
+    # ignore colours on Windows. (macOS draws them native and keeps the
+    # bold text only.)
+    BIG = ("Arial", 11, "bold")
+    GREEN, GREEN_DOWN, RED, RED_DOWN = "#2e7d32", "#1b5e20", "#c62828", "#8e0000"
+    start_btn = tk.Button(rb, text="\u25b6  Start N", font=BIG, command=on_run,
+                          bg=GREEN, fg="white", activebackground=GREEN_DOWN,
+                          activeforeground="white", pady=4)
+    start_btn.grid(row=2, column=0, columnspan=2, padx=2, pady=(6, 2), sticky="ew")
+    nf = ttk.Frame(rb)
+    nf.grid(row=2, column=2, padx=2, pady=(6, 2), sticky="w")
+    ttk.Label(nf, text="N =", font=BIG).pack(side="left", padx=(2, 4))
+    ttk.Entry(nf, textvariable=n_var, width=6, font=("Arial", 11)).pack(side="left")
+    ttk.Label(nf, text="traces").pack(side="left", padx=(4, 0))
+    cont_btn = tk.Button(rb, text="Continue", font=BIG, state="disabled",
+                         command=lambda: worker.send("continue"),
+                         fg="white", activebackground=GREEN_DOWN,
+                         activeforeground="white", pady=4)
+
+    def set_continue(enabled: bool):
+        """Green and live while a stopped run is waiting; grey otherwise."""
+        cont_btn.config(state="normal" if enabled else "disabled",
+                        bg=GREEN if enabled else root.cget("background"))
+    set_continue(False)
+    cont_btn.grid(row=3, column=0, padx=2, pady=2, sticky="ew")
+    tk.Button(rb, text="\u25a0  Stop", font=BIG, command=worker.stop_flag.set,
+              bg=RED, fg="white", activebackground=RED_DOWN,
+              activeforeground="white", pady=4).grid(
+        row=3, column=1, padx=2, pady=2, sticky="ew")
+    ttk.Label(rb, text="Start N: approach, pull, repeat until N traces are "
+                       "accepted. Stop pauses it; Continue resumes into the "
+                       "same file.",
+              font=("Arial", 8), foreground="#444", justify="left",
+              wraplength=560).grid(row=4, column=0, columnspan=3, padx=4,
+                                   sticky="w")
     smf = ttk.Frame(rb)
-    smf.grid(row=3, column=1, columnspan=2, sticky="w")
+    smf.grid(row=5, column=0, columnspan=3, sticky="w", padx=2)
     ttk.Label(smf, text="smash the tip every").pack(side="left", padx=(2, 2))
     smash_var = svars.setdefault("ramp.smash_every",
                                  tk.StringVar(value=f"{cfg.ramp.smash_every:g}"))
@@ -1431,7 +1502,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
 
     ro = tk.Text(rb, width=58, height=7, font=("Courier", 9), relief="flat",
                  state="disabled", background=root.cget("background"))
-    ro.grid(row=4, column=0, columnspan=3, sticky="ew", padx=2, pady=(4, 2))
+    ro.grid(row=6, column=0, columnspan=3, sticky="ew", padx=2, pady=(4, 2))
 
     def set_text(widget, text):
         widget.config(state="normal")
@@ -1610,7 +1681,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
 
     def hand_move(*command) -> bool:
         """Send a move made by hand, unless a command is already running:
-        a slider release in the middle of Run N must not queue up behind it."""
+        a slider release in the middle of Start N must not queue up behind it."""
         if not rig_is_free():
             status.config(text="busy: wait for the current command to finish, "
                                "or press Stop")
@@ -1718,7 +1789,9 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
 
     # The rest of the column is tabbed, as Igor's panel was, so that the
     # boxes above stay in view on a 900-pixel screen: Settings and Saving.
-    nb = ttk.Notebook(left)
+    style = ttk.Style(root)
+    style.configure("Big.TNotebook.Tab", font=("Arial", 11, "bold"), padding=(18, 6))
+    nb = ttk.Notebook(left, style="Big.TNotebook")
     nb.pack(fill="both", expand=True)
 
     # -- settings --------------------------------------------------------------------
@@ -1746,36 +1819,74 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         row=per_col, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 0))
     ttk.Button(sb, text="Apply", command=lambda: apply_settings()).grid(
         row=per_col, column=2, sticky="w", padx=2, pady=(6, 0))
-    smsg = tk.Label(sb, text="", font=("Arial", 8), wraplength=560,
-                    justify="left", anchor="w")
-    smsg.grid(row=per_col + 1, column=0, columnspan=4, sticky="w", padx=6)
-    ttk.Label(sb, text="Every change is checked against the safety rules before "
-                       "it applies, and starts a new file.",
-              font=("Arial", 8), foreground="#444").grid(
-        row=per_col + 2, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
+    # The safety check, in its own box and large. Every value is tried on a
+    # copy of the config as it is typed -- green when it would be accepted,
+    # red with the reason when not -- and applied on Enter, Apply or
+    # leaving the box.
+    cb = ttk.LabelFrame(sb, text="Safety check")
+    cb.grid(row=per_col + 1, column=0, columnspan=4, sticky="ew", padx=4,
+            pady=(8, 2))
+    smsg = tk.Label(cb, text="all settings as loaded", font=("Arial", 11, "bold"),
+                    wraplength=540, justify="left", anchor="w", fg="#006000")
+    smsg.pack(fill="x", padx=6, pady=(2, 0))
+    ttk.Label(cb, text="Every change is checked against the safety rules before "
+                       "it applies (Enter, Apply, or leaving the box). An "
+                       "accepted change starts a new file.",
+              font=("Arial", 8), foreground="#444", wraplength=540,
+              justify="left").pack(fill="x", padx=6, pady=(0, 4))
     applied = {"values": {path: _get(cfg, path) for path, *_ in SETTINGS}}
 
     scales = {path: scale_ for path, *_rest, scale_ in SETTINGS}
+    labels = {path: label for path, label, *_rest in SETTINGS}
+    sb.columnconfigure(3, weight=1)            # the check box spans the tab
 
-    def apply_settings() -> bool:
+    def pending_changes():
+        """The typed values that differ from what is applied, as
+        {config path: value}, or (None, message) when a box is not a number."""
         changes = {}
         for path, label, igor, unit, kind, scale_ in SETTINGS:
             raw = svars[path].get().strip()
             try:
                 number = float(raw) / scale_
             except ValueError:
-                smsg.config(text=f"{label}: '{raw}' is not a number", fg="#b00000")
-                return False
+                return None, f"{label}: '{raw}' is not a number"
             value = int(round(number)) if kind is int else number
             if value != applied["values"][path]:
                 changes[path] = value
+        return changes, ""
+
+    def preview_settings(*_args):
+        """The verdict as you type, without applying anything."""
+        changes, bad = pending_changes()
+        if bad:
+            smsg.config(text=bad, fg="#b00000")
+            return
+        if not changes:
+            return                     # nothing pending: keep the last verdict
+        problems, warnings = check_settings(cfg, changes)
+        names = ", ".join(labels[p] for p in changes)
+        if problems:
+            smsg.config(text="REFUSED: " + "; ".join(problems), fg="#b00000")
+        elif warnings:
+            smsg.config(text=f"{names}: allowed, with a warning: "
+                             + " | ".join(warnings) + "  (Enter or Apply to use it)",
+                        fg="#b06000")
+        else:
+            smsg.config(text=f"{names}: OK, within the safety rules "
+                             "(Enter or Apply to use it)", fg="#006000")
+
+    def apply_settings() -> bool:
+        changes, bad = pending_changes()
+        if bad:
+            smsg.config(text=bad, fg="#b00000")
+            return False
         if not changes:
             return True
         problems, warnings = check_settings(cfg, changes)
         if problems:
-            smsg.config(text="REFUSED: " + "; ".join(problems), fg="#b00000")
             for path in changes:                   # put the boxes back
                 svars[path].set(f"{applied['values'][path] * scales[path]:g}")
+            smsg.config(text="REFUSED: " + "; ".join(problems), fg="#b00000")
             status.config(text="settings refused: " + "; ".join(problems))
             return False
         for path, value in changes.items():
@@ -1784,7 +1895,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         if "ramp.bias_v" in changes:
             worker.bias_dirty = True
         worker.send("newfile")                     # the config travels with the data
-        names = ", ".join(p.split(".")[-1] for p in changes)
+        names = ", ".join(labels[p] for p in changes)
         if warnings:
             smsg.config(text=f"applied {names}; warning: " + " | ".join(warnings),
                         fg="#b06000")
@@ -1793,7 +1904,10 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         status.config(text=f"applied {names}")
         return True
 
-    # -- saving: one experiment per Run N -----------------------------------------
+    for var in svars.values():
+        var.trace_add("write", preview_settings)
+
+    # -- saving: one experiment per Start N -----------------------------------------
     # <data folder>/<date>/<your name>/<experiment>_<HHMMSS>_<N>traces.*
     # Name, experiment, folder and the boxes are remembered between launches.
     fb = ttk.Frame(nb)
@@ -1827,7 +1941,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     ttk.Entry(fb, textvariable=notes_var, width=36).grid(
         row=3, column=1, columnspan=2, sticky="ew", padx=2)
     ttk.Label(fb, text="experiment: e.g. clean_gold, OPE3_1mM, changed any time, the "
-                       "next Run N uses it. Notes: molecule, solvent, tip, sample; "
+                       "next Start N uses it. Notes: molecule, solvent, tip, sample; "
                        "they go into the file header and into experiment_log.csv in "
                        "the data folder, one row per run, every day",
               font=("Arial", 8), foreground="#444", wraplength=560, justify="left").grid(
@@ -1862,7 +1976,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         worker.saving.update(saving_now())
         folder, stem = worker.experiment_paths()
         rel = Path(*folder.parts[-2:]) if len(folder.parts) >= 2 else folder
-        next_lbl.config(text=f"next Run N: {rel}{os.sep}{stem}_<N>traces.h5"
+        next_lbl.config(text=f"next Start N: {rel}{os.sep}{stem}_<N>traces.h5"
                              + (" + .ibw" if igor_var.get() else "")
                              + (" + .txt" if txt_var.get() else "")
                              + "  (under the data folder)")
@@ -1968,26 +2082,16 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                     FigureCanvasTkAgg, Figure, status)
 
     # -- the plots --------------------------------------------------------------------
-    # Four panels always: the record, the trace with the readback over it,
-    # the piezo in and out, the histogram. Three more on request, each a
-    # checkbox: the gold level (the trace on a linear axis), the approach
-    # (G at each step against piezo position) and the pull's I-V. The
-    # figure is laid out again whenever a box changes.
+    # Four panels: the record, the trace with the readback over it, the
+    # piezo in and out, the histogram.
     top = ttk.Frame(right)
     top.pack(fill="x")
-    ttk.Label(top, text="also show:").pack(side="left")
-    extras = {key: tk.BooleanVar(value=key in show)
-              for key in ("gold", "approach", "iv")}
-    for key, text in (("gold", "gold level"), ("approach", "approach"),
-                      ("iv", "I-V")):
-        ttk.Checkbutton(top, text=text, variable=extras[key],
-                        command=lambda: rebuild()).pack(side="left", padx=3)
     # Off by default, every panel redraws together once per trace, when the
-    # pull is in; on, the record, piezo and approach panels also redraw
-    # while a move is running (the staircase grows as you watch).
+    # pull is in; on, the record and piezo panels also redraw while a move
+    # is running (the staircase grows as you watch).
     live_moving = tk.BooleanVar(value=False)
     ttk.Checkbutton(top, text="redraw while moving", variable=live_moving).pack(
-        side="left", padx=(16, 3))
+        side="left", padx=(0, 3))
     banner = tk.Label(top, text="", font=("Arial", 9, "bold"), fg="#b06000")
     banner.pack(side="right")
     ttk.Button(top, text="Readback window",
@@ -2110,8 +2214,6 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     fig = Figure(figsize=(10.5, 6.6), dpi=100)
     canvas = FigureCanvasTkAgg(fig, master=right)
     canvas.get_tk_widget().pack(fill="both", expand=True)
-    status = ttk.Label(root, text="", font=("Arial", 9), anchor="w")
-    status.pack(fill="x", padx=8, pady=(0, 4))
 
     live = {"paused": False, "cycle": None, "trace": None, "hist": None,
             "dirty": False}
@@ -2127,9 +2229,6 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         ("trace", "trace", "nm", "log10 G/G0", "readback nm"),
         ("piezo", "piezo in/out", "s", "piezo nm", None),
         ("hist", "histogram", "log10 G/G0", "counts/trace", None),
-        ("gold", "gold level", "nm", "G/G0", "junction mV"),
-        ("approach", "approach", "piezo nm", "log10 G/G0", None),
-        ("iv", "I-V", "junction mV", "current uA", None),
     ]
     limits: dict = {}                  # key -> {"x": (lo, hi), "y": ..., "y2": ...}
 
@@ -2226,27 +2325,14 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             draw_live()
 
     def rebuild():
-        """Lay the figure out again: two columns of the main panels, then a
-        column for every two extras ticked. Everything is redrawn into the
-        new axes on the next poll (or at once while browsing)."""
+        """Lay the figure out: the four panels in two columns. Everything is
+        redrawn into the new axes on the next poll (or at once while
+        browsing)."""
         fig.clear()
-        chosen = [k for k in ("gold", "approach", "iv") if extras[k].get()]
-        ncols = 2 + (len(chosen) + 1) // 2
-        # The figure keeps the canvas's size and the panels share it: with
-        # extras ticked they get narrower, and maximising the window gives
-        # them room. (Resizing the canvas from here left stale images of
-        # the previous layout on screen.)
-        grid = fig.subplots(2, ncols, squeeze=False)
+        grid = fig.subplots(2, 2, squeeze=False)
         ax.clear()
         ax.update(record=grid[0, 0], trace=grid[0, 1],
                   piezo=grid[1, 0], hist=grid[1, 1])
-        for i, key in enumerate(chosen):
-            ax[key] = grid[i % 2, 2 + i // 2]
-        used = set(id(a_) for a_ in ax.values())
-        for col in range(2, ncols):
-            for row in range(2):
-                if id(grid[row, col]) not in used:
-                    grid[row, col].set_visible(False)      # an odd slot
         fig.tight_layout(pad=2.0, w_pad=3.0)   # room for the right-hand axes
         if live["paused"] and browse["session"] is not None:
             draw_saved(browse["session"], int(idx_var.get()))
@@ -2280,18 +2366,10 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             plots.plot_trace(ax["trace"], cfg, tr["g0"], tr["disp"], tr["verdict"],
                              title=f"trace {worker.attempts}",
                              sense_v=rec.piezo_sense_v)
-            if "gold" in ax:
-                plots.plot_gold_level(ax["gold"], cfg, tr["g0"], tr["disp"],
-                                      voltage_v=rec.voltage_v)
-            if "iv" in ax:
-                plots.plot_iv(ax["iv"], cfg, rec.voltage_v, rec.current_v)
         if cyc is not None and cyc.t:
             plots.plot_piezo(ax["piezo"], cfg, np.array(cyc.t), np.array(cyc.piezo_v),
                              np.array(cyc.sense_v), marks=cyc.marks,
                              title="piezo in and out, this cycle")
-            if "approach" in ax and cyc.app_piezo_v:
-                plots.plot_approach(ax["approach"], cfg, cyc.app_piezo_v,
-                                    cyc.app_g0, cyc.app_railed)
         if hist is not None and hist["counts"] is not None:
             plots.plot_histogram(ax["hist"], cfg, hist["centres"], hist["counts"],
                                  hist["n"])
@@ -2315,8 +2393,6 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                                 f"(the file keeps the trace only)")
         plots.plot_trace(ax["trace"], scfg, g0, disp, verdict,
                          title=f"saved trace {i}", sense_v=sense)
-        if "gold" in ax:
-            plots.plot_gold_level(ax["gold"], scfg, g0, disp, voltage_v=voltage)
         t = np.arange(voltage.size) / fs
         cmd = start_v - scfg.cal.nm_to_piezo_volts(disp)
         plots.plot_piezo(ax["piezo"], scfg, t, cmd, sense,
@@ -2325,11 +2401,6 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             browse["hist"] = analysis.log_histogram(s.conductances())
         plots.plot_histogram(ax["hist"], scfg, *browse["hist"], browse["n"],
                              title="histogram of the file")
-        if "iv" in ax:
-            plots.plot_iv(ax["iv"], scfg, voltage, current)
-        if "approach" in ax:
-            ax["approach"].clear()
-            ax["approach"].set_title("approach: not stored in the file", fontsize=9)
         banner.config(text=f"BROWSING {Path(browse['path']).name} trace {i}; "
                            f"live plots paused")
         apply_limits()
@@ -2397,7 +2468,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             elif kind == "keithley":
                 show_keithley(p)
             elif kind == "paused":
-                cont_btn.config(state="normal" if p["remaining"] else "disabled")
+                set_continue(bool(p["remaining"]))
             elif kind == "actuator":
                 act_lbl.config(text=f"{p['steps']} steps this session"
                                     + (f", position {p['position']}"
@@ -2464,12 +2535,13 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             if live.get("busy_since") is None:
                 live["busy_since"] = time.monotonic()
             elapsed = time.monotonic() - live["busy_since"]
-            status.config(text=f"{live.get('status', '')}   |   {worker.current} "
-                               f"running {elapsed:4.0f} s: piezo {rig.piezo_v:.3f} V, "
-                               f"junction {v_mv:.1f} mV, {i_ua:.3f} uA"
-                               "   (Stop ends an approach between steps)")
+            status2.config(text=f"{worker.current} running {elapsed:.0f} s: piezo "
+                                f"{rig.piezo_v:.3f} V, junction {v_mv:.1f} mV, "
+                                f"{i_ua:.3f} uA  (Stop ends it between steps)")
         else:
             live["busy_since"] = None
+            if status2.cget("text"):
+                status2.config(text="")
         if (monitor_wants_sample() and not worker.busy and worker.commands.empty()
                 and time.monotonic() - mon_state["last"] > 0.3):
             mon_state["last"] = time.monotonic()
@@ -2497,10 +2569,6 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                             np.array(cyc.rec_v), np.array(cyc.rec_i),
                             marks=cyc.marks,
                             title="this cycle: junction V and current (live)")
-                    if "approach" in ax and cyc.app_piezo_v:
-                        plots.plot_approach(ax["approach"], cfg, cyc.app_piezo_v,
-                                            cyc.app_g0, cyc.app_railed,
-                                            title="approach (live)")
                     apply_limits()
                     canvas.draw_idle()
         if not live["paused"] and banner.cget("text").startswith("BROWSING"):
@@ -2546,6 +2614,13 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             root.destroy()
     root.protocol("WM_DELETE_WINDOW", on_close)
 
+    # The column's height: all of it when the screen has room, else what
+    # fits, and the scrollbar takes care of the rest.
+    root.update_idletasks()
+    left_canvas.configure(height=min(left.winfo_reqheight(),
+                                     root.winfo_screenheight() - 170
+                                     - stb.winfo_reqheight()))
+
     worker.send("noop")                              # first readout
     root.after(150, poll)
     if readback:
@@ -2558,11 +2633,13 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         root.after(900, open_limits)                 # smoke test: it must open
         root.after(950, open_monitor)
         root.after(1200, lambda: (limits.update(
-            gold={"x": (0.0, 2.0), "y": (0.0, 6.0), "y2": None}), redraw_now()))
+            trace={"x": (-0.5, 3.0), "y": (-7.0, 1.0), "y2": None}), redraw_now()))
         root.after(3000, lambda: (lim_state["win"].destroy(),   # and close again
                                   mon_state["win"].destroy()))
-        for ms, key in ((4000, "gold"), (6000, "approach"), (8000, "iv")):
-            root.after(ms, lambda k=key: (extras[k].set(True), rebuild()))
+        # The Settings tab: a refused value and an accepted one, previewed.
+        root.after(4500, lambda: (nb.select(sb), left_canvas.yview_moveto(1.0),
+                                  svars["ramp.bias_v"].set("900")))
+        root.after(6500, lambda: svars["ramp.bias_v"].set("150"))
         # The Piezo box: a slider move and a step by hand, after the run.
         root.after(9000, lambda: worker.send("goto", 2.0))
         root.after(9500, lambda: worker.send("step", 0.5))
@@ -2573,6 +2650,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         root.after(10400, lambda: worker.send("keithley", "find_suppress"))
         root.after(10500, lambda: worker.send("keithley", "gain", 7))
         root.after(9200, lambda: nb.select(fb))
+        root.after(9300, lambda: left_canvas.yview_moveto(1.0))   # scrolled down
 
         def smoke_hist():
             files = sorted(Path(worker.saving["folder"]).rglob("*traces.h5"))
@@ -2613,9 +2691,6 @@ def main(argv: list[str] | None = None) -> int:
                         "no tip)")
     p.add_argument("--readback", action="store_true",
                    help="GUI: open the readback-only window at start")
-    p.add_argument("--show", default="", metavar="PANELS",
-                   help="GUI: extra panels ticked at start, any of "
-                        "gold,approach,iv (default: none)")
     p.add_argument("--save-test-pulls", action="store_true",
                    help="headless with --test-pull: also save them to a "
                         "TESTPULLS .h5 and export it for Igor (format test)")
@@ -2639,11 +2714,6 @@ def main(argv: list[str] | None = None) -> int:
                                 not args.no_igor,
                                 args.require_engaged, test_pull_v=args.test_pull,
                                 save_test_pulls=args.save_test_pulls)
-        show = {s.strip() for s in args.show.split(",") if s.strip()}
-        unknown = show - {"gold", "approach", "iv"}
-        if unknown:
-            p.error(f"--show: unknown panel(s) {sorted(unknown)}; "
-                    f"choose from gold, approach, iv")
         # The smoke run keeps its remembered settings in its own folder so
         # it never pre-fills a real session's Saving tab.
         saving_file = (args.out / "pullout_saving.json"
@@ -2654,7 +2724,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_gui(cfg, out, not args.no_igor,
                        args.config.name if args.config else "defaults",
                        autoclose=args.autoclose, readback=args.readback,
-                       show=show, saving_file=saving_file)
+                       saving_file=saving_file)
     except (ConfigError, SafetyViolation) as exc:
         log.error("%s", exc)
         return 1
