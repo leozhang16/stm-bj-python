@@ -46,17 +46,20 @@ connected only when you press Connect, its state is left exactly as it is
 nothing -- the banner says so once the program knows), and on exit the
 connection is closed without touching the amplifier.
 
-The Coarse approach box is Igor's Actuator Controls: a Newport controller
-over its serial port -- a NanoPZ PZC200 (Igor's, 19200 baud) or an Agilis
-AG-UC2/AG-UC8 (USB, 921600 baud), chosen with the port -- Connect, then
-Step closer / Step apart by the step size, or Start approach, which steps
-the sample in until the current passes the stop level and then backs off
-one step so the piezo Approach can make the contact from below; or, with
-a screw by hand, a contact light and beep at the contact current. The port
-is opened by Connect, not at start-up, so a wrong port costs a message and
-nothing else; rigtests/actuator_check.py finds the port and the controller
-on its own. Every coarse step passes the interlock: the piezo must be
-parked first (Withdraw).
+The Coarse approach box is Igor's Actuator Controls: a Newport controller,
+chosen with the port -- a NanoPZ PZC200 (19200 baud, read/write) or an
+Agilis AG-UC2/AG-UC8 (NI-VISA, 921600 baud, write-only, this lab's) --
+Connect, then Step closer / Step apart, or Start approach, which steps the
+sample in until the current passes the stop level and then backs off one
+step so the piezo Approach can make the contact from below; or, with a
+screw by hand, a contact light and beep at the contact current. The Agilis
+does not report back (Igor never reads it either), so Connect only opens
+the link and the first watched Step is the real confirmation; toward the
+sample is +PR (closer_sign = +1). The port is opened by Connect, not at
+start-up, so a wrong port costs a message and nothing else;
+rigtests/actuator_check.py finds the port and the controller (and moves an
+Agilis once so you can watch it). Every coarse step passes the interlock:
+the piezo must be parked first (Withdraw).
 
 When this program starts it parks the piezo at 0 V, so whatever extension
 Igor left is undone; the approach (or the slider) then extends the piezo
@@ -96,7 +99,7 @@ log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v41"
+__version__ = "v43"
 
 
 # --------------------------------------------------------------------------
@@ -609,11 +612,20 @@ class Worker(threading.Thread):
             self.cfg.actuator.port = port
             self.cfg.actuator.kind = kind              # the config travels with the data
             self.a_state.update(port=port, controller=kind)
-            self.status(f"{name} connected on {port}: status {reply['status']!r}, "
-                        f"position {reply['position']}"
-                        + (f", {reply['version']}" if reply.get("version") else "")
-                        + f". Steps move the sample by {self.cfg.actuator.step_size} "
-                        "controller steps; the piezo must be parked (Withdraw) first")
+            where = reply.get("resource") or port
+            if reply["status"] == "write-only":
+                # The Agilis gives no readback; the first watched Step is the
+                # real confirmation, so say so instead of a false all-clear.
+                self.status(f"{name} opened at {where} (write-only: it does not "
+                            "report back, so press Withdraw, then Step apart and "
+                            "watch the stage move before Start approach). Toward "
+                            f"the sample is +PR; if Step closer goes the wrong "
+                            "way, set closer_sign to -1")
+            else:
+                self.status(f"{name} connected on {port}: status "
+                            f"{reply['status']!r}, position {reply['position']}"
+                            + (f", {reply['version']}" if reply.get("version") else "")
+                            + ". The piezo must be parked (Withdraw) before a step")
             self._post_actuator()
             return
         self.status(f"actuator: unknown action {action!r}")
@@ -1704,15 +1716,17 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     # the stop current and the step counter.
     af = ttk.Frame(ab)
     step_var = tk.StringVar(value=str(A.step_size))
+    amp_var = tk.StringVar(value=str(A.step_amplitude))
     stop_var = tk.StringVar(value=f"{A.stop_current_ua:g}")
 
     def apply_actuator():
         try:
             A.step_size = max(1, int(step_var.get()))
+            A.step_amplitude = max(1, min(50, int(amp_var.get())))
             A.stop_current_ua = abs(float(stop_var.get()))
         except ValueError:
-            status.config(text="actuator: step size must be a whole number, "
-                               "stop current a number")
+            status.config(text="actuator: step size and amplitude must be "
+                               "whole numbers, stop current a number")
     # The link first: which controller (two Newport ones speak different
     # languages), the COM port (Igor hard-wired Com1), and Connect, which
     # opens the port and asks the controller for its status and position.
@@ -1738,9 +1752,14 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     ttk.Button(af, text="Find ports",
                command=lambda: worker.send("actuator", "ports")).grid(
         row=1, column=3, padx=2, pady=2, sticky="ew")
-    ttk.Label(af, text="Step size").grid(row=2, column=0, sticky="w", padx=2)
-    e1 = ttk.Entry(af, textvariable=step_var, width=5)
-    e1.grid(row=2, column=1, padx=2, sticky="w")
+    szf = ttk.Frame(af)
+    szf.grid(row=2, column=0, columnspan=2, sticky="w", padx=2)
+    ttk.Label(szf, text="Steps").pack(side="left")
+    e1 = ttk.Entry(szf, textvariable=step_var, width=4)
+    e1.pack(side="left", padx=(2, 8))
+    ttk.Label(szf, text="Amplitude").pack(side="left")
+    e1b = ttk.Entry(szf, textvariable=amp_var, width=4)
+    e1b.pack(side="left", padx=2)
     ttk.Button(af, text="Step closer",
                command=lambda: (apply_actuator(), hand_move("coarse_step", True))).grid(
         row=2, column=2, padx=2, pady=2, sticky="ew")
@@ -1754,7 +1773,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     ttk.Button(af, text="Start approach",
                command=lambda: (apply_actuator(), hand_move("coarse_approach"))).grid(
         row=3, column=3, padx=2, pady=2, sticky="ew")
-    for e in (e1, e2):
+    for e in (e1, e1b, e2):
         e.bind("<Return>", lambda _e: apply_actuator())
         e.bind("<FocusOut>", lambda _e: apply_actuator())
     NOT_CONNECTED = "not connected: choose the controller and the port, press Connect"
@@ -2783,9 +2802,10 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         # The coarse approach on the simulated actuator: Connect, then
         # Start approach (lands, backs off one step), then a piezo Approach.
         root.after(6900, lambda: (mode_var.set("actuator"), show_mode(),
+                                  kind_var.set(KIND_NAMES["agilis"]),
                                   left_canvas.yview_moveto(0.0)))
         root.after(7000, lambda: worker.send("actuator", "ports"))
-        root.after(7100, lambda: worker.send("actuator", "connect", "COM1", "nanopz"))
+        root.after(7100, lambda: worker.send("actuator", "connect", "COM4", "agilis"))
         root.after(7200, lambda: worker.send("coarse_approach"))
         # The Piezo box: a slider move and a step by hand, after the run.
         root.after(9000, lambda: worker.send("goto", 2.0))

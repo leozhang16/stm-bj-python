@@ -357,26 +357,35 @@ class ActuatorConfig:
     route available.
 
     kind: "none" (approach by hand), "nanopz" (Newport PZC200 over serial,
-    19200 baud), "agilis" (Newport AG-UC2 / AG-UC8 over its USB serial port,
-    always 921600 baud), or "simulated".
+    19200 baud, read/write), "agilis" (Newport Agilis AG-UC2 / AG-UC8 over
+    NI-VISA, 921600 baud, write-only), or "simulated".
 
-    The Agilis speaks a different language (``MR`` remote mode, ``1PR-5``
-    relative move on axis 1, ``1TP`` steps, ``1TS`` status, ``VE`` version)
-    and has its own fields: ``axis`` (1 or 2), ``channel`` (AG-UC8 only,
-    1-4; 0 = not used, as on an AG-UC2) and ``closer_sign``, the sign of a
-    step count that moves the tip toward the sample -- Igor's NanoPZ used
-    negative; on an Agilis it depends on how the actuator is mounted, so
-    rigtests/actuator_check.py --move lets you watch one move and set it.
+    The Agilis is what this lab's Igor drives (Actuator_VISA_functions.ipf):
+    opened through NI-VISA by a resource name (``ASRL4::INSTR`` for COM4),
+    at 921600 baud, and spoken to write-only -- Igor never reads it back, so
+    neither do we; a move is confirmed by watching the stage. Each move is
+    ``mr`` (remote) / ``<axis>SU<amp>`` (step amplitude, Igor's 23) /
+    ``<axis>PR<n>`` (n steps) / ``ml`` (local). Its fields: ``axis`` (1 for
+    the Z/approach actuator), ``step_amplitude`` (the SU value, 1-50, how
+    far each step moves; Igor's working value is 23), ``channel`` (AG-UC8
+    only, 1-4; 0 = don't send CC, as Igor's Z does), ``visa_resource`` (an
+    override; otherwise COMn -> ASRLn::INSTR) and ``closer_sign`` (+1 =
+    toward the sample is positive, as Igor's Z is; -1 flips it if the
+    actuator is mounted the other way). For the NanoPZ, ``step_size`` is the
+    controller-step count; for the Agilis it is the ``PR`` step count.
     """
 
     kind: str = "none"
     port: str = "COM1"
     baud: int = 19200            # the NanoPZ's; an Agilis is fixed at 921600
-    step_size: int = 5           # G_ActuatorStepSize
+    step_size: int = 5           # G_ActuatorStepSize (NanoPZ steps / Agilis PR count)
     settle_s: float = 0.10
-    axis: int = 1                # Agilis: 1 or 2
-    channel: int = 0             # Agilis AG-UC8: 1-4 (0 = AG-UC2, none)
-    closer_sign: int = -1        # sign of a step count toward the sample
+    axis: int = 1                # Agilis: the axis, 1 for the Z/approach actuator
+    step_amplitude: int = 23     # Agilis SU, 1-50 (Igor's working value)
+    channel: int = 0             # Agilis AG-UC8: 1-4 (0 = don't send CC)
+    closer_sign: int = 1         # +1 = toward the sample is +PR (Igor's Z); -1 flips
+    visa_resource: str = ""      # override; else COMn -> ASRLn::INSTR
+    visa_backend: str = ""       # "" = NI-VISA (as the Keithley uses)
     # Current above which the coarse approach stops, in microamps. Igor used
     # 0.1 uA on G_CurrentSamplingReadoutVal (Functions_STMBJ.ipf:1780).
     stop_current_ua: float = 0.1

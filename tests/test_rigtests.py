@@ -432,67 +432,83 @@ def test_nanopz_protocol_on_a_fake_port(cfg):
     assert mute.position() is None
 
 
-class FakeAgilis(FakeSerial):
-    """An AG-UC2 on a string: no echo of the command letters beyond the
-    axis+command prefix, replies as the manual shows them."""
+class FakeVisa:
+    """A Newport Agilis on a string, through a pyvisa-shaped object: it is
+    write-only (``write_raw`` records bytes), as the real one is over this
+    link, and the ResourceManager just hands it back."""
 
-    def __init__(self, *a, **kw):
-        super().__init__(*a, **kw)
-        self.position = 7
-        self.remote = False
+    def __init__(self):
+        self.resource = None
+        self.raw: list[bytes] = []
+        self.attrs: dict = {}
+        self.closed = False
 
-    def write(self, data: bytes):
-        cmd = data.decode().strip()
-        self.written.append(cmd)
-        if cmd == "MR":
-            self.remote = True
-        elif cmd == "VE":
-            self._reply = b"AG-UC2 v2.4.1\r\n"
-        elif cmd.endswith("TS"):
-            self._reply = f"{cmd}0\r\n".encode()           # 0 = ready
-        elif cmd.endswith("TP"):
-            self._reply = f"{cmd}{self.position}\r\n".encode()
-        elif cmd == "TE":
-            self._reply = b"TE0\r\n"
-        elif "PR" in cmd:
-            self.position += int(cmd.split("PR")[1])
+    # pyvisa ResourceManager surface
+    def open_resource(self, resource):
+        self.resource = resource
+        return self
+
+    # pyvisa Resource surface
+    def write_raw(self, data: bytes):
+        self.raw.append(bytes(data))
+
+    def close(self):
+        self.closed = True
+
+    # attributes the driver sets (baud_rate, timeout, write_termination, ...)
+    def __setattr__(self, name, value):
+        if name in ("resource", "raw", "attrs", "closed"):
+            object.__setattr__(self, name, value)
         else:
-            self._reply = b""
+            self.attrs[name] = value
+
+    @property
+    def sent(self) -> list[str]:
+        return [b.decode("ascii").strip() for b in self.raw]
 
 
-def test_agilis_protocol_on_a_fake_port(cfg):
-    from stmlab.actuator import AgilisActuator
-    cfg.actuator.step_size = 5
-    cfg.actuator.closer_sign = -1
-    made = []
+def test_agilis_is_write_only_and_matches_igor(cfg):
+    """The Agilis driver sends exactly Igor's byte sequence: remote, set
+    amplitude, move, local -- closer is +PR on this rig, apart is -PR --
+    and it never reads back (write-only, as Igor is)."""
+    from stmlab.actuator import AgilisActuator, com_to_visa
+    assert com_to_visa("COM4") == "ASRL4::INSTR"
+    assert com_to_visa("ASRL4::INSTR") == "ASRL4::INSTR"
 
-    def factory(**kw):
-        made.append(FakeAgilis(**kw))
-        return made[-1]
-    act = AgilisActuator(cfg, port="COM4", serial_factory=factory)
-    ser = made[0]
-    assert ser.opened["baudrate"] == 921600                 # fixed, whatever the json says
-    assert ser.written == ["MR"]                            # remote mode, no channel on a UC2
-    ident = act.identify()
-    assert ident["version"] == "AG-UC2 v2.4.1" and ident["position"] == 7
-    assert ident["status"] == "0" and ident["kind"] == "agilis"
+    cfg.actuator.step_size = 3                           # PR count
+    cfg.actuator.step_amplitude = 23                     # SU, Igor's value
+    cfg.actuator.closer_sign = 1                         # +PR = closer (this rig)
+    fake = FakeVisa()
+    act = AgilisActuator(cfg, port="COM4", rm_factory=lambda backend: fake)
+    assert fake.resource == "ASRL4::INSTR"
+    assert fake.attrs["baud_rate"] == 921600             # fixed, whatever the json says
+    assert fake.sent == ["mr"]                           # remote mode on open, no CC on a UC2
+
+    ident = act.identify()                               # a harmless round-trip, no read
+    assert ident["status"] == "write-only" and ident["position"] is None
+    assert ident["kind"] == "agilis" and ident["resource"] == "ASRL4::INSTR"
+    assert act.position() is None                        # there is no readback
+
+    fake.raw.clear()
     act.step(closer=True)
-    assert "1PR-5" in ser.written                           # closer_sign -1
+    assert fake.sent == ["mr", "1SU23", "1PR3", "ml"]    # toward the sample: +PR
+    fake.raw.clear()
     act.step(closer=False)
-    assert "1PR5" in ser.written
-    assert act.position() == 7
-    cfg.actuator.closer_sign = +1
-    act.step(closer=True)
-    assert ser.written[-1] in ("1PR5", "1TS") and "1PR5" in ser.written[-3:]
-    act.close()
-    assert ser.written[-2:] == ["1ST", "ML"] and ser.closed  # the front panel back
+    assert fake.sent == ["mr", "1SU-23", "1PR-3", "ml"]  # apart: -PR, -amplitude
 
-    cfg.actuator.channel = 3                                # an AG-UC8: select the channel
+    cfg.actuator.closer_sign = -1                        # actuator mounted the other way
+    fake.raw.clear()
+    act.step(closer=True)
+    assert fake.sent == ["mr", "1SU-23", "1PR-3", "ml"]  # now closer is -PR
+    act.close()
+    assert "ml" in fake.sent[-1:] or fake.closed
+
+    # An AG-UC8 selects its channel on open (Igor's Z sends no CC: channel 0).
+    cfg.actuator.channel = 2
     cfg.actuator.axis = 2
-    act8 = AgilisActuator(cfg, port="COM4", serial_factory=factory)
-    assert made[-1].written[:2] == ["MR", "CC3"]
-    act8.step(closer=False)
-    assert "2PR-5" in made[-1].written                      # axis 2, closer_sign +1 -> apart is -5
+    fake8 = FakeVisa()
+    AgilisActuator(cfg, port="COM4", rm_factory=lambda backend: fake8)
+    assert fake8.sent == ["mr", "CC2"]
 
 
 def test_connect_picks_the_controller_kind(ap, cfg, tmp_path):

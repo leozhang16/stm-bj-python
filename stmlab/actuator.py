@@ -290,115 +290,136 @@ class NanoPZActuator(Actuator):
             pass
 
 
+def com_to_visa(port: str) -> str:
+    """COM4 -> ASRL4::INSTR, the VISA resource name NI-VISA uses for a serial
+    port. An already-VISA name (``ASRL4::INSTR``) is passed through."""
+    p = port.strip()
+    if p.upper().startswith("ASRL") or "::" in p:
+        return p
+    digits = "".join(c for c in p if c.isdigit())
+    return f"ASRL{digits}::INSTR" if digits else p
+
+
 class AgilisActuator(Actuator):
-    """A Newport Agilis AG-UC2 or AG-UC8. Fixed 921600 baud. The controller
-    is put in remote mode on open (its front-panel buttons stop working
-    until ``close`` returns it to local mode) and the configured channel is
-    selected on an AG-UC8."""
+    """A Newport Agilis AG-UC2 / AG-UC8, driven the way this lab's Igor does
+    (Actuator_VISA_functions.ipf): through NI-VISA, at 921600 baud, 8N1, no
+    flow control, and WRITE-ONLY. The controller is not read back -- Igor
+    never does, and the AG-UC does not answer status or position queries on
+    this link -- so ``position`` is None and a move is confirmed by watching
+    the stage, not by the program.
+
+    Each move mirrors Igor's button exactly: ``mr`` (remote) then
+    ``<axis>SU<amp>`` (set the step amplitude) then ``<axis>PR<n>`` (move n
+    steps) then ``ml`` (back to local). Closer to the sample is +PR on this
+    rig (``closer_sign`` = +1); apart is -PR, as Igor's StepActuatorApart.
+    """
 
     BAUD = 921600
     connected = True
     kind = "agilis"
 
     def __init__(self, cfg: RigConfig, port: str | None = None,
-                 serial_factory=None):
+                 resource: str | None = None, rm_factory=None):
         A = cfg.actuator
         self.cfg = cfg
         self.axis = int(A.axis) if int(A.axis) in (1, 2) else 1
         self.port_name = port or A.port
-        self.port = _open_serial(self.port_name, self.BAUD, serial_factory,
-                                 timeout=1.0)
-        log.info("Agilis open on %s at %d baud, axis %d", self.port_name,
-                 self.BAUD, self.axis)
-        self.write("MR")                          # remote mode, required first
-        time.sleep(0.05)
-        if int(A.channel) > 0:
-            self.write(f"CC{int(A.channel)}")
-            time.sleep(0.05)
+        self.resource = resource or A.visa_resource or com_to_visa(self.port_name)
 
-    # -- protocol ---------------------------------------------------------
+        if rm_factory is None:
+            try:
+                import pyvisa
+            except ImportError as exc:
+                raise ActuatorError(
+                    f"pyvisa is not installed ({exc}); on the lab PC it is "
+                    "already there for the Keithley. The Agilis needs it too "
+                    "(NI-VISA, the same backend)") from exc
+
+            def rm_factory(backend):
+                return pyvisa.ResourceManager(backend)
+            self._pyvisa = pyvisa
+        else:
+            self._pyvisa = None
+
+        try:
+            rm = rm_factory(A.visa_backend or "")
+            self.inst = rm.open_resource(self.resource)
+            self._configure()
+        except ActuatorError:
+            raise
+        except Exception as exc:                 # noqa: BLE001
+            raise ActuatorError(
+                f"could not open the Agilis at {self.resource} "
+                f"(from {self.port_name}): {exc}. Is Igor still holding the "
+                "port, is the controller powered on, and is NI-VISA installed?"
+            ) from exc
+
+        log.info("Agilis open at %s (%s), axis %d, write-only",
+                 self.resource, self.port_name, self.axis)
+        # Remote mode, and the channel on an AG-UC8 (Igor's Z sends no CC).
+        self.write("mr\r")
+        if int(A.channel) > 0:
+            self.write(f"CC{int(A.channel)}\r")
+
+    def _configure(self) -> None:
+        """NI-VISA serial attributes, matching Igor's SetupVISASerialPort."""
+        inst = self.inst
+        inst.baud_rate = self.BAUD
+        inst.data_bits = 8
+        inst.timeout = 300
+        inst.write_termination = ""
+        inst.read_termination = ""
+        pv = self._pyvisa
+        if pv is not None:
+            inst.parity = pv.constants.Parity.none
+            inst.stop_bits = pv.constants.StopBits.one
+            try:
+                inst.flow_control = pv.constants.ControlFlow.none
+            except Exception:                    # some backends name it differently
+                pass
+
+    # -- protocol (write-only) -------------------------------------------
 
     def write(self, command: str) -> None:
-        self.port.write((command + "\r\n").encode("ascii"))
-        self.port.flush()
-
-    def query(self, command: str) -> str:
-        """Send and read one reply line, with the command's own letters
-        stripped off the front: ``1TP`` answers ``1TP-12`` -> ``-12``."""
-        self.port.reset_input_buffer()
-        self.write(command)
-        raw = self.port.readline().decode("ascii", errors="replace").strip()
-        if not raw:
-            raise ActuatorError(
-                f"no reply to {command!r} on {self.port_name}: wrong port, "
-                "not an Agilis (a NanoPZ talks at 19200), or the controller off")
-        if raw.startswith(command):
-            raw = raw[len(command):]
-        return raw.strip()
+        self.inst.write_raw(command.encode("ascii"))
 
     def identify(self) -> dict:
-        version = self.query("VE")
-        status = self.status()
-        return {"status": status, "position": self.position(),
-                "port": self.port_name, "kind": "agilis", "version": version}
+        """No readback: the Agilis does not answer here. A harmless remote ->
+        local round-trip proves writes do not error; that, plus a watched
+        Step, is all the confirmation this controller gives."""
+        self.write("mr\r")
+        self.write("ml\r")
+        return {"status": "write-only", "position": None,
+                "port": self.port_name, "resource": self.resource,
+                "kind": "agilis", "version": None}
 
     # -- motion -----------------------------------------------------------
 
     def step(self, closer: bool = True) -> None:
         A = self.cfg.actuator
-        sign = -1 if int(A.closer_sign) < 0 else 1
-        steps = sign * A.step_size if closer else -sign * A.step_size
-        self.write(f"{self.axis}PR{steps}")
-        self.wait_ready(timeout=5.0)
+        amp = max(1, min(50, int(A.step_amplitude)))
+        count = max(1, int(A.step_size))
+        toward = 1 if int(A.closer_sign) >= 0 else -1     # +PR is closer on this rig
+        sign = toward if closer else -toward
+        self.write("mr\r")                                # Igor wraps every move
+        self.write(f"{self.axis}SU{'' if sign > 0 else '-'}{amp}\r\n")
+        self.write(f"{self.axis}PR{sign * count}\r\n")
+        self.write("ml\r")
         time.sleep(A.settle_s)
 
-    def wait_ready(self, timeout: float = 5.0) -> None:
-        """Block until the axis reports ready (status 0), or the timeout."""
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout:
-            try:
-                if self.status().strip() == "0":
-                    return
-            except ActuatorError:
-                return
-            time.sleep(0.05)
-        log.warning("Agilis axis %d still busy after %.1f s", self.axis, timeout)
-
     def stop(self) -> None:
-        self.write(f"{self.axis}ST")
-
-    # -- feedback ---------------------------------------------------------
+        self.write(f"{self.axis}ST\r")
 
     def position(self) -> int | None:
-        """The controller's step counter (``TP``): steps since power-on or
-        the last zero, not an absolute position."""
-        try:
-            reply = self.query(f"{self.axis}TP")
-        except ActuatorError:
-            log.warning("Agilis did not report its step count", exc_info=True)
-            return None
-        digits = "".join(c for c in reply if c.isdigit() or c == "-")
-        try:
-            return int(digits)
-        except ValueError:
-            log.warning("could not parse the step count from %r", reply)
-            return None
-
-    def status(self) -> str:
-        return self.query(f"{self.axis}TS")
-
-    def error(self) -> str:
-        """``TE``: the error of the previous command, 0 when there was none."""
-        return self.query("TE")
+        return None                              # write-only: no step counter here
 
     def close(self) -> None:
         try:
-            self.stop()
-            self.write("ML")                      # the front panel works again
+            self.write("ml\r")                   # the front panel works again
         except Exception:
             pass
         try:
-            self.port.close()
+            self.inst.close()
         except Exception:
             pass
 
@@ -421,35 +442,52 @@ def make_actuator(cfg: RigConfig, rig_sim=None, connect: bool = True) -> Actuato
 # rigtests/actuator_check.py; nothing else should use these.
 PROBES = {
     "nanopz": {"baud": 19200, "queries": ("0TS?", "0TP?", "0VE?"),
-               "move": lambda n: ("0MO", f"0PR{n}"), "after": "0TP?"},
+               "wake": ("0MO",), "move": lambda n: ("0MO", f"0PR{n}"),
+               "after": "0TP?"},
     "agilis": {"baud": 921600, "queries": ("VE", "1TS", "1TP", "TE"),
-               "move": lambda n: ("MR", f"1PR{n}"), "after": "1TP"},
+               "wake": ("MR",), "move": lambda n: ("MR", f"1PR{n}"),
+               "after": "1TP"},
 }
+
+TERMINATORS = {"CRLF": "\r\n", "CR": "\r", "LF": "\n"}
 
 
 def probe_port(port: str, kind: str = "nanopz", move: int = 0,
-               serial_factory=None) -> list[tuple[str, bytes]]:
+               serial_factory=None, terminator: str = "\r\n",
+               wake: bool = False, xonxoff: bool = False,
+               wait_s: float = 0.5) -> list[tuple[str, bytes]]:
     """What the controller answers, raw, to that kind's read-only queries
     -- and, with ``move`` != 0, the step count after one relative move of
-    that many steps (sign as given: watch which way it goes)."""
+    that many steps (sign as given: watch which way it goes).
+
+    ``terminator``, ``wake`` (send the controller's harmless first command,
+    motor on or remote mode, before asking) and ``xonxoff`` are the knobs a
+    silent port is probed with; ``modem_lines`` reads the handshake pins.
+    """
     probe = PROBES[kind]
     if serial_factory is None:
         import serial
         serial_factory = serial.Serial
     out: list[tuple[str, bytes]] = []
     ser = serial_factory(port=port, baudrate=probe["baud"], bytesize=8,
-                         parity="N", stopbits=1, timeout=2.0)
+                         parity="N", stopbits=1, timeout=2.0, xonxoff=xonxoff)
     try:
         def send(cmd: str) -> None:
-            ser.write((cmd + "\r\n").encode("ascii"))
+            ser.write((cmd + terminator).encode("ascii"))
             ser.flush()
 
         def ask(cmd: str) -> None:
             ser.reset_input_buffer()
             send(cmd)
-            time.sleep(0.5)                     # let the whole reply arrive
+            time.sleep(wait_s)                  # let the whole reply arrive
             waiting = getattr(ser, "in_waiting", 0)
             out.append((cmd, ser.read(waiting) if waiting else ser.readline()))
+        if wake:
+            for cmd in probe["wake"]:
+                send(cmd)
+                time.sleep(0.2)
+                waiting = getattr(ser, "in_waiting", 0)
+                out.append((cmd, ser.read(waiting) if waiting else b""))
         for cmd in probe["queries"]:
             ask(cmd)
         if move:
@@ -463,3 +501,20 @@ def probe_port(port: str, kind: str = "nanopz", move: int = 0,
     finally:
         ser.close()
     return out
+
+
+def modem_lines(port: str, baud: int = 19200, serial_factory=None) -> dict:
+    """The handshake inputs as the PC sees them. A powered RS-232 device
+    usually drives DSR and CTS high; an unpowered one, an unplugged cable
+    or a bare header leave them low. (A USB virtual port reports whatever
+    its chip says.)"""
+    if serial_factory is None:
+        import serial
+        serial_factory = serial.Serial
+    ser = serial_factory(port=port, baudrate=baud, bytesize=8, parity="N",
+                         stopbits=1, timeout=0.5)
+    try:
+        return {name: bool(getattr(ser, name, False))
+                for name in ("cts", "dsr", "cd", "ri")}
+    finally:
+        ser.close()
