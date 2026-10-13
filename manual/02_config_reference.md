@@ -132,11 +132,14 @@ Coarse-approach actuator. Igor drove a Newport NanoPZ over serial with
 
 | Field | Default | Unit | Igor origin | Meaning |
 |---|---|---|---|---|
-| `kind` | `"none"` | -- | -- | `"none"` (approach by hand), `"nanopz"` (serial), or `"simulated"` |
-| `port` | `"COM1"` | -- | Igor hardcoded Com1 | Serial port; USB connections usually appear as COM3 or higher |
-| `baud` | `19200` | baud | NanoPZ_Actuator_Functions_STM.ipf | Serial rate (8N1, CRLF line endings) |
-| `step_size` | `5` | steps | `G_ActuatorStepSize` | Steps per coarse move; negative counts move toward the sample |
+| `kind` | `"none"` | -- | -- | `"none"` (approach by hand), `"nanopz"` (Newport PZC200, serial), `"agilis"` (Newport AG-UC2/AG-UC8, USB serial), or `"simulated"` |
+| `port` | `"COM1"` | -- | Igor hardcoded Com1 | Serial port; USB connections usually appear as COM3 or higher (`rigtests/actuator_check.py` lists them) |
+| `baud` | `19200` | baud | NanoPZ_Actuator_Functions_STM.ipf | NanoPZ serial rate (8N1, CRLF line endings); an Agilis is fixed at 921600 and ignores this |
+| `step_size` | `5` | steps | `G_ActuatorStepSize` | Steps per coarse move |
 | `settle_s` | `0.10` | s | -- | Wait after each coarse step |
+| `axis` | `1` | -- | -- | Agilis: the axis the actuator is plugged into, 1 or 2 |
+| `channel` | `0` | -- | -- | Agilis AG-UC8: the channel, 1-4 (0 = none, an AG-UC2) |
+| `closer_sign` | `-1` | -- | `StepActuatorCloser` | Sign of a step count that moves the tip toward the sample (NanoPZ: negative; Agilis: watch one move with `actuator_check.py --move`) |
 | `stop_current_ua` | `0.1` | uA | `G_CurrentSamplingReadoutVal`, Functions_STMBJ.ipf:1780 | Current above which the coarse approach stops |
 
 ## Mode configs

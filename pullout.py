@@ -46,12 +46,22 @@ connected only when you press Connect, its state is left exactly as it is
 nothing -- the banner says so once the program knows), and on exit the
 connection is closed without touching the amplifier.
 
-WHAT THIS DOES NOT DO: the coarse approach. Bring the tip within the fine
-piezo's reach (620 nm) by hand or with Igor's actuator controls first. When
-this program starts it parks the piezo at 0 V, so whatever extension Igor
-left is undone; the approach (or the slider) then extends the piezo until
-contact. Close Igor's DAQ tasks (or Igor) before starting, or the card will
-be busy.
+The Coarse approach box is Igor's Actuator Controls: a Newport controller
+over its serial port -- a NanoPZ PZC200 (Igor's, 19200 baud) or an Agilis
+AG-UC2/AG-UC8 (USB, 921600 baud), chosen with the port -- Connect, then
+Step closer / Step apart by the step size, or Start approach, which steps
+the sample in until the current passes the stop level and then backs off
+one step so the piezo Approach can make the contact from below; or, with
+a screw by hand, a contact light and beep at the contact current. The port
+is opened by Connect, not at start-up, so a wrong port costs a message and
+nothing else; rigtests/actuator_check.py finds the port and the controller
+on its own. Every coarse step passes the interlock: the piezo must be
+parked first (Withdraw).
+
+When this program starts it parks the piezo at 0 V, so whatever extension
+Igor left is undone; the approach (or the slider) then extends the piezo
+until contact. Close Igor (its DAQ tasks and its serial port) before
+starting, or the card and the port will be busy.
 """
 
 from __future__ import annotations
@@ -76,6 +86,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from stmlab import analysis, approach, calibrate, plots, storage, trace   # noqa: E402
+from stmlab.actuator import ActuatorError                           # noqa: E402
 from stmlab.approach import ApproachError                           # noqa: E402
 from stmlab.config import ConfigError, G0_SIEMENS, RigConfig, validate   # noqa: E402
 from stmlab.instrument import Rig                                   # noqa: E402
@@ -85,7 +96,7 @@ log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v39"
+__version__ = "v41"
 
 
 # --------------------------------------------------------------------------
@@ -355,6 +366,13 @@ class Worker(threading.Thread):
         self.k_state: dict = {"connected": False, "zero_check": None,
                               "suppress": None, "suppress_ua": None,
                               "gain": cfg.keithley.gain_exponent}
+        # The NanoPZ: its port is opened by Connect in the Coarse approach
+        # box, never at start-up (a wrong port must not cost the session).
+        act = getattr(rig, "actuator", None)
+        self.a_state: dict = {"connected": bool(getattr(act, "connected", False)),
+                              "port": cfg.actuator.port, "position": None,
+                              "steps": 0, "ports": None,
+                              "controller": cfg.actuator.kind}
 
     # -- posting ------------------------------------------------------------
 
@@ -526,32 +544,102 @@ class Worker(threading.Thread):
 
     # -- the coarse actuator: Igor's Actuator Controls ------------------------------
 
+    def _actuator_ready(self) -> bool:
+        """True when a step can be sent; otherwise the status says what to do."""
+        act = self.rig.actuator
+        if getattr(act, "connected", False):
+            return True
+        if self.cfg.actuator.kind == "none":
+            self.status("no actuator configured or connected: choose the "
+                        "controller and its COM port and press Connect in the "
+                        "Coarse approach box (or use the screw by hand, "
+                        "watching I (uA) and the contact light)")
+        else:
+            self.status("the actuator is not connected: choose the controller "
+                        "and its COM port and press Connect in the Coarse "
+                        "approach box")
+        return False
+
+    def _post_actuator(self) -> None:
+        act = self.rig.actuator
+        on = bool(getattr(act, "connected", False))
+        self.a_state.update(connected=on, steps=self.rig.coarse_steps,
+                            position=act.position() if on else None)
+        self.post("actuator", **self.a_state)
+
+    def cmd_actuator(self, action: str, *args) -> None:
+        """The NanoPZ link. Igor opened Com1 when it started; here the port
+        is chosen in the window and opened on Connect, and the controller
+        has to answer a status query before the program believes it."""
+        from stmlab import actuator as amod
+        if action == "ports":
+            try:
+                ports = amod.list_serial_ports()
+            except amod.ActuatorError as exc:
+                self.status(f"{exc}. On the lab PC: pip install pyserial")
+                return
+            self.a_state["ports"] = ports
+            agilis = [d for d, desc in ports if "AG-UC" in desc.upper()]
+            self.status("serial ports on this PC: "
+                        + (", ".join(f"{d} ({desc})" for d, desc in ports)
+                           or "none found (Device Manager -> Ports (COM & LPT))")
+                        + (f". {', '.join(agilis)} is a Newport Agilis AG-UC2/UC8: "
+                           "if that is the coarse actuator, choose Agilis and "
+                           "that port" if agilis else ""))
+            self.post("actuator", **self.a_state)
+            return
+        if action == "connect":
+            port = (args[0] if args and args[0] else self.cfg.actuator.port).strip()
+            kind = (args[1] if len(args) > 1 and args[1] else self.cfg.actuator.kind)
+            kind = kind.lower() if kind.lower() in amod.KINDS else "nanopz"
+            name = {"nanopz": "NanoPZ", "agilis": "Agilis"}[kind]
+            if self.cfg.simulate:
+                act = amod.SimulatedActuator(self.cfg, getattr(self.rig, "_session", None))
+                reply = {"status": "simulated", "position": act.position(), "port": port}
+            else:
+                try:
+                    act = amod.KINDS[kind](self.cfg, port=port)
+                    reply = act.identify()
+                except Exception as exc:          # noqa: BLE001
+                    self.status(f"{name}: {exc}")
+                    self.a_state.update(connected=False)
+                    self.post("actuator", **self.a_state)
+                    return
+            self.rig.attach_actuator(act)
+            self.cfg.actuator.port = port
+            self.cfg.actuator.kind = kind              # the config travels with the data
+            self.a_state.update(port=port, controller=kind)
+            self.status(f"{name} connected on {port}: status {reply['status']!r}, "
+                        f"position {reply['position']}"
+                        + (f", {reply['version']}" if reply.get("version") else "")
+                        + f". Steps move the sample by {self.cfg.actuator.step_size} "
+                        "controller steps; the piezo must be parked (Withdraw) first")
+            self._post_actuator()
+            return
+        self.status(f"actuator: unknown action {action!r}")
+
     def cmd_coarse_step(self, closer: bool) -> None:
         """One actuator step, through the interlock: refused unless the
         piezo is retracted (``limits.coarse_step_max_piezo_v``)."""
-        if self.cfg.actuator.kind == "none":
-            self.status("no actuator configured: set actuator.kind to "
-                        "\"nanopz\" (and the COM port) in the config, or use "
-                        "the screw by hand")
+        if not self._actuator_ready():
             return
         try:
             self.rig.coarse_step(closer=closer)
-        except NotImplementedError as exc:
+        except (NotImplementedError, ActuatorError) as exc:
             self.status(f"actuator: {exc}")
             return
-        pos = self.rig.actuator.position()
+        self._post_actuator()
+        pos = self.a_state["position"]
         self.status(f"actuator stepped {'closer' if closer else 'apart'} "
                     f"({self.rig.coarse_steps} steps this session"
                     + (f", position {pos}" if pos is not None else "") + ")")
-        self.post("actuator", steps=self.rig.coarse_steps, position=pos)
 
     def cmd_coarse_approach(self) -> None:
         """Igor's Start Approach (HighResCardApproach): step the actuator in
         until the current passes ``actuator.stop_current_ua``, with the
-        piezo retracted throughout. Stop ends it between steps."""
-        if self.cfg.actuator.kind == "none":
-            self.status("no actuator configured: approach with the screw by "
-                        "hand, watching I (uA) and the contact light")
+        piezo retracted throughout; then one step back, so the fine piezo
+        has room to make the contact itself. Stop ends it between steps."""
+        if not self._actuator_ready():
             return
         if self.bias_dirty:
             self.cmd_bias()
@@ -559,12 +647,25 @@ class Worker(threading.Thread):
         self.rig.hold(bias_v=self.cfg.ramp.bias_v)
         self.status("coarse approach: stepping the actuator in until "
                     f"{self.cfg.actuator.stop_current_ua:g} uA ...")
-        steps = approach.coarse_approach(self.rig, self.stop_flag)
-        pos = self.rig.actuator.position()
-        self.post("actuator", steps=self.rig.coarse_steps, position=pos)
-        self.status(f"coarse approach done after {steps} steps: the current "
-                    "is above the stop level; now Approach (piezo) finds the "
-                    "contact")
+        try:
+            steps = approach.coarse_approach(self.rig, self.stop_flag)
+            stopped = self.stop_flag.is_set()
+            if not stopped:
+                # Landed, with the piezo at its floor: back off one step so
+                # the junction is open and Approach can close it from below.
+                self.rig.coarse_step(closer=False)
+        except ActuatorError as exc:
+            self.status(f"actuator: {exc}")
+            self._post_actuator()
+            return
+        self._post_actuator()
+        if stopped:
+            self.status(f"coarse approach stopped after {steps} steps")
+        else:
+            self.status(f"coarse approach: current above "
+                        f"{self.cfg.actuator.stop_current_ua:g} uA after {steps} "
+                        "steps, then one step back to open the junction; now "
+                        "Approach (piezo) makes the contact")
 
     # -- moves made by hand: the slider and the step buttons ----------------------
 
@@ -1094,7 +1195,11 @@ def open_rig(cfg: RigConfig) -> tuple[SafeSession, Rig]:
     guard = SafeSession(cfg)
     guard.__enter__()
     try:
-        rig = Rig(cfg).open()
+        actuator = None
+        if cfg.actuator.kind.lower() in ("nanopz", "agilis") and not cfg.simulate:
+            from stmlab.actuator import UnconnectedActuator
+            actuator = UnconnectedActuator()        # Connect opens the port
+        rig = Rig(cfg, actuator=actuator).open()
     except Exception:
         guard.__exit__(*sys.exc_info())
         raise
@@ -1586,7 +1691,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     mode_var = tk.StringVar(value="screw" if A.kind == "none" else "actuator")
     mf = ttk.Frame(ab)
     mf.grid(row=0, column=0, sticky="w")
-    ttk.Radiobutton(mf, text=f"NanoPZ actuator ({A.port})", value="actuator",
+    ttk.Radiobutton(mf, text="Newport actuator (serial)", value="actuator",
                     variable=mode_var, command=lambda: show_mode()).pack(
         side="left", padx=2)
     ttk.Radiobutton(mf, text="screw by hand", value="screw",
@@ -1608,29 +1713,68 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         except ValueError:
             status.config(text="actuator: step size must be a whole number, "
                                "stop current a number")
-    ttk.Label(af, text="Step size").grid(row=0, column=0, sticky="w", padx=2)
+    # The link first: which controller (two Newport ones speak different
+    # languages), the COM port (Igor hard-wired Com1), and Connect, which
+    # opens the port and asks the controller for its status and position.
+    KIND_NAMES = {"nanopz": "NanoPZ PZC200 (19200 baud)",
+                  "agilis": "Agilis AG-UC2/UC8 (921600 baud)"}
+    kind_var = tk.StringVar(value=KIND_NAMES.get(A.kind.lower(), KIND_NAMES["nanopz"]))
+
+    def kind_now() -> str:
+        return next((k for k, v in KIND_NAMES.items() if v == kind_var.get()),
+                    "nanopz")
+    ttk.Label(af, text="Controller").grid(row=0, column=0, sticky="w", padx=2)
+    ttk.Combobox(af, textvariable=kind_var, width=28, state="readonly",
+                 values=tuple(KIND_NAMES.values())).grid(
+        row=0, column=1, columnspan=3, padx=2, pady=2, sticky="w")
+    port_var = tk.StringVar(value=A.port)
+    ttk.Label(af, text="Port").grid(row=1, column=0, sticky="w", padx=2)
+    port_box = ttk.Combobox(af, textvariable=port_var, width=8, values=(A.port,))
+    port_box.grid(row=1, column=1, padx=2, sticky="w")
+    ttk.Button(af, text="Connect",
+               command=lambda: hand_move("actuator", "connect", port_var.get(),
+                                         kind_now())).grid(
+        row=1, column=2, padx=2, pady=2, sticky="ew")
+    ttk.Button(af, text="Find ports",
+               command=lambda: worker.send("actuator", "ports")).grid(
+        row=1, column=3, padx=2, pady=2, sticky="ew")
+    ttk.Label(af, text="Step size").grid(row=2, column=0, sticky="w", padx=2)
     e1 = ttk.Entry(af, textvariable=step_var, width=5)
-    e1.grid(row=0, column=1, padx=2)
+    e1.grid(row=2, column=1, padx=2, sticky="w")
     ttk.Button(af, text="Step closer",
                command=lambda: (apply_actuator(), hand_move("coarse_step", True))).grid(
-        row=0, column=2, padx=2, pady=2, sticky="ew")
+        row=2, column=2, padx=2, pady=2, sticky="ew")
     ttk.Button(af, text="Step apart",
                command=lambda: (apply_actuator(), hand_move("coarse_step", False))).grid(
-        row=0, column=3, padx=2, pady=2, sticky="ew")
+        row=2, column=3, padx=2, pady=2, sticky="ew")
     ttk.Label(af, text="Start approach stops at (uA)").grid(
-        row=1, column=0, columnspan=2, sticky="w", padx=2)
+        row=3, column=0, columnspan=2, sticky="w", padx=2)
     e2 = ttk.Entry(af, textvariable=stop_var, width=5)
-    e2.grid(row=1, column=2, padx=2, sticky="w")
+    e2.grid(row=3, column=2, padx=2, sticky="w")
     ttk.Button(af, text="Start approach",
                command=lambda: (apply_actuator(), hand_move("coarse_approach"))).grid(
-        row=1, column=3, padx=2, pady=2, sticky="ew")
+        row=3, column=3, padx=2, pady=2, sticky="ew")
     for e in (e1, e2):
         e.bind("<Return>", lambda _e: apply_actuator())
         e.bind("<FocusOut>", lambda _e: apply_actuator())
-    act_lbl = tk.Label(af, text="0 steps this session; the piezo must be parked "
-                                "(Withdraw) before a step", font=("Arial", 8),
-                       anchor="w")
-    act_lbl.grid(row=2, column=0, columnspan=4, sticky="w", padx=2)
+    NOT_CONNECTED = "not connected: choose the controller and the port, press Connect"
+    act_lbl = tk.Label(af, text=NOT_CONNECTED, font=("Arial", 8), anchor="w",
+                       fg="#b06000")
+    act_lbl.grid(row=4, column=0, columnspan=4, sticky="w", padx=2)
+
+    def show_actuator(p: dict):
+        if p.get("ports"):
+            port_box.config(values=tuple(d for d, _desc in p["ports"]))
+        if p["connected"]:
+            kind_var.set(KIND_NAMES.get(p.get("controller", ""), kind_var.get()))
+            act_lbl.config(fg="#006000",
+                           text=f"connected on {p['port']}"
+                                + (f", position {p['position']}"
+                                   if p["position"] is not None else "")
+                                + f"; {p['steps']} steps this session; the piezo "
+                                  "must be parked (Withdraw) before a step")
+        else:
+            act_lbl.config(fg="#b06000", text=NOT_CONNECTED)
 
     # Screw mode: nothing to drive; the program is the eyes. The contact
     # current sets the beep and the light.
@@ -2470,11 +2614,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             elif kind == "paused":
                 set_continue(bool(p["remaining"]))
             elif kind == "actuator":
-                act_lbl.config(text=f"{p['steps']} steps this session"
-                                    + (f", position {p['position']}"
-                                       if p["position"] is not None else "")
-                                    + "; the piezo must be parked (Withdraw) "
-                                      "before a step")
+                show_actuator(p)
             elif kind == "session_log":
                 status.config(text=f"{status.cget('text')}   |   logged in "
                                    f"{Path(p['path']).name}")
@@ -2640,6 +2780,13 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         root.after(4500, lambda: (nb.select(sb), left_canvas.yview_moveto(1.0),
                                   svars["ramp.bias_v"].set("900")))
         root.after(6500, lambda: svars["ramp.bias_v"].set("150"))
+        # The coarse approach on the simulated actuator: Connect, then
+        # Start approach (lands, backs off one step), then a piezo Approach.
+        root.after(6900, lambda: (mode_var.set("actuator"), show_mode(),
+                                  left_canvas.yview_moveto(0.0)))
+        root.after(7000, lambda: worker.send("actuator", "ports"))
+        root.after(7100, lambda: worker.send("actuator", "connect", "COM1", "nanopz"))
+        root.after(7200, lambda: worker.send("coarse_approach"))
         # The Piezo box: a slider move and a step by hand, after the run.
         root.after(9000, lambda: worker.send("goto", 2.0))
         root.after(9500, lambda: worker.send("step", 0.5))

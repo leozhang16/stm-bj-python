@@ -53,7 +53,10 @@ class Rig:
 
         if self._actuator is None:
             from .actuator import make_actuator
-            self._actuator = make_actuator(self.cfg)
+            # The simulated actuator moves the simulated surface, so a
+            # coarse approach on a laptop ends the way the real one does.
+            self._actuator = make_actuator(
+                self.cfg, rig_sim=self._session if self.cfg.simulate else None)
 
         # Establish a known output state, and with it a truthful tracker.
         self.piezo_goto(self.cfg.ramp.piezo_park_v)
@@ -261,6 +264,16 @@ class Rig:
                     >= fraction)
 
     # -- coarse actuator --------------------------------------------------
+
+    def attach_actuator(self, actuator) -> None:
+        """Swap the actuator in (Connect in the window): the placeholder or
+        a previous connection is closed first."""
+        old, self._actuator = self._actuator, actuator
+        if old is not None and old is not actuator:
+            try:
+                old.close()
+            except Exception:
+                pass
 
     @property
     def actuator(self):

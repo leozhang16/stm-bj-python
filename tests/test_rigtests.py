@@ -354,6 +354,204 @@ def test_without_an_actuator_the_buttons_only_explain(ap, cfg, tmp_path):
         ap.close_rig(guard, rig)
 
 
+class FakeSerial:
+    """A NanoPZ controller on a string: records what is written, answers
+    the two queries the driver uses, echoes the command as the real one
+    does, and knows when it has been closed."""
+
+    def __init__(self, port, baudrate, bytesize, parity, stopbits, timeout):
+        self.opened = dict(port=port, baudrate=baudrate, bytesize=bytesize,
+                           parity=parity, stopbits=stopbits, timeout=timeout)
+        self.written: list[str] = []
+        self.position = -123
+        self.closed = False
+        self._reply = b""
+
+    def write(self, data: bytes):
+        cmd = data.decode().strip()
+        self.written.append(cmd)
+        if cmd == "0TP?":
+            self._reply = f"0TP? {self.position}\r\n".encode()
+        elif cmd == "0TS?":
+            self._reply = b"0TS? P\r\n"
+        elif cmd.startswith("0PR"):
+            self.position += int(cmd[3:])
+        else:
+            self._reply = b""
+
+    def flush(self):
+        pass
+
+    def reset_input_buffer(self):
+        pass
+
+    def readline(self):
+        r, self._reply = self._reply, b""
+        return r
+
+    @property
+    def in_waiting(self):
+        return len(self._reply)
+
+    def read(self, n):
+        return self.readline()
+
+    def close(self):
+        self.closed = True
+
+
+def test_nanopz_protocol_on_a_fake_port(cfg):
+    from stmlab.actuator import NanoPZActuator, ActuatorError
+    cfg.actuator.step_size = 5
+    made = []
+
+    def factory(**kw):
+        made.append(FakeSerial(**kw))
+        return made[-1]
+    act = NanoPZActuator(cfg, port="COM7", serial_factory=factory)
+    ser = made[0]
+    assert ser.opened["port"] == "COM7" and ser.opened["baudrate"] == 19200
+    assert ser.written == ["0MO"]                       # motor on, nothing else
+    assert act.identify() == {"status": "P", "position": -123, "port": "COM7",
+                              "kind": "nanopz"}
+    act.step(closer=True)
+    assert ser.written[-1] == "0PR-5"                   # negative = toward the sample
+    act.step(closer=False)
+    assert ser.written[-1] == "0PR5"
+    assert act.position() == -123                       # the fake tracks the moves
+    act.close()
+    assert ser.written[-2:] == ["0ST", "0MF"] and ser.closed
+
+    # A port that answers nothing is reported as such, not as a position.
+    class Mute(FakeSerial):
+        def readline(self):
+            return b""
+    mute = NanoPZActuator(cfg, port="COM8", serial_factory=lambda **kw: Mute(**kw))
+    with pytest.raises(ActuatorError, match="nothing on COM8 answers"):
+        mute.identify()
+    assert mute.position() is None
+
+
+class FakeAgilis(FakeSerial):
+    """An AG-UC2 on a string: no echo of the command letters beyond the
+    axis+command prefix, replies as the manual shows them."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.position = 7
+        self.remote = False
+
+    def write(self, data: bytes):
+        cmd = data.decode().strip()
+        self.written.append(cmd)
+        if cmd == "MR":
+            self.remote = True
+        elif cmd == "VE":
+            self._reply = b"AG-UC2 v2.4.1\r\n"
+        elif cmd.endswith("TS"):
+            self._reply = f"{cmd}0\r\n".encode()           # 0 = ready
+        elif cmd.endswith("TP"):
+            self._reply = f"{cmd}{self.position}\r\n".encode()
+        elif cmd == "TE":
+            self._reply = b"TE0\r\n"
+        elif "PR" in cmd:
+            self.position += int(cmd.split("PR")[1])
+        else:
+            self._reply = b""
+
+
+def test_agilis_protocol_on_a_fake_port(cfg):
+    from stmlab.actuator import AgilisActuator
+    cfg.actuator.step_size = 5
+    cfg.actuator.closer_sign = -1
+    made = []
+
+    def factory(**kw):
+        made.append(FakeAgilis(**kw))
+        return made[-1]
+    act = AgilisActuator(cfg, port="COM4", serial_factory=factory)
+    ser = made[0]
+    assert ser.opened["baudrate"] == 921600                 # fixed, whatever the json says
+    assert ser.written == ["MR"]                            # remote mode, no channel on a UC2
+    ident = act.identify()
+    assert ident["version"] == "AG-UC2 v2.4.1" and ident["position"] == 7
+    assert ident["status"] == "0" and ident["kind"] == "agilis"
+    act.step(closer=True)
+    assert "1PR-5" in ser.written                           # closer_sign -1
+    act.step(closer=False)
+    assert "1PR5" in ser.written
+    assert act.position() == 7
+    cfg.actuator.closer_sign = +1
+    act.step(closer=True)
+    assert ser.written[-1] in ("1PR5", "1TS") and "1PR5" in ser.written[-3:]
+    act.close()
+    assert ser.written[-2:] == ["1ST", "ML"] and ser.closed  # the front panel back
+
+    cfg.actuator.channel = 3                                # an AG-UC8: select the channel
+    cfg.actuator.axis = 2
+    act8 = AgilisActuator(cfg, port="COM4", serial_factory=factory)
+    assert made[-1].written[:2] == ["MR", "CC3"]
+    act8.step(closer=False)
+    assert "2PR-5" in made[-1].written                      # axis 2, closer_sign +1 -> apart is -5
+
+
+def test_connect_picks_the_controller_kind(ap, cfg, tmp_path):
+    guard, rig = ap.open_rig(cfg)
+    mon = ap.Monitor(rig)
+    worker = ap.Worker(cfg, rig, mon, save=False, out_dir=tmp_path,
+                       igor_export=False)
+    try:
+        worker.cmd_actuator("connect", "COM4", "agilis")
+        assert worker.a_state["connected"] and worker.a_state["controller"] == "agilis"
+        assert cfg.actuator.kind == "agilis" and cfg.actuator.port == "COM4"
+        worker.cmd_actuator("connect", "COM1", "nanopz")
+        assert cfg.actuator.kind == "nanopz" and cfg.actuator.port == "COM1"
+    finally:
+        worker.close_file()
+        ap.close_rig(guard, rig)
+
+
+def test_a_port_that_will_not_open_names_the_ports(cfg):
+    from stmlab.actuator import NanoPZActuator, ActuatorError
+
+    def refuse(**kw):
+        raise OSError("could not open port 'COM1'")
+    with pytest.raises(ActuatorError, match="could not open 'COM1'"):
+        NanoPZActuator(cfg, port="COM1", serial_factory=refuse)
+
+
+def test_connect_then_coarse_approach_lands_and_backs_off(ap, cfg, tmp_path):
+    """The window's flow on the simulator: Connect attaches the actuator,
+    Start approach steps the sample in until current, backs off one step,
+    and the piezo Approach then makes the contact from below."""
+    from stmlab.safety import RigState
+    guard, rig = ap.open_rig(cfg)                # actuator.kind == "none"
+    mon = ap.Monitor(rig)
+    worker = ap.Worker(cfg, rig, mon, save=False, out_dir=tmp_path,
+                       igor_export=False)
+    try:
+        worker.cmd_coarse_approach()             # refused: nothing connected
+        texts = [p["text"] for k, p in list(worker.events.queue) if k == "status"]
+        assert any("press Connect" in t for t in texts)
+        worker.cmd_actuator("ports")
+        worker.cmd_actuator("connect", "COM5")
+        assert worker.a_state["connected"] and worker.a_state["port"] == "COM5"
+        assert cfg.actuator.kind == "nanopz" and cfg.actuator.port == "COM5"
+        worker.cmd_zero()
+        worker.cmd_coarse_approach()
+        assert rig.coarse_steps >= 2             # in until current, one back
+        assert rig.piezo_v <= cfg.limits.coarse_step_max_piezo_v
+        assert rig.read_current_ua() < cfg.actuator.stop_current_ua   # open again
+        worker.cmd_engage()
+        assert rig.state == RigState.ENGAGED
+        assert rig.piezo_v > 0.2                 # the contact is up the range
+        acts = [p for k, p in list(worker.events.queue) if k == "actuator"]
+        assert acts[-1]["connected"] and acts[-1]["steps"] == rig.coarse_steps
+    finally:
+        worker.close_file()
+        ap.close_rig(guard, rig)
+
+
 # -- histograms of a saved session --------------------------------------------------
 
 def test_histogram_2d_aligns_each_trace_at_the_break(cfg):

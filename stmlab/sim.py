@@ -234,6 +234,15 @@ class SimulatedDaqSession:
 
         return g0
 
+    def move_surface(self, delta_nm: float) -> None:
+        """The coarse actuator: the sample moves, the piezo does not. The
+        junction's memory of where it last broke is a place on the sample,
+        so it moves with it -- otherwise a sample backed off by 150 nm
+        would still read as a 1 G0 contact."""
+        self.surface_nm += delta_nm
+        if self._snap_nm is not None:
+            self._snap_nm += delta_nm
+
     def _roll_molecule(self) -> None:
         """Decide, once per break, whether a molecule bridged the gap."""
         self._snap_g0 = 1.0

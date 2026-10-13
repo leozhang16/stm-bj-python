@@ -1,4 +1,19 @@
-"""Coarse approach actuator: Newport NanoPZ over a serial port.
+"""Coarse approach actuator: a Newport NanoPZ (PZC200) or a Newport Agilis
+(AG-UC2 / AG-UC8) over a serial port.
+
+Two controllers, two languages. The NanoPZ is what Igor's procedures drove
+and what the notes below describe. The Agilis is the other Newport
+piezo-motor controller a lab may have on the same job: it appears in
+Windows as "Newport AG-UC2-UC8 USB Serial Port", talks at a fixed 921600
+baud, and its commands are ``MR`` (remote mode, required first), ``ML``
+(local mode), ``<axis>PR<n>`` (relative move, n steps), ``<axis>TP`` (tell
+the step count), ``<axis>TS`` (status: 0 ready, 1 stepping, 2 jogging, 3
+moving to a limit), ``<axis>ST`` (stop), ``CC<n>`` (channel 1-4, AG-UC8
+only), ``TE`` (error of the previous command, 0 = none) and ``VE``
+(firmware version). Axis is 1 or 2; commands end in CR LF; replies carry
+the command back in front of the value (``1TP-12``). Which sign of ``PR``
+moves the tip toward the sample depends on the mounting:
+``actuator.closer_sign``.
 
 The controller speaks RS-232. Connected by USB it appears as a virtual COM
 port (either through the controller's own USB, or a USB-to-serial adapter),
@@ -30,6 +45,12 @@ Sign convention, from ``StepActuatorCloser`` (NanoPZ_Actuator...:22): a
 
 Nothing here checks the interlock. ``Rig.coarse_step`` does that, and is the
 only thing that should ever call :meth:`step`.
+
+The port is opened when the controller is *connected*, not when the program
+starts: ``UnconnectedActuator`` stands in for a configured NanoPZ until
+``NanoPZActuator(cfg, port=...)`` succeeds, so a wrong COM port costs a
+message in the window, not the session. ``rigtests/nanopz_check.py`` is the
+stand-alone check of the serial link.
 """
 
 from __future__ import annotations
@@ -87,44 +108,104 @@ class NullActuator(Actuator):
             "approach by hand")
 
 
+class UnconnectedActuator(Actuator):
+    """A NanoPZ that is configured but whose port has not been opened yet.
+    Every move refuses with the instruction; ``Rig.attach_actuator`` swaps
+    the real one in once Connect has succeeded."""
+
+    connected = False
+
+    def step(self, closer: bool = True) -> None:
+        raise ActuatorError(
+            "the NanoPZ is not connected: choose its COM port and press "
+            "Connect in the Coarse approach box (or use the screw by hand)")
+
+
 class SimulatedActuator(Actuator):
     def __init__(self, cfg: RigConfig, rig_sim=None):
         self.cfg = cfg
         self.sim = rig_sim
         self._position = 0
 
+    # One controller step of the PZA12 actuator is tens of nanometres, so a
+    # configured step (5 of them, Igor's G_ActuatorStepSize) moves the
+    # sample by about a quarter of the fine piezo's range. The simulated
+    # surface moves by this much per step, and a coarse approach lands in
+    # contact within a step, as the real one does. (Not a divisor of the
+    # surface's 300 nm start, so the landing has a random-looking phase
+    # and the step back leaves a real gap, as on the rig.)
+    NM_PER_STEP = 140.0
+    connected = True
+
     def step(self, closer: bool = True) -> None:
         delta = -self.cfg.actuator.step_size if closer \
             else self.cfg.actuator.step_size
         self._position += delta
         if self.sim is not None:
-            self.sim.surface_nm -= 8.0 if closer else -8.0
+            self.sim.move_surface(-self.NM_PER_STEP if closer else self.NM_PER_STEP)
 
     def position(self) -> int:
         return self._position
 
 
-class NanoPZActuator(Actuator):
-    def __init__(self, cfg: RigConfig):
-        import serial
-
-        A = cfg.actuator
-        self.cfg = cfg
+def _open_serial(port_name: str, baud: int, serial_factory=None,
+                 timeout: float = 2.0):
+    """Open a serial port 8N1, with the message a person needs when it fails."""
+    if serial_factory is None:
         try:
-            self.port = serial.Serial(
-                port=A.port, baudrate=A.baud, bytesize=8, parity="N",
-                stopbits=1, timeout=2.0)
-        except Exception as exc:
+            import serial
+        except ImportError as exc:
+            raise ActuatorError(
+                f"pyserial is not installed ({exc}); on the lab PC: "
+                f"pip install pyserial") from exc
+        serial_factory = serial.Serial
+    try:
+        return serial_factory(port=port_name, baudrate=baud, bytesize=8,
+                              parity="N", stopbits=1, timeout=timeout)
+    except Exception as exc:
+        try:
             available = ", ".join(f"{d} ({desc})"
                                   for d, desc in list_serial_ports()) or "none"
-            raise ActuatorError(
-                f"could not open {A.port!r}: {exc}\n"
-                f"Serial ports visible to this machine: {available}\n"
-                f"Igor used Com1; a USB connection is usually a higher "
-                f"number. Set actuator.port in the config.") from exc
+        except ActuatorError:
+            available = "unknown (pyserial missing)"
+        raise ActuatorError(
+            f"could not open {port_name!r}: {exc}. Serial ports visible to "
+            f"this machine: {available}. Is Igor still holding the port?") from exc
 
-        log.info("NanoPZ open on %s at %d baud", A.port, A.baud)
+
+class NanoPZActuator(Actuator):
+    """The PZC200. ``port`` overrides ``cfg.actuator.port`` for the session;
+    ``serial_factory`` stands in for ``serial.Serial`` in tests."""
+
+    connected = True
+    kind = "nanopz"
+
+    def __init__(self, cfg: RigConfig, port: str | None = None,
+                 serial_factory=None):
+        A = cfg.actuator
+        self.cfg = cfg
+        self.port_name = port or A.port
+        self.port = _open_serial(self.port_name, A.baud, serial_factory)
+        log.info("NanoPZ open on %s at %d baud", self.port_name, A.baud)
         self.motor_on()
+
+    def identify(self) -> dict:
+        """Prove the link: the controller's status character and position.
+        Raises ActuatorError when nothing answers (wrong port or baud, the
+        controller off, or Igor still holding the port)."""
+        try:
+            status = self.status()
+        except ActuatorError:
+            status = None
+        position = self.position()
+        if status is None and position is None:
+            raise ActuatorError(
+                f"nothing on {self.port_name} answers 0TS? or 0TP? at "
+                f"{self.cfg.actuator.baud} baud: wrong port, wrong "
+                "controller (an Agilis talks at 921600 and does not know these "
+                "commands), the controller off, or Igor still holding the port")
+        return {"status": status, "position": position, "port": self.port_name,
+                "kind": "nanopz"}
 
     # -- protocol ---------------------------------------------------------
 
@@ -209,10 +290,176 @@ class NanoPZActuator(Actuator):
             pass
 
 
-def make_actuator(cfg: RigConfig, rig_sim=None) -> Actuator:
+class AgilisActuator(Actuator):
+    """A Newport Agilis AG-UC2 or AG-UC8. Fixed 921600 baud. The controller
+    is put in remote mode on open (its front-panel buttons stop working
+    until ``close`` returns it to local mode) and the configured channel is
+    selected on an AG-UC8."""
+
+    BAUD = 921600
+    connected = True
+    kind = "agilis"
+
+    def __init__(self, cfg: RigConfig, port: str | None = None,
+                 serial_factory=None):
+        A = cfg.actuator
+        self.cfg = cfg
+        self.axis = int(A.axis) if int(A.axis) in (1, 2) else 1
+        self.port_name = port or A.port
+        self.port = _open_serial(self.port_name, self.BAUD, serial_factory,
+                                 timeout=1.0)
+        log.info("Agilis open on %s at %d baud, axis %d", self.port_name,
+                 self.BAUD, self.axis)
+        self.write("MR")                          # remote mode, required first
+        time.sleep(0.05)
+        if int(A.channel) > 0:
+            self.write(f"CC{int(A.channel)}")
+            time.sleep(0.05)
+
+    # -- protocol ---------------------------------------------------------
+
+    def write(self, command: str) -> None:
+        self.port.write((command + "\r\n").encode("ascii"))
+        self.port.flush()
+
+    def query(self, command: str) -> str:
+        """Send and read one reply line, with the command's own letters
+        stripped off the front: ``1TP`` answers ``1TP-12`` -> ``-12``."""
+        self.port.reset_input_buffer()
+        self.write(command)
+        raw = self.port.readline().decode("ascii", errors="replace").strip()
+        if not raw:
+            raise ActuatorError(
+                f"no reply to {command!r} on {self.port_name}: wrong port, "
+                "not an Agilis (a NanoPZ talks at 19200), or the controller off")
+        if raw.startswith(command):
+            raw = raw[len(command):]
+        return raw.strip()
+
+    def identify(self) -> dict:
+        version = self.query("VE")
+        status = self.status()
+        return {"status": status, "position": self.position(),
+                "port": self.port_name, "kind": "agilis", "version": version}
+
+    # -- motion -----------------------------------------------------------
+
+    def step(self, closer: bool = True) -> None:
+        A = self.cfg.actuator
+        sign = -1 if int(A.closer_sign) < 0 else 1
+        steps = sign * A.step_size if closer else -sign * A.step_size
+        self.write(f"{self.axis}PR{steps}")
+        self.wait_ready(timeout=5.0)
+        time.sleep(A.settle_s)
+
+    def wait_ready(self, timeout: float = 5.0) -> None:
+        """Block until the axis reports ready (status 0), or the timeout."""
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            try:
+                if self.status().strip() == "0":
+                    return
+            except ActuatorError:
+                return
+            time.sleep(0.05)
+        log.warning("Agilis axis %d still busy after %.1f s", self.axis, timeout)
+
+    def stop(self) -> None:
+        self.write(f"{self.axis}ST")
+
+    # -- feedback ---------------------------------------------------------
+
+    def position(self) -> int | None:
+        """The controller's step counter (``TP``): steps since power-on or
+        the last zero, not an absolute position."""
+        try:
+            reply = self.query(f"{self.axis}TP")
+        except ActuatorError:
+            log.warning("Agilis did not report its step count", exc_info=True)
+            return None
+        digits = "".join(c for c in reply if c.isdigit() or c == "-")
+        try:
+            return int(digits)
+        except ValueError:
+            log.warning("could not parse the step count from %r", reply)
+            return None
+
+    def status(self) -> str:
+        return self.query(f"{self.axis}TS")
+
+    def error(self) -> str:
+        """``TE``: the error of the previous command, 0 when there was none."""
+        return self.query("TE")
+
+    def close(self) -> None:
+        try:
+            self.stop()
+            self.write("ML")                      # the front panel works again
+        except Exception:
+            pass
+        try:
+            self.port.close()
+        except Exception:
+            pass
+
+
+KINDS = {"nanopz": NanoPZActuator, "agilis": AgilisActuator}
+
+
+def make_actuator(cfg: RigConfig, rig_sim=None, connect: bool = True) -> Actuator:
+    """The actuator for this config. ``connect=False`` leaves a configured
+    controller as an ``UnconnectedActuator`` until Connect is pressed."""
     kind = cfg.actuator.kind.lower()
-    if kind == "nanopz":
-        return NanoPZActuator(cfg)
     if kind == "simulated" or (cfg.simulate and kind != "none"):
         return SimulatedActuator(cfg, rig_sim)
+    if kind in KINDS:
+        return KINDS[kind](cfg) if connect else UnconnectedActuator()
     return NullActuator()
+
+
+# What each controller is asked, read-only, and how a move is sent. For
+# rigtests/actuator_check.py; nothing else should use these.
+PROBES = {
+    "nanopz": {"baud": 19200, "queries": ("0TS?", "0TP?", "0VE?"),
+               "move": lambda n: ("0MO", f"0PR{n}"), "after": "0TP?"},
+    "agilis": {"baud": 921600, "queries": ("VE", "1TS", "1TP", "TE"),
+               "move": lambda n: ("MR", f"1PR{n}"), "after": "1TP"},
+}
+
+
+def probe_port(port: str, kind: str = "nanopz", move: int = 0,
+               serial_factory=None) -> list[tuple[str, bytes]]:
+    """What the controller answers, raw, to that kind's read-only queries
+    -- and, with ``move`` != 0, the step count after one relative move of
+    that many steps (sign as given: watch which way it goes)."""
+    probe = PROBES[kind]
+    if serial_factory is None:
+        import serial
+        serial_factory = serial.Serial
+    out: list[tuple[str, bytes]] = []
+    ser = serial_factory(port=port, baudrate=probe["baud"], bytesize=8,
+                         parity="N", stopbits=1, timeout=2.0)
+    try:
+        def send(cmd: str) -> None:
+            ser.write((cmd + "\r\n").encode("ascii"))
+            ser.flush()
+
+        def ask(cmd: str) -> None:
+            ser.reset_input_buffer()
+            send(cmd)
+            time.sleep(0.5)                     # let the whole reply arrive
+            waiting = getattr(ser, "in_waiting", 0)
+            out.append((cmd, ser.read(waiting) if waiting else ser.readline()))
+        for cmd in probe["queries"]:
+            ask(cmd)
+        if move:
+            for cmd in probe["move"](int(move)):
+                send(cmd)
+                time.sleep(0.1)
+            time.sleep(1.5)
+            ask(probe["after"])
+            if kind == "agilis":
+                send("ML")                      # the front panel works again
+    finally:
+        ser.close()
+    return out

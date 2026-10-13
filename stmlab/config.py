@@ -356,14 +356,27 @@ class ActuatorConfig:
     port, which this single-card rig does not have, so serial is the only
     route available.
 
-    kind: "none" (approach by hand), "nanopz" (serial), or "simulated".
+    kind: "none" (approach by hand), "nanopz" (Newport PZC200 over serial,
+    19200 baud), "agilis" (Newport AG-UC2 / AG-UC8 over its USB serial port,
+    always 921600 baud), or "simulated".
+
+    The Agilis speaks a different language (``MR`` remote mode, ``1PR-5``
+    relative move on axis 1, ``1TP`` steps, ``1TS`` status, ``VE`` version)
+    and has its own fields: ``axis`` (1 or 2), ``channel`` (AG-UC8 only,
+    1-4; 0 = not used, as on an AG-UC2) and ``closer_sign``, the sign of a
+    step count that moves the tip toward the sample -- Igor's NanoPZ used
+    negative; on an Agilis it depends on how the actuator is mounted, so
+    rigtests/actuator_check.py --move lets you watch one move and set it.
     """
 
     kind: str = "none"
     port: str = "COM1"
-    baud: int = 19200
+    baud: int = 19200            # the NanoPZ's; an Agilis is fixed at 921600
     step_size: int = 5           # G_ActuatorStepSize
     settle_s: float = 0.10
+    axis: int = 1                # Agilis: 1 or 2
+    channel: int = 0             # Agilis AG-UC8: 1-4 (0 = AG-UC2, none)
+    closer_sign: int = -1        # sign of a step count toward the sample
     # Current above which the coarse approach stops, in microamps. Igor used
     # 0.1 uA on G_CurrentSamplingReadoutVal (Functions_STMBJ.ipf:1780).
     stop_current_ua: float = 0.1
