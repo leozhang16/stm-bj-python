@@ -99,7 +99,7 @@ log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v45"
+__version__ = "v47"
 
 
 # --------------------------------------------------------------------------
@@ -460,6 +460,8 @@ class Worker(threading.Thread):
             k.open(init=False)             # join the session; change nothing
             self.keithley = k
             self.k_state["connected"] = True
+            if self.cfg.simulate:          # the simulated card sees its suppress
+                setattr(self.rig._session, "keithley", k)
         return self.keithley
 
     def close_keithley(self) -> None:
@@ -521,12 +523,32 @@ class Worker(threading.Thread):
                         "0 V bias, about 3 s ...")
             was = self.rig.bias_v
             self.mon.quiet = True
+            # The sweep only does anything with the suppress switched ON:
+            # swept with it off, the output stays flat, the fit through the
+            # noise puts the zero crossing anywhere, and switching that value
+            # on afterwards rails the amplifier (seen on the rig).
+            k.suppress_enable(True)
             try:
                 value, sweep, readings = kmod.find_suppress(self.rig, k)
                 self.rig.hold(bias_v=was)
             finally:
                 self.mon.quiet = False
-            k.suppress_enable(True)
+            # Sanity: the output must have followed the sweep at the gain's
+            # slope (1 V per uA at 1e6 V/A), and an offset current of more
+            # than half a microamp is not an offset but a wrong fit.
+            slope = float(np.polyfit(sweep[1:-1], readings[1:-1], 1)[0])  # V per uA
+            expected = self.cfg.cal.preamp_gain_v_per_a * 1e-6
+            if abs(slope) < 0.2 * abs(expected) or abs(value) > 0.5:
+                k.set_suppress_ua(0.0)
+                k.suppress_enable(False)
+                self.k_state.update(suppress=False, suppress_ua=0.0)
+                self.bias_dirty = True
+                self.status(f"find suppress: the sweep did not behave (slope "
+                            f"{slope:+.2f} V/uA, expected about {expected:+.2f}; "
+                            f"fit {value:+.3f} uA), so the suppress is set to 0 "
+                            "and OFF. At 1e6 V/A it is not needed anyway: press "
+                            "Calibrate zero.")
+                return
             self.k_state.update(suppress=True, suppress_ua=float(value))
             self.bias_dirty = True
             self.status(f"current suppress set to {value:+.4f} uA and ON "
@@ -600,10 +622,13 @@ class Worker(threading.Thread):
                 act = amod.SimulatedActuator(self.cfg, getattr(self.rig, "_session", None))
                 reply = {"status": "simulated", "position": act.position(), "port": port}
             else:
+                act = None
                 try:
                     act = amod.KINDS[kind](self.cfg, port=port)
                     reply = act.identify()
                 except Exception as exc:          # noqa: BLE001
+                    if act is not None:
+                        act.close()               # free the port for the next try
                     self.status(f"{name}: {exc}")
                     self.a_state.update(connected=False)
                     self.post("actuator", **self.a_state)

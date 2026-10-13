@@ -154,19 +154,30 @@ def coarse_approach(rig, stop_flag=None) -> int:
     require_retracted(cfg, rig.piezo_v, "coarse approach")
     rig.state = RigState.APPROACHING
 
+    # A controller that can hold a run (the Agilis: remote mode and the
+    # amplitude once, then one command per step) is told so; the loop is
+    # then one move and one current read per step, as Igor's was.
+    act = rig.actuator
+    begin, end = getattr(act, "begin_run", None), getattr(act, "end_run", None)
+    if begin is not None:
+        begin(closer=True)
     start = rig.coarse_steps
-    while True:
-        if stop_flag is not None and stop_flag.is_set():
-            log.info("coarse approach stopped by request")
-            break
+    try:
+        while True:
+            if stop_flag is not None and stop_flag.is_set():
+                log.info("coarse approach stopped by request")
+                break
 
-        current_ua = rig.read_current_ua()
-        if abs(current_ua) >= A.stop_current_ua:
-            log.info("coarse approach: %.3f uA after %d steps",
-                     current_ua, rig.coarse_steps - start)
-            break
+            current_ua = rig.read_current_ua()
+            if abs(current_ua) >= A.stop_current_ua:
+                log.info("coarse approach: %.3f uA after %d steps",
+                         current_ua, rig.coarse_steps - start)
+                break
 
-        rig.coarse_step(closer=True)          # interlock + budget checked here
+            rig.coarse_step(closer=True)      # interlock + budget checked here
+    finally:
+        if end is not None:
+            end()
 
     rig.state = RigState.RETRACTED
     return rig.coarse_steps - start

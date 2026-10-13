@@ -200,15 +200,15 @@ class RampConfig:
     pull_rate_nm_per_s: float = 20.0        # G_PullOutRate
     bias_v: float = 0.100                   # G_TipBias, 100 mV
 
-    # Igor used 5 G0 (G_ConductanceThreshold). Through the 106 kohm series
-    # resistor that is reachable: 0.92 V at the amplifier with 2.4 mV left
-    # across the junction (see amplifier_volts / junction_volts below).
-    # Without the resistor it would need 38.7 V and could never be seen.
-    # 0.5 G0 is a shallower contact, 0.76 V and 20 mV across the junction;
-    # whether to go back to Igor's 5 is a physics choice (how deep a
-    # contact each pull starts from), not a range problem. A railed
-    # amplifier counts as contact as well, where the amplifier can rail.
-    engage_g0: float = 0.5                  # G_ConductanceThreshold
+    # Igor's 5 G0 (G_ConductanceThreshold): every pull starts from a contact
+    # a few atoms across. Through the 106 kohm series resistor that is
+    # reachable: 0.92 V at the amplifier with 2.4 mV left across the
+    # junction (see amplifier_volts / junction_volts below); without the
+    # resistor it would need 38.7 V and could never be seen. A lower value
+    # (0.5 G0: 0.76 V, 20 mV across the junction) is a shallower contact --
+    # a physics choice, not a range problem. A railed amplifier counts as
+    # contact as well, where the amplifier can rail.
+    engage_g0: float = 5.0                  # G_ConductanceThreshold
     break_g0: float = 5e-4                  # G_EndOfTraceNoiseThreshold
     approach_step_nm: float = 0.5           # G_MakeContactApproachStepSize
     retract_step_nm: float = 5.0            # magnitude; applied negative
@@ -377,8 +377,8 @@ class ActuatorConfig:
     (Igor's button sends 1).
     """
 
-    kind: str = "none"
-    port: str = "COM1"
+    kind: str = "agilis"         # this lab's coarse actuator (see above)
+    port: str = "COM4"           # its "Newport AG-UC2-UC8 USB Serial Port"
     baud: int = 19200            # the NanoPZ's; an Agilis is fixed at 921600
     step_size: int = 5           # G_ActuatorStepSize (NanoPZ steps / Agilis PR count)
     settle_s: float = 0.10

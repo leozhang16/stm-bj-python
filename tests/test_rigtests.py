@@ -105,8 +105,9 @@ def test_a_slider_move_into_contact_engages_and_a_pull_follows(ap, cfg, tmp_path
     try:
         worker.cmd_goto(1.0)                           # far from the surface
         assert rig.state is not ap.RigState.ENGAGED
-        # The simulated surface sits at 300 nm: go past it, by hand.
-        worker.cmd_goto(cfg.cal.nm_to_piezo_volts(300.5))
+        # The simulated surface sits at 300 nm: go past it, by hand, far
+        # enough for Igor's 5 G0 engage threshold (a few atoms in).
+        worker.cmd_goto(cfg.cal.nm_to_piezo_volts(301.0))
         assert rig.state is ap.RigState.ENGAGED
         events = []
         while not worker.events.empty():
@@ -339,7 +340,8 @@ def test_coarse_steps_go_through_the_interlock(ap, cfg, tmp_path):
 
 
 def test_without_an_actuator_the_buttons_only_explain(ap, cfg, tmp_path):
-    guard, rig = ap.open_rig(cfg)                # actuator.kind == "none"
+    cfg.actuator.kind = "none"                   # a rig with no coarse actuator
+    guard, rig = ap.open_rig(cfg)
     mon = ap.Monitor(rig)
     worker = ap.Worker(cfg, rig, mon, save=False, out_dir=tmp_path,
                        igor_export=False)
@@ -468,7 +470,8 @@ class FakeVisa:
         elif cmd.endswith("TS"):
             reply = f"{cmd}0"
         elif cmd.endswith("TP"):
-            reply = f"{cmd}{self.counter}"
+            if self.remote:                     # the AG-UC2 answers TP in remote only
+                reply = f"{cmd}{self.counter}"
         elif cmd == "mr":
             if not self.ignore_mr:
                 self.remote = True
@@ -511,6 +514,9 @@ class FakeVisa:
         """What was sent, without the TE/TS/TP queries the driver adds."""
         return [c for c in self.sent if c not in ("TE", "1TS", "1TP", "2TS", "2TP", "VE")]
 
+    def moves_and_counter(self) -> list[str]:
+        return [c for c in self.sent if c not in ("TE", "1TS", "2TS", "VE")]
+
 
 def test_agilis_matches_igor_and_reads_the_controller_back(cfg, monkeypatch):
     """Igor's byte sequence per move (remote, amplitude, PR, local; +PR is
@@ -538,11 +544,28 @@ def test_agilis_matches_igor_and_reads_the_controller_back(cfg, monkeypatch):
     fake.raw.clear()
     act.step(closer=False)                               # 20 apart, as on the rig
     assert fake.moves() == ["mr", "1SU-50", "1PR-20", "ml"]
+    fake.raw.clear()
     assert act.position() == 2066                        # 2086 - 20, the rig's numbers
+    assert fake.moves_and_counter() == ["mr", "1TP", "ml"]   # TP needs remote mode
+
+    # A run (the coarse approach): remote and amplitude once, then one
+    # command per step -- Igor's dadada, not four commands and four checks.
+    fake.raw.clear()
+    act.begin_run(closer=True)
+    for _ in range(3):
+        act.step(closer=True)
+    assert act.position() == 2066 + 60                   # in a run: TP straight away
+    act.end_run()
+    assert fake.moves_and_counter() == ["mr", "1SU50", "1PR20", "1PR20", "1PR20",
+                                        "1TP", "ml"]
+    fake.raw.clear()
+    act.step(closer=False)                               # back to the button sequence
+    assert fake.moves() == ["mr", "1SU-50", "1PR-20", "ml"]
+    assert act.position() == 2066 + 40
     fake.raw.clear()
     act.step(closer=True)
     assert fake.moves() == ["mr", "1SU50", "1PR20", "ml"]
-    assert act.position() == 2086
+    assert act.position() == 2066 + 60
 
     cfg.actuator.closer_sign = -1                        # actuator mounted the other way
     fake.raw.clear()
@@ -602,7 +625,8 @@ def test_connect_then_coarse_approach_lands_and_backs_off(ap, cfg, tmp_path):
     Start approach steps the sample in until current, backs off one step,
     and the piezo Approach then makes the contact from below."""
     from stmlab.safety import RigState
-    guard, rig = ap.open_rig(cfg)                # actuator.kind == "none"
+    cfg.actuator.kind = "none"                   # nothing configured yet
+    guard, rig = ap.open_rig(cfg)
     mon = ap.Monitor(rig)
     worker = ap.Worker(cfg, rig, mon, save=False, out_dir=tmp_path,
                        igor_export=False)
@@ -725,6 +749,31 @@ def test_the_whole_window_opens_runs_and_closes(tmp_path):
 
 # -- the Keithley tab, on the simulated amplifier ----------------------------------
 
+def test_find_suppress_refuses_a_sweep_the_amplifier_did_not_follow(ap, cfg, tmp_path):
+    """Seen on the rig: swept with the suppress off, the output stays flat,
+    the fit through the noise puts the zero crossing anywhere, and that
+    value switched on rails the amplifier. A flat sweep now ends with the
+    suppress at 0 and OFF and a message, never a stray microamp."""
+    guard, rig = ap.open_rig(cfg)
+    mon = ap.Monitor(rig)
+    worker = ap.Worker(cfg, rig, mon, save=False, out_dir=tmp_path,
+                       igor_export=False)
+    try:
+        worker.cmd_keithley("connect")
+        rig._session.keithley = None            # the card no longer sees the suppress
+        worker.cmd_keithley("find_suppress")
+        assert worker.k_state["suppress"] is False
+        assert worker.k_state["suppress_ua"] == 0.0
+        assert worker.keithley.commands[-2:] == ["H8S0,0X", "N0X"]
+        texts = [p["text"] for k, p in list(worker.events.queue) if k == "status"]
+        assert any("did not behave" in t and "Calibrate zero" in t for t in texts)
+        assert rig.bias_v == pytest.approx(cfg.ramp.bias_v)   # bias restored
+    finally:
+        worker.close_keithley()
+        worker.close_file()
+        ap.close_rig(guard, rig)
+
+
 def test_keithley_commands_track_the_amplifier_state(ap, cfg, tmp_path):
     guard, rig = ap.open_rig(cfg)
     mon = ap.Monitor(rig)
@@ -744,7 +793,9 @@ def test_keithley_commands_track_the_amplifier_state(ap, cfg, tmp_path):
         assert worker.k_state["zero_check"] is False
         worker.cmd_keithley("find_suppress")
         assert worker.k_state["suppress"] is True
-        assert k.commands[-1] == "N1X"
+        n1 = k.commands.index("N1X")                   # switched ON before the sweep,
+        assert any(c.startswith("H8S") for c in k.commands[n1:])   # then swept and set
+        assert abs(worker.k_state["suppress_ua"]) < 0.01            # a sane offset
         assert rig.bias_v == pytest.approx(cfg.ramp.bias_v)   # bias restored
         worker.cmd_keithley("gain", 7)
         assert cfg.keithley.gain_exponent == 7

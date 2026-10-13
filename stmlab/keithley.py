@@ -73,6 +73,7 @@ class Keithley428:
         self._inst = None
         self.gain_exponent = cfg.gain_exponent
         self.suppress_ua = 0.0
+        self.suppress_on = False
         self.bias_enabled = False
 
     # -- lifecycle --------------------------------------------------------
@@ -166,6 +167,7 @@ class Keithley428:
         return conversion_ua_per_v
 
     def suppress_enable(self, on: bool) -> None:
+        self.suppress_on = bool(on)
         self.write("N1X" if on else "N0X")
 
     def set_suppress_ua(self, ua: float) -> None:

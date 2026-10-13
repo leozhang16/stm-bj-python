@@ -132,6 +132,12 @@ class SimulatedDaqSession:
         node_v = bias_v * r_par / (rs + r_par)          # as the bias row sees it
         junction_v = cal.voltage_input_sign * node_v
         current_a = junction_v * g                       # through the junction
+        # The Keithley's current suppress, when a simulated amplifier is
+        # attached and has it switched on: a set current subtracted at the
+        # input before the gain, which is what Find suppress sweeps.
+        k = getattr(self, "keithley", None)
+        if k is not None and getattr(k, "suppress_on", False):
+            current_a = current_a - k.suppress_ua * 1e-6
         current_v = current_a * cal.preamp_gain_v_per_a + cal.current_zero_v
 
         current_v += self.rng.normal(0.0, self.noise_v_rms, current_v.shape)

@@ -322,7 +322,7 @@ class AgilisActuator(Actuator):
     """
 
     BAUD = 921600
-    GAP_S = 0.05                  # after a command before the next
+    GAP_S = 0.02                  # after a command before the next
     connected = True
     kind = "agilis"
 
@@ -334,6 +334,11 @@ class AgilisActuator(Actuator):
         self.port_name = port or A.port
         self.resource = resource or A.visa_resource or com_to_visa(self.port_name)
         self.version: str | None = None
+        # A run (the coarse approach) holds remote mode and the amplitude
+        # and sends only the move per step: Igor's button sequence per step
+        # is four commands and four error checks, far too slow for a loop.
+        self._run_sign: int | None = None
+        self._run_steps = 0
 
         if rm_factory is None:
             try:
@@ -404,10 +409,10 @@ class AgilisActuator(Actuator):
         self.inst.write_raw((command + "\r\n").encode("ascii"))
         t0 = time.monotonic()
         while time.monotonic() - t0 < wait_s:
-            time.sleep(0.03)
+            time.sleep(0.004)
             waiting = int(getattr(self.inst, "bytes_in_buffer", 0) or 0)
             if waiting:
-                time.sleep(0.03)                 # the rest of the line
+                time.sleep(0.004)                # the rest of the line
                 waiting = int(getattr(self.inst, "bytes_in_buffer", 0) or waiting)
                 raw = self.inst.read_bytes(waiting)
                 return raw.decode("ascii", errors="replace").strip()
@@ -452,18 +457,49 @@ class AgilisActuator(Actuator):
 
     # -- motion -----------------------------------------------------------
 
-    def step(self, closer: bool = True) -> None:
+    def _direction(self, closer: bool) -> tuple[int, int, int]:
         A = self.cfg.actuator
         amp = max(1, min(50, int(A.step_amplitude)))
         count = max(1, int(A.step_size))
         toward = 1 if int(A.closer_sign) >= 0 else -1     # +PR is closer on this rig
-        sign = toward if closer else -toward
-        self._checked("mr")                                # Igor wraps every move
+        return (toward if closer else -toward), amp, count
+
+    def begin_run(self, closer: bool = True) -> None:
+        """Start a run of steps in one direction: remote mode and the
+        amplitude once, checked, so that each ``step`` is one command."""
+        sign, amp, _count = self._direction(closer)
+        self._checked("mr")
+        self._checked(f"{self.axis}SU{'' if sign > 0 else '-'}{amp}")
+        self._run_sign, self._run_steps = sign, 0
+
+    def end_run(self) -> None:
+        """Back to local mode, as Igor leaves the box after every move."""
+        if self._run_sign is not None:
+            self._run_sign = None
+            self.write("ml")
+
+    def step(self, closer: bool = True) -> None:
+        sign, amp, count = self._direction(closer)
+        if self._run_sign == sign:
+            # In a run: the move alone, waited out; the first one checked.
+            self.write(f"{self.axis}PR{sign * count}")
+            self._run_steps += 1
+            if self._run_steps == 1:
+                code = self.error()
+                if code not in (0, None):
+                    raise ActuatorError(
+                        f"the Agilis refused the move: TE{code} "
+                        f"({AGILIS_ERRORS.get(code, 'unknown error')})")
+            self.wait_ready(timeout=2.0 + 0.02 * count)
+            return
+        if self._run_sign is not None:                    # a run the other way
+            self.end_run()
+        self._checked("mr")                                # Igor's button, exactly
         self._checked(f"{self.axis}SU{'' if sign > 0 else '-'}{amp}")
         self._checked(f"{self.axis}PR{sign * count}")
         self.wait_ready(timeout=2.0 + 0.02 * count)
         self._checked("ml")
-        time.sleep(A.settle_s)
+        time.sleep(self.cfg.actuator.settle_s)
 
     def wait_ready(self, timeout: float = 5.0) -> None:
         """Block until the axis reports ready (TS = 0), or the timeout."""
@@ -472,7 +508,7 @@ class AgilisActuator(Actuator):
             st = self.status()
             if st is None or st == "0":
                 return
-            time.sleep(0.05)
+            time.sleep(0.01)
         log.warning("Agilis axis %d still busy after %.1f s", self.axis, timeout)
 
     def stop(self) -> None:
@@ -489,8 +525,15 @@ class AgilisActuator(Actuator):
 
     def position(self) -> int | None:
         """``TP``: the controller's net step count since power-on (or the
-        last ZP) -- a counter, not a calibrated position."""
-        reply = self.query(f"{self.axis}TP")
+        last ZP) -- a counter, not a calibrated position. The AG-UC2 only
+        answers it in remote mode, so outside a run it is asked between a
+        ``mr`` and an ``ml``."""
+        if self._run_sign is None:
+            self.write("mr")
+            reply = self.query(f"{self.axis}TP")
+            self.write("ml")
+        else:
+            reply = self.query(f"{self.axis}TP")
         if reply is None:
             return None
         digits = "".join(c for c in reply.split("TP")[-1] if c.isdigit() or c == "-")
@@ -501,6 +544,7 @@ class AgilisActuator(Actuator):
             return None
 
     def close(self) -> None:
+        self._run_sign = None
         try:
             self.write("ml")                     # the front panel works again
         except Exception:
