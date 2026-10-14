@@ -93,12 +93,15 @@ def check_pull_headroom(cfg: RigConfig, start_v: float) -> None:
 # The interlock
 # --------------------------------------------------------------------------
 
-def require_retracted(cfg: RigConfig, piezo_v: float, action: str) -> None:
-    """Refuse a coarse move unless the fine piezo is retracted.
+def require_retracted(cfg: RigConfig, piezo_v: float, action: str,
+                      limit: float | None = None) -> None:
+    """Refuse a coarse move unless the fine piezo is at or below ``limit``
+    (default: the config's coarse-step limit).
 
     The single most important function here. A coarse step advances the tip
-    further than the piezo's full range; taking one while the piezo is
-    extended drives the tip into the sample.
+    further than the piezo's full range; taking one with the piezo extended
+    beyond its approach position leaves no room to open the junction after
+    the landing.
 
     ``piezo_v`` is the LAST COMMANDED value, tracked by the instrument layer.
     There is no position sensor, so this is a bookkeeping interlock -- which
@@ -107,11 +110,12 @@ def require_retracted(cfg: RigConfig, piezo_v: float, action: str) -> None:
     forcing all motion through ``instrument.py``: not elegance, but the fact
     that this function depends on it.
     """
-    limit = cfg.limits.coarse_step_max_piezo_v
+    if limit is None:
+        limit = cfg.limits.coarse_step_max_piezo_v
     if piezo_v > limit:
         raise SafetyViolation(
-            f"refusing {action}: piezo is at {piezo_v:.3f} V, must be below "
-            f"{limit:.3f} V. Retract the fine piezo first.")
+            f"refusing {action}: piezo is at {piezo_v:.3f} V, must be at or "
+            f"below {limit:.3f} V. Retract the fine piezo first.")
 
 
 def check_step_budget(cfg: RigConfig, steps_taken: int) -> None:

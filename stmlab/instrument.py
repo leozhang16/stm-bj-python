@@ -279,16 +279,23 @@ class Rig:
     def actuator(self):
         return self._actuator
 
+    def coarse_step_limit_v(self) -> float:
+        """The fine-piezo voltage above which a coarse step is refused: the
+        approach position (plus a hair), or the parked rule if higher."""
+        return max(self.cfg.limits.coarse_step_max_piezo_v,
+                   self.cfg.actuator.approach_piezo_v + 0.05)
+
     def coarse_step(self, closer: bool = True) -> None:
         """One coarse step, behind the interlock.
 
-        Refuses unless the fine piezo is retracted. This is the guard that
-        protects the tip, and it is why nothing else in the package is allowed
-        to touch the actuator directly.
+        Refuses unless the fine piezo is at or below its approach position.
+        This is the guard that protects the tip, and it is why nothing else
+        in the package is allowed to touch the actuator directly.
         """
         safety.require_retracted(
             self.cfg, self._piezo_v,
-            f"coarse step {'closer' if closer else 'apart'}")
+            f"coarse step {'closer' if closer else 'apart'}",
+            limit=self.coarse_step_limit_v())
         safety.check_step_budget(self.cfg, self.coarse_steps)
         self._actuator.step(closer=closer)
         self.coarse_steps += 1

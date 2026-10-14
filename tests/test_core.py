@@ -126,10 +126,15 @@ def test_interlock_refuses_coarse_step_when_extended(cfg):
 
 
 def test_interlock_fires_through_the_rig(rig):
-    """The guard must be reachable from where it actually matters."""
-    rig.piezo_goto(5.0)
+    """The guard must be reachable from where it actually matters: a coarse
+    step is refused with the piezo extended beyond its approach position
+    (mid range, where the coarse approach runs), and allowed at it."""
+    limit = rig.coarse_step_limit_v()
+    rig.piezo_goto(limit + 1.0)
     with pytest.raises(SafetyViolation):
         rig.coarse_step(closer=True)
+    rig.piezo_goto(rig.cfg.actuator.approach_piezo_v)
+    rig.coarse_step(closer=True)
 
 
 def test_step_budget_stops_a_runaway(cfg):

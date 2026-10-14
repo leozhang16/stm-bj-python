@@ -127,22 +127,21 @@ class SimulatedActuator(Actuator):
         self.sim = rig_sim
         self._position = 0
 
-    # One controller step of the PZA12 actuator is tens of nanometres, so a
-    # configured step (5 of them, Igor's G_ActuatorStepSize) moves the
-    # sample by about a quarter of the fine piezo's range. The simulated
-    # surface moves by this much per step, and a coarse approach lands in
-    # contact within a step, as the real one does. (Not a divisor of the
-    # surface's 300 nm start, so the landing has a random-looking phase
-    # and the step back leaves a real gap, as on the rig.)
-    NM_PER_STEP = 140.0
+    # One micro-step of the lab's Agilis at its amplitude is tens of
+    # nanometres (on the rig, five of them outran the fine piezo's whole
+    # range), so a configured step of 5 moves the simulated surface by a
+    # good fraction of that range and a single step by much less -- which
+    # is what the aimed coarse approach relies on. (Not a divisor of the
+    # surface's 300 nm start, so a landing has a random-looking phase.)
+    NM_PER_MICROSTEP = 28.0
     connected = True
 
     def step(self, closer: bool = True) -> None:
-        delta = -self.cfg.actuator.step_size if closer \
-            else self.cfg.actuator.step_size
-        self._position += delta
+        count = max(1, int(self.cfg.actuator.step_size))
+        self._position += -count if closer else count
         if self.sim is not None:
-            self.sim.move_surface(-self.NM_PER_STEP if closer else self.NM_PER_STEP)
+            nm = self.NM_PER_MICROSTEP * count
+            self.sim.move_surface(-nm if closer else nm)
 
     def position(self) -> int:
         return self._position

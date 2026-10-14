@@ -328,10 +328,14 @@ def test_coarse_steps_go_through_the_interlock(ap, cfg, tmp_path):
     try:
         worker.cmd_coarse_step(True)             # parked: allowed
         assert rig.coarse_steps == 1
-        worker.cmd_goto(2.0)                     # piezo extended
+        rig._session.move_surface(400.0)         # the surface out of reach
+        worker.cmd_goto(cfg.actuator.approach_piezo_v)   # at the approach position
+        worker.cmd_coarse_step(True)             # allowed: room to open the junction
+        assert rig.coarse_steps == 2
+        worker.cmd_goto(cfg.actuator.approach_piezo_v + 1.0)   # beyond it
         with pytest.raises(SafetyViolation):
             worker.cmd_coarse_step(True)         # refused before the move
-        assert rig.coarse_steps == 1
+        assert rig.coarse_steps == 2
         events = [k for k, _ in list(worker.events.queue)]
         assert "actuator" in events
     finally:
@@ -620,10 +624,13 @@ def test_a_port_that_will_not_open_names_the_ports(cfg):
         NanoPZActuator(cfg, port="COM1", serial_factory=refuse)
 
 
-def test_connect_then_coarse_approach_lands_and_backs_off(ap, cfg, tmp_path):
+def test_connect_then_coarse_approach_aims_the_contact_mid_range(ap, cfg, tmp_path):
     """The window's flow on the simulator: Connect attaches the actuator,
-    Start approach steps the sample in until current, backs off one step,
-    and the piezo Approach then makes the contact from below."""
+    Start approach steps the sample in with the piezo at its low end until
+    current, then aims -- single steps apart, a scan, the measured step
+    size -- until the contact sits in the band, opens the junction by a
+    few nanometres and leaves the piezo there; the piezo Approach then
+    makes the contact mid range."""
     from stmlab.safety import RigState
     cfg.actuator.kind = "none"                   # nothing configured yet
     guard, rig = ap.open_rig(cfg)
@@ -639,13 +646,23 @@ def test_connect_then_coarse_approach_lands_and_backs_off(ap, cfg, tmp_path):
         assert worker.a_state["connected"] and worker.a_state["port"] == "COM5"
         assert cfg.actuator.kind == "nanopz" and cfg.actuator.port == "COM5"
         worker.cmd_zero()
+        rig._session.move_surface(400.0)         # the surface out of the piezo's reach
         worker.cmd_coarse_approach()
-        assert rig.coarse_steps >= 2             # in until current, one back
-        assert rig.piezo_v <= cfg.limits.coarse_step_max_piezo_v
-        assert rig.read_current_ua() < cfg.actuator.stop_current_ua   # open again
+        assert rig.coarse_steps >= 2             # stepped in until current, then aimed
+        lo, hi = cfg.actuator.band_lo_v, cfg.actuator.band_hi_v
+        assert lo - 0.5 <= rig.piezo_v <= hi     # open, just under the contact, in band
+        assert rig.read_current_ua() < cfg.actuator.stop_current_ua   # open
+        texts = [p["text"] for k, p in list(worker.events.queue) if k == "status"]
+        done = [t for t in texts if t.startswith("coarse approach done")]
+        assert done and "junction opened" in done[-1] and "one single actuator step" in done[-1]
         worker.cmd_engage()
         assert rig.state == RigState.ENGAGED
-        assert rig.piezo_v > 0.2                 # the contact is up the range
+        assert lo - 0.5 <= rig.piezo_v <= hi + 0.5    # the contact is mid range
+        before = rig.coarse_steps
+        worker.cmd_coarse_step(True)             # closer into a closed junction
+        assert rig.coarse_steps == before        # refused
+        texts = [p["text"] for k, p in list(worker.events.queue) if k == "status"]
+        assert any("Step closer refused" in t for t in texts)
         acts = [p for k, p in list(worker.events.queue) if k == "actuator"]
         assert acts[-1]["connected"] and acts[-1]["steps"] == rig.coarse_steps
     finally:

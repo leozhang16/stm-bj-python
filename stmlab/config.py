@@ -178,11 +178,13 @@ class SafetyLimits:
     # Approach runaway protection.
     max_coarse_steps: int = 2000
 
-    # THE interlock. A coarse step advances further than the piezo's whole
-    # range; taking one while the piezo is extended drives the tip into the
-    # sample. Extension is the +ve direction here (approach steps are +0.5 nm,
-    # the pull ramp descends), so "retracted" means at or below this value.
-    # 0.1 V is 6.2 nm of residual extension.
+    # The interlock on coarse steps: taken only with the fine piezo at or
+    # below the larger of this and ``actuator.approach_piezo_v`` (+ 0.05 V).
+    # The coarse approach runs with the piezo at its approach position, mid
+    # range, so that after the landing the piezo can retract to open the
+    # junction and still has room to close it again; a hand move further
+    # out than that is refused. 0.1 V is the old "parked" rule, kept for a
+    # rig that sets approach_piezo_v to 0.
     coarse_step_max_piezo_v: float = 0.1
 
 
@@ -379,6 +381,22 @@ class ActuatorConfig:
 
     kind: str = "agilis"         # this lab's coarse actuator (see above)
     port: str = "COM4"           # its "Newport AG-UC2-UC8 USB Serial Port"
+    # The coarse approach aims the contact at the middle of the piezo's
+    # range. The actuator steps the sample in with the piezo at its low
+    # end (approach_piezo_v) until current; then, in a loop: single steps
+    # apart until the junction is open, a quick piezo scan up in
+    # scan_step_nm steps to find where contact is, and if that is below
+    # the band the sample goes apart, above it (or out of reach) closer --
+    # by as many single steps as the step size it measured on the way
+    # says, so it usually lands in the band on the second try. Done when
+    # the contact is inside [band_lo_v, band_hi_v]: the junction is then
+    # opened by a few nm and the piezo left there, with room both ways.
+    approach_piezo_v: float = 1.0           # the low end, during actuator steps
+    band_lo_v: float = 3.0                  # the contact must land in this band
+    band_hi_v: float = 7.0
+    scan_step_nm: float = 5.0               # the piezo scan's step (not the 0.5 nm engage)
+    max_approach_rounds: int = 12           # scans before giving up
+    max_backoff_steps: int = 40             # single steps apart per round, at most
     baud: int = 19200            # the NanoPZ's; an Agilis is fixed at 921600
     step_size: int = 5           # G_ActuatorStepSize (NanoPZ steps / Agilis PR count)
     settle_s: float = 0.10
@@ -777,6 +795,19 @@ def validate(cfg: RigConfig) -> list[str]:
         problems.append(
             "coarse_step_max_piezo_v is outside the piezo range, so the "
             "coarse-step interlock can never be satisfied (or never fires)")
+    A = cfg.actuator
+    if not (L.piezo_ao_min_v <= A.approach_piezo_v <= L.piezo_ao_max_v - 0.5):
+        problems.append(
+            f"actuator.approach_piezo_v ({A.approach_piezo_v} V) must be inside "
+            f"the piezo range with at least 0.5 V above it: the coarse approach "
+            "steps the actuator with the piezo there and scans upward from it")
+    if not (A.approach_piezo_v < A.band_lo_v < A.band_hi_v <= L.piezo_ao_max_v):
+        problems.append(
+            f"actuator band [{A.band_lo_v}, {A.band_hi_v}] V must lie above "
+            f"approach_piezo_v ({A.approach_piezo_v} V) and inside the piezo "
+            "range: it is where the coarse approach puts the contact")
+    if A.scan_step_nm <= 0:
+        problems.append("actuator.scan_step_nm must be positive")
 
     # Piezo sense readback: only checked on a two-card rig that reads it.
     if M.has_piezo_sense:

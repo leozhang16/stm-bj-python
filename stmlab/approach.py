@@ -131,32 +131,13 @@ def smash(rig) -> None:
 # Coarse approach
 # --------------------------------------------------------------------------
 
-def coarse_approach(rig, stop_flag=None) -> int:
-    """Step the coarse actuator in until current appears.
-
-    Igor watched the sampled current and stopped above 0.1 uA
-    (Functions_STMBJ.ipf:1780). The fine piezo must be retracted throughout --
-    ``Rig.coarse_step`` enforces that on every single step, not just at the
-    start, because the loop below never moves the piezo and a bug that did
-    would otherwise go unnoticed.
-
-    Returns the number of steps taken.
-    """
-    cfg: RigConfig = rig.cfg
-    A = cfg.actuator
-
-    if A.kind == "none":
-        raise ApproachError(
-            "no coarse actuator is configured (actuator.kind == 'none'), so "
-            "the coarse approach must be done by hand. Bring the tip in until "
-            "the fine piezo can reach the surface, then call engage().")
-
-    require_retracted(cfg, rig.piezo_v, "coarse approach")
-    rig.state = RigState.APPROACHING
-
-    # A controller that can hold a run (the Agilis: remote mode and the
-    # amplitude once, then one command per step) is told so; the loop is
-    # then one move and one current read per step, as Igor's was.
+def _run_in(rig, stop_flag) -> int:
+    """Phase one: the actuator steps the sample in, with the piezo at its
+    low end, until the current passes the stop level. Igor watched the
+    sampled current and stopped above 0.1 uA (Functions_STMBJ.ipf:1780).
+    A controller that can hold a run (the Agilis) gets one command per
+    step; the loop is one move and one current read per step."""
+    A = rig.cfg.actuator
     act = rig.actuator
     begin, end = getattr(act, "begin_run", None), getattr(act, "end_run", None)
     if begin is not None:
@@ -164,23 +145,150 @@ def coarse_approach(rig, stop_flag=None) -> int:
     start = rig.coarse_steps
     try:
         while True:
-            if stop_flag is not None and stop_flag.is_set():
-                log.info("coarse approach stopped by request")
+            _check_stop(rig, stop_flag, "coarse approach")
+            if abs(rig.read_current_ua()) >= A.stop_current_ua:
                 break
-
-            current_ua = rig.read_current_ua()
-            if abs(current_ua) >= A.stop_current_ua:
-                log.info("coarse approach: %.3f uA after %d steps",
-                         current_ua, rig.coarse_steps - start)
-                break
-
-            rig.coarse_step(closer=True)      # interlock + budget checked here
+            rig.coarse_step(closer=True)          # interlock + budget checked here
     finally:
         if end is not None:
             end()
-
-    rig.state = RigState.RETRACTED
     return rig.coarse_steps - start
+
+
+def _single_steps(rig, closer: bool, n: int, stop_flag) -> None:
+    """``n`` single actuator steps, whatever the configured step count."""
+    A = rig.cfg.actuator
+    saved = A.step_size
+    A.step_size = 1
+    try:
+        for _ in range(n):
+            _check_stop(rig, stop_flag, "coarse approach")
+            rig.coarse_step(closer=closer)
+    finally:
+        A.step_size = saved
+
+
+def _open_with_single_steps(rig, stop_flag) -> int:
+    """Single steps apart, with the piezo at its low end, until the current
+    is below the stop level. Returns the number of steps."""
+    A = rig.cfg.actuator
+    n = 0
+    while abs(rig.read_current_ua()) >= A.stop_current_ua:
+        if n >= A.max_backoff_steps:
+            raise ApproachError(
+                f"the junction is still closed after {n} single steps apart "
+                "with the piezo at its low end; the tip may be crashed. Step "
+                "apart by hand and look at the current.")
+        _single_steps(rig, closer=False, n=1, stop_flag=stop_flag)
+        n += 1
+    return n
+
+
+def _scan_up(rig, stop_flag) -> float | None:
+    """The piezo from its low end upward in ``scan_step_nm`` steps until the
+    current passes the stop level: the contact voltage, or None when the
+    top of the range is reached with nothing there."""
+    cfg = rig.cfg
+    A, L = cfg.actuator, cfg.limits
+    rig.piezo_goto(A.approach_piezo_v)
+    step_v = cfg.cal.nm_to_piezo_volts(A.scan_step_nm)
+    while True:
+        _check_stop(rig, stop_flag, "coarse approach")
+        if abs(rig.read_current_ua()) >= A.stop_current_ua:
+            return rig.piezo_v
+        if rig.piezo_v + step_v > L.piezo_ao_max_v:
+            return None
+        rig.piezo_step_nm(A.scan_step_nm)
+
+
+def coarse_approach(rig, stop_flag=None) -> dict:
+    """Bring the surface to where the fine piezo meets it mid range.
+
+    Phase one, Igor's: with the piezo at its low end the actuator steps
+    the sample in until current. Phase two aims: single steps apart until
+    the junction is open, a quick piezo scan upward to find the contact
+    voltage, and then -- contact below the band: the sample goes apart;
+    above it, or none within reach: closer. The first two scans measure
+    how many volts of contact one single actuator step is worth, and
+    from then on the number of steps is computed so the next scan lands
+    in the band. Done when the contact is inside [band_lo_v, band_hi_v]:
+    the junction is opened by a few nanometres and the piezo left there,
+    with room both ways, which is where Approach and the pulls want it.
+
+    Every coarse step passes ``Rig.coarse_step`` (the interlock: piezo at
+    or below its low end; the step budget) and is taken with the piezo
+    at its low end, never into a closed junction.
+
+    Returns a dict: steps_in, rounds, contact_v, open_v, step_v (volts of
+    contact per single actuator step, when measured). Raises ApproachError
+    when stopped by request or when it cannot converge.
+    """
+    cfg: RigConfig = rig.cfg
+    A, L = cfg.actuator, cfg.limits
+
+    if A.kind == "none":
+        raise ApproachError(
+            "no coarse actuator is configured (actuator.kind == 'none'), so "
+            "the coarse approach must be done by hand. Bring the tip in until "
+            "the fine piezo can reach the surface, then call engage().")
+
+    rig.state = RigState.APPROACHING
+    rig.piezo_goto(A.approach_piezo_v)
+    require_retracted(cfg, rig.piezo_v, "coarse approach",
+                      limit=rig.coarse_step_limit_v())
+
+    steps_in = _run_in(rig, stop_flag)
+    log.info("coarse approach: current after %d steps in", steps_in)
+
+    centre = 0.5 * (A.band_lo_v + A.band_hi_v)
+    step_v: float | None = None          # volts of contact per single step apart
+    prev: float | None = None            # the previous scan's contact voltage
+    net = 0                              # signed single steps apart since that scan
+    contact_v = None
+    for round_ in range(1, A.max_approach_rounds + 1):
+        rig.piezo_goto(A.approach_piezo_v)
+        net += _open_with_single_steps(rig, stop_flag)
+        contact_v = _scan_up(rig, stop_flag)
+        if contact_v is not None and A.band_lo_v <= contact_v <= A.band_hi_v:
+            break
+        if contact_v is not None and prev is not None and net != 0:
+            # Two scans with a known number of single steps between them:
+            # that is the step size, in volts of contact per step apart.
+            measured = (contact_v - prev) / net
+            if measured > 0.02:
+                step_v = measured
+                log.info("one single actuator step is worth %.3f V of contact",
+                         step_v)
+        prev, net = contact_v, 0
+        if contact_v is None:
+            closer = True                       # out of reach: in, and look again
+            n = 1 if step_v is None else max(
+                1, int(round((L.piezo_ao_max_v - centre) / step_v)))
+        else:
+            want = centre - contact_v           # +: the surface must go apart
+            closer = want < 0
+            n = 1 if step_v is None else max(1, int(round(abs(want) / step_v)))
+        rig.piezo_goto(A.approach_piezo_v)      # never a coarse step extended
+        if closer and abs(rig.read_current_ua()) >= A.stop_current_ua:
+            n, closer = 1, False                # closed at the low end: open first
+        _single_steps(rig, closer=closer, n=n, stop_flag=stop_flag)
+        net += -n if closer else n
+        log.info("round %d: contact at %s V, %d single step(s) %s", round_,
+                 f"{contact_v:.3f}" if contact_v is not None else "none",
+                 n, "closer" if closer else "apart")
+    else:
+        raise ApproachError(
+            f"coarse approach did not land the contact between {A.band_lo_v} "
+            f"and {A.band_hi_v} V in {A.max_approach_rounds} rounds (last "
+            f"contact at {contact_v}); the actuator's step may be larger than "
+            "the band is wide: widen band_lo_v/band_hi_v in the config.")
+
+    # In contact at contact_v, inside the band: open the junction by a few
+    # nanometres and leave the piezo there.
+    separate(rig, stop_flag)
+    rig.state = RigState.RETRACTED
+    return {"steps_in": steps_in, "rounds": round_, "contact_v": contact_v,
+            "open_v": rig.piezo_v, "step_v": step_v}
 
 
 def withdraw_coarse(rig, steps: int = 1) -> None:
