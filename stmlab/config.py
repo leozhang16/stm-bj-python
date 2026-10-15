@@ -90,6 +90,12 @@ class ChannelMap:
     # ``Rig.last_sense_v``; it never enters the (2, n) record itself. None
     # means "no sense line" even on a two-card rig.
     ai_piezo_sense: str | None = "ai2"
+    # The card the sense line is on. None: the low-res card, as on the
+    # original two-card rig, where the sense line gets a task of its own (a
+    # DSA card and an X-series card never share one). The record's own card
+    # ("Dev1" on a one-card rig): the sense line joins the record's task as
+    # a third input, on the record's clock, nothing left to synchronise.
+    sense_device: str | None = None
     sense_ai_range_v: float = 10.0
     # How the sense input is wired: "default" (the card's default, DIFF on an
     # X-series card), "rse" (single-ended, shield to AI GND -- a BNC from a
@@ -110,16 +116,29 @@ class ChannelMap:
         return f"{self.device}/{channel}"
 
     @property
+    def sense_card(self) -> str | None:
+        """The card the sense line is read on: ``sense_device``, else the
+        low-res card; None when neither is named."""
+        return self.sense_device or self.low_res_device or None
+
+    @property
     def has_piezo_sense(self) -> bool:
-        """True only on a two-card rig with a sense channel named."""
-        return bool(self.low_res_device) and bool(self.ai_piezo_sense)
+        """True when a sense channel and a card to read it on are named."""
+        return bool(self.sense_card) and bool(self.ai_piezo_sense)
 
     @property
     def piezo_sense_path(self) -> str | None:
-        """``dev2/ai2``, or None when this rig has no sense line."""
+        """``dev2/ai2`` (or ``Dev1/ai3`` on a one-card rig), or None when
+        this rig has no sense line."""
         if not self.has_piezo_sense:
             return None
-        return f"{self.low_res_device}/{self.ai_piezo_sense}"
+        return f"{self.sense_card}/{self.ai_piezo_sense}"
+
+    @property
+    def sense_in_record(self) -> bool:
+        """Is the sense line on the record's own card, read in its task?"""
+        return self.has_piezo_sense and \
+            self.sense_card.lower() == self.device.lower()
 
     @property
     def ai_channels(self) -> tuple[str, str]:

@@ -268,6 +268,49 @@ def load_ibw(path: str | Path) -> np.ndarray:
     return np.asarray(binarywave.load(str(path))["wave"]["wData"])
 
 
+def load_igor_block(path: str | Path) -> dict:
+    """Read an Igor binary wave of conductance traces, Igor's own or one
+    this package wrote, into plain arrays. Needs ``igor2``.
+
+    Returns a dict: ``traces`` (a list of 1-D arrays in G/G0, one per
+    column), ``parameters`` (the 20-slot parameter rows of
+    :func:`split_igor_block`, or None when the wave has no such tail),
+    ``dx_nm`` (the wave's x scaling: nm per point, or None when the wave
+    has none), ``x0_nm``, ``name`` and ``note``.
+
+    A SavePullOut block ends every column with two blank points and the 20
+    parameters; that tail is recognised by its two blank rows. A wave
+    without it (a single trace, or a block cut by hand) is taken whole.
+    """
+    from igor2 import binarywave
+    w = binarywave.load(str(path))["wave"]
+    block = np.asarray(w["wData"], dtype=float)
+    header = w["wave_header"]
+    if block.ndim == 1:
+        block = block[:, None]
+    elif block.ndim != 2:
+        raise ValueError(f"{path}: a {block.ndim}-D wave is not a block of traces")
+    n_rows = block.shape[0]
+    tail = 2 + IGOR_PARAMETER_SLOTS
+    parameters = None
+    if n_rows > tail and np.isnan(block[n_rows - tail:n_rows - tail + 2, :]).all():
+        traces_2d, parameters = split_igor_block(block, IGOR_PARAMETER_SLOTS)
+    else:
+        traces_2d = block.T
+    traces = [np.asarray(t, dtype=float) for t in traces_2d]
+    dx = float(header["sfA"][0]) if "sfA" in header else 0.0
+    x0 = float(header["sfB"][0]) if "sfB" in header else 0.0
+    name = w.get("wave_header", {}).get("bname", b"")
+    if isinstance(name, bytes):
+        name = name.split(b"\0", 1)[0].decode("ascii", "ignore")
+    note = w.get("note", b"")
+    if isinstance(note, bytes):
+        note = note.decode("utf-8", "ignore")
+    return {"traces": traces, "parameters": parameters,
+            "dx_nm": dx if np.isfinite(dx) and dx > 0 else None, "x0_nm": x0,
+            "name": str(name), "note": note}
+
+
 def write_ibw(path: str | Path, name: str, data: np.ndarray,
               note: str = "", dx: float = 1.0, x0: float = 0.0,
               data_units: str = "", x_units: str = "") -> Path:

@@ -328,7 +328,7 @@ def report(cfg: RigConfig, data: np.ndarray) -> None:
     print(f"{f['n']} points over {f['seconds']:.1f} s; command "
           f"{f['cmd_min']:.3f} .. {f['cmd_max']:.3f} V")
     if not f["has_sense"]:
-        print("no sense readback (channels.low_res_device is None)")
+        print("no sense readback (no sense line in the config)")
         return
     if f["corr"] is None:
         print("the command did not move enough to judge the readback")
@@ -973,13 +973,15 @@ def main(argv: list[str] | None = None) -> int:
     cfg = RigConfig.from_json(args.config) if args.config else RigConfig()
     if args.simulate:
         cfg.simulate = True
-        if cfg.channels.low_res_device is None:
+        if not cfg.channels.has_piezo_sense:
             # The point of this test is the readback; give the fake rig one.
             cfg.channels.low_res_device = "dev2"
+            cfg.channels.ai_piezo_sense = cfg.channels.ai_piezo_sense or "ai2"
             log.info("simulate: pretending a second card so the sense line "
                      "has something to show")
     if not cfg.simulate and not cfg.channels.has_piezo_sense:
-        log.warning("channels.low_res_device is None: the command will be "
+        log.warning("no sense line in the config (ai_piezo_sense with "
+                    "sense_device or low_res_device): the command will be "
                     "plotted but there is no sense readback to compare it with")
 
     try:

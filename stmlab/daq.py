@@ -64,10 +64,12 @@ class DaqSession:
 
     On a two-card rig (``channels.low_res_device`` set) a third, one-channel
     AI task reads the piezo sense line on the second card during every play:
-    same N, same rate, started by the same ``ao/StartTrigger``. Its samples
-    are left in :attr:`last_sense_v` rather than added to the record, so the
-    (2, n) contract of :meth:`play` -- and every row index above this layer --
-    is untouched.
+    same N, same rate, started by the same ``ao/StartTrigger``. On a one-card
+    rig with ``channels.sense_device`` naming the record's own card, the
+    sense line is a third channel of the record's task instead, on the same
+    clock. Either way its samples are left in :attr:`last_sense_v` rather
+    than added to the record, so the (2, n) contract of :meth:`play` -- and
+    every row index above this layer -- is untouched.
     """
 
     def __init__(self, cfg: RigConfig):
@@ -75,6 +77,7 @@ class DaqSession:
         self._ai = None
         self._ao = None
         self._sense = None                   # piezo sense task, or None
+        self._sense_in_record = False        # sense as the record task's 3rd channel
         self._n = 0
         self._ao_running = False
         self._retriggerable = True
@@ -127,11 +130,21 @@ class DaqSession:
             self._ai.ai_channels.add_ai_voltage_chan(
                 chan, min_val=-m.ai_range_v, max_val=m.ai_range_v)
 
-        # The piezo sense line lives on the other card, so it cannot join the
-        # task above (a DSA card and an X-series card never share a task).
-        # One channel, its own task, read alongside the record.
         sense_path = m.piezo_sense_path
-        if sense_path is not None:
+        if sense_path is not None and m.sense_in_record:
+            # One card: the sense line is a third input of the record's own
+            # task, sampled on the record's clock. Nothing to synchronise.
+            self._ai.ai_channels.add_ai_voltage_chan(
+                sense_path, terminal_config=sense_terminal_config(m),
+                min_val=-m.sense_ai_range_v, max_val=m.sense_ai_range_v)
+            self._sense_in_record = True
+            self.sense_sync = "hardware"
+            log.info("piezo sense readback on %s (%s), in the record's task",
+                     sense_path, m.sense_terminal)
+        elif sense_path is not None:
+            # Two cards: the sense line lives on the other card, so it cannot
+            # join the task above (a DSA card and an X-series card never
+            # share a task). One channel, its own task, read alongside.
             self._sense = nidaqmx.Task("stmbj_sense")
             self._sense.ai_channels.add_ai_voltage_chan(
                 sense_path, terminal_config=sense_terminal_config(m),
@@ -329,15 +342,18 @@ class DaqSession:
         self._ao_running = True
         self._ao.wait_until_done(timeout=timeout_s)
 
-        data = self._ai.read(number_of_samples_per_channel=n,
-                             timeout=timeout_s)
-        if self._sense is not None:
+        data = np.asarray(self._ai.read(number_of_samples_per_channel=n,
+                                        timeout=timeout_s), dtype=float)
+        if self._sense_in_record:
+            self.last_sense_v = data[2].copy()
+            data = data[:2]
+        elif self._sense is not None:
             sense = self._sense.read(number_of_samples_per_channel=n,
                                      timeout=timeout_s)
             self.last_sense_v = np.asarray(sense, dtype=float).ravel()
         # AO is left running: the outputs hold their last sample, which is how
         # the piezo keeps its position between plays.
-        return np.asarray(data, dtype=float)
+        return data
 
     @property
     def effective_rate_hz(self) -> float:

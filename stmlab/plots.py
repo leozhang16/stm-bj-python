@@ -4,8 +4,9 @@ One function per picture, each taking an ``Axes`` and plain arrays, so the
 same code draws the live window of ``pullout.py`` and the figures
 for a saved session. Run it on a file to get the figures as PNGs:
 
-    python -m stmlab.plots data/<session>.h5            # trace 0
-    python -m stmlab.plots data/<session>.h5 --trace 7  # trace 7
+    python plot.py data/<session>.h5 -1                 # trace 1, in a window
+    python -m stmlab.plots data/<session>.h5            # trace 1, as a PNG
+    python -m stmlab.plots data/<session>.h5 --trace 7  # trace 8 (0-based index)
     python -m stmlab.plots data/<session>.h5 --out figs # PNGs there
 
 Igor's windows, for orientation: ``HighRes`` is :func:`plot_record`,
@@ -356,11 +357,12 @@ def _twin(ax):
     return twin
 
 
-def figure_for_session(path: str | Path, trace_index: int = 0):
+def figure_for_session(path: str | Path, trace_index: int = 0, fig=None):
     """Six panels for one trace of a saved session plus its histogram.
 
     Returns (figure, info dict). The record panel shows the cut trace, since
-    the file keeps the trace and not the pads around it.
+    the file keeps the trace and not the pads around it. Draws on ``fig``
+    when one is given (a pyplot figure, say), else on a new Figure.
     """
     from matplotlib.figure import Figure
 
@@ -379,11 +381,13 @@ def figure_for_session(path: str | Path, trace_index: int = 0):
         centres, counts = analysis.log_histogram(session.conductances())
         verdict = analysis.select_trace(g0, cfg.ramp)
 
-    fig = Figure(figsize=(13, 7.5), dpi=100)
+    if fig is None:
+        fig = Figure(figsize=(13, 7.5), dpi=100)
+    fig.clear()
     axes = fig.subplots(2, 3)
     record = np.stack([voltage, current])
-    plot_record(axes[0, 0], cfg, record, fs, title=f"trace {i} of {n}: record")
-    plot_trace(axes[0, 1], cfg, g0, disp, verdict, title=f"trace {i}",
+    plot_record(axes[0, 0], cfg, record, fs, title=f"trace {i + 1} of {n}: record")
+    plot_trace(axes[0, 1], cfg, g0, disp, verdict, title=f"trace {i + 1}",
                sense_v=sense)
     plot_gold_level(axes[0, 2], cfg, g0, disp, voltage_v=voltage)
     t = np.arange(voltage.size) / fs
@@ -393,7 +397,7 @@ def figure_for_session(path: str | Path, trace_index: int = 0):
     plot_iv(axes[1, 2], cfg, voltage, current)
     fig.suptitle(str(Path(path).name), fontsize=10)
     fig.tight_layout(w_pad=3.0)
-    return fig, {"n": n, "index": i, "verdict": verdict}
+    return fig, {"n": n, "index": i, "number": i + 1, "verdict": verdict}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -409,9 +413,9 @@ def main(argv: list[str] | None = None) -> int:
     fig, info = figure_for_session(args.path, args.trace)
     out_dir = args.out or args.path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"{args.path.stem}_trace{info['index']:04d}.png"
+    out = out_dir / f"{args.path.stem}_trace{info['number']:04d}.png"
     fig.savefig(out, dpi=110)
-    print(f"{args.path.name}: {info['n']} traces; trace {info['index']} "
+    print(f"{args.path.name}: {info['n']} traces; trace {info['number']} "
           f"{'accepted' if info['verdict'].accepted else 'rejected'} "
           f"({info['verdict'].reason})")
     print(f"wrote {out}")

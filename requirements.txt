@@ -5,6 +5,9 @@ h5py>=3.8
 # Analysis figures in the experiment scripts, and the GUI's graph windows.
 matplotlib>=3.7
 
+# plot.py reading Igor's own .ibw files (the Python .h5 and .txt need nothing).
+igor2>=0.5
+
 # The GUI (gui.py) also needs Tkinter, which is part of Python itself, not a
 # pip package: python.org installers bundle it; Homebrew Python needs
 # `brew install python-tk@3.12`; Debian/Ubuntu `apt install python3-tk`.

@@ -29,8 +29,11 @@ is its own approach + pull, from an open junction), Continue, Stop and
 Calibrate zero; the single-cycle commands (engage, pull, cycle, withdraw,
 smash) are still there for --headless and the tests, and the smash-every
 line runs the smash inside Start N. A saved session can be browsed in the
-same plots. Under Run, the Status box: the rig's numbers (state, piezo,
-junction, current, zero, file, Keithley) and the last message, in colour.
+same plots (traces counted from 1), and its histograms opened in windows
+of their own, drawn by plot.py -- the same file that works alone:
+``python plot.py <session>.h5 1D | 2D | -1`` (trace 1). Under Run, the
+Status box: the rig's numbers (state, piezo, junction, current, zero, file,
+Keithley) and the last message, in colour.
 
 The Piezo box is Igor's PiezoGroupbox: a slider over the piezo's whole
 voltage range (applies when the mouse is released, as Igor's did), Step
@@ -97,6 +100,7 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import plot as session_plots                     # noqa: E402  (plot.py, beside this file)
 from stmlab import analysis, approach, calibrate, plots, storage, trace   # noqa: E402
 from stmlab.actuator import ActuatorError                           # noqa: E402
 from stmlab.approach import ApproachError                           # noqa: E402
@@ -108,7 +112,7 @@ log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v52"
+__version__ = "v55"
 
 
 # --------------------------------------------------------------------------
@@ -1332,7 +1336,9 @@ def hist_window(win, session, stem: str, kind: str, tk, ttk, FigureCanvasTkAgg,
                 Figure, status) -> dict:
     """A window with one plot and the knobs that matter for it, applied on
     Redraw or Return; the matplotlib toolbar underneath gives zoom, pan and
-    Save. Returns the window's controls (for tests)."""
+    Save. The picture itself is plot.py's (hist_1d, hist_2d), the same one
+    ``python plot.py <file>.h5 1D`` draws. Returns the window's controls
+    (for tests)."""
     from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
 
     bar = ttk.Frame(win)
@@ -1373,13 +1379,7 @@ def hist_window(win, session, stem: str, kind: str, tk, ttk, FigureCanvasTkAgg,
         except ValueError:
             return default
 
-    cfg = session.cfg
-    traces = list(session.conductances())
-    n_samples = max((t.size for t in traces), default=0)
-    fs = float(session.scalar("sample_rate_hz")[0]) if len(session) else \
-        cfg.ramp.sample_rate_hz
-    disp = analysis.displacement_nm(n_samples, cfg.ramp, fs)
-    cache: dict = {}
+    data = session_plots.from_session(session, stem)
 
     if kind == "1d":
         entry(bar, "bins", "bins", 1000)
@@ -1407,71 +1407,28 @@ def hist_window(win, session, stem: str, kind: str, tk, ttk, FigureCanvasTkAgg,
         fig.clear()
         ax = fig.add_subplot(111)
         if kind == "1d":
-            bins = max(10, num("bins", 1000, int) or 1000)
-            x0, x1 = num("x0", -7.0) or -7.0, num("x1", 1.0) or 1.0
-            smooth = max(1, num("smooth", 11, int) or 11)
-            key = (bins, smooth)
-            if key not in cache:
-                cache[key] = analysis.log_histogram(traces, lo=-8.0, hi=2.0,
-                                                    n_bins=bins,
-                                                    smooth_width=smooth)
-            centres, counts = cache[key]
-            lw = num("lw", 1.2) or 1.2
-            color = ctl["color"].get().strip() or "k"
-            try:
-                ax.plot(centres, counts, color=color, lw=lw)
-                if ctl["fill"].get():
-                    ax.fill_between(centres, 0, counts, color=color, alpha=0.25)
-            except ValueError:
-                ax.plot(centres, counts, color="k", lw=lw)
-                note.config(text=f"'{color}' is not a colour name; drew black")
-            if ctl["logy"].get():
-                ax.set_yscale("log")
-            ax.set_xlim(x0, x1)
-            ax.set_xlabel("log10 (G / G0)")
-            ax.set_ylabel("counts per trace")
-            ax.set_title(f"{stem}: {len(traces)} traces", fontsize=10)
-            for g in (0.0, np.log10(2), np.log10(3), np.log10(4)):
-                ax.axvline(g, color="#999", lw=0.5, ls=":")
-            ax.grid(True, alpha=0.3)
-            peak = analysis.peak_position(centres, counts, around=0.0, window=0.4)
-            note.config(text=f"1 G0 peak at {peak:+.4f} decades; bins {bins}, "
-                             f"smooth {smooth} points")
+            x0, x1 = num("x0", -7.0), num("x1", 1.0)
+            info = session_plots.hist_1d(
+                ax, data,
+                bins=num("bins", 1000, int) or 1000,
+                smooth=num("smooth", 11, int) or 11,
+                xlim=(-7.0 if x0 is None else x0, 1.0 if x1 is None else x1),
+                lw=num("lw", 1.2) or 1.2,
+                color=ctl["color"].get().strip() or "k",
+                logy=ctl["logy"].get(), fill=ctl["fill"].get())
         else:
-            nx = max(10, num("nx", 200, int) or 200)
-            ny = max(10, num("ny", 300, int) or 300)
             x0, x1 = num("x0", -0.5), num("x1", 2.0)
             y0, y1 = num("y0", -7.0), num("y1", 1.0)
-            x0 = -0.5 if x0 is None else x0
-            x1 = 2.0 if x1 is None else x1
-            y0 = -7.0 if y0 is None else y0
-            y1 = 1.0 if y1 is None else y1
-            align = num("align", 0.5)
-            key = (nx, ny, x0, x1, y0, y1, align)
-            if key not in cache:
-                cache[key] = analysis.histogram_2d(
-                    traces, disp, align_at_g0=align, x_range=(x0, x1), n_x=nx,
-                    y_range=(y0, y1), n_y=ny)
-            counts, xe, ye = cache[key]
-            vmax = num("vmax", None)
-            cmap = ctl["cmap"].get().strip() or "viridis"
-            try:
-                im = ax.pcolormesh(xe, ye, counts.T, cmap=cmap, vmin=0,
-                                   vmax=vmax, shading="flat")
-            except ValueError:
-                im = ax.pcolormesh(xe, ye, counts.T, cmap="viridis", vmin=0,
-                                   vmax=vmax, shading="flat")
-                note.config(text=f"'{cmap}' is not a colormap; used viridis")
-            if ctl["cbar"].get():
-                fig.colorbar(im, ax=ax, label="counts per trace")
-            ax.set_xlabel("displacement (nm)" + ("" if align is None else
-                                                 f", 0 where G first < {align:g} G0"))
-            ax.set_ylabel("log10 (G / G0)")
-            ax.set_title(f"{stem}: {len(traces)} traces", fontsize=10)
-            if not note.cget("text").startswith("'"):
-                note.config(text=f"{nx} x {ny} bins; colour max "
-                                 f"{counts.max():.3g} counts per trace"
-                                 + (f" (shown up to {vmax:g})" if vmax else ""))
+            info = session_plots.hist_2d(
+                ax, data,
+                xbins=num("nx", 200, int) or 200,
+                ybins=num("ny", 300, int) or 300,
+                xlim=(-0.5 if x0 is None else x0, 2.0 if x1 is None else x1),
+                ylim=(-7.0 if y0 is None else y0, 1.0 if y1 is None else y1),
+                align=num("align", 0.5),
+                cmap=ctl["cmap"].get().strip() or "viridis",
+                vmax=num("vmax", None), colorbar=ctl["cbar"].get())
+        note.config(text=info["note"])
         fig.tight_layout()
         canvas.draw_idle()
 
@@ -2370,7 +2327,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     bb = ttk.LabelFrame(fb, text="A saved session: browse its traces, plot its histograms")
     bb.grid(row=10, column=0, columnspan=3, sticky="ew", padx=2, pady=(6, 2))
     browse = {"session": None, "path": None, "n": 0, "hist": None}
-    idx_var = tk.StringVar(value="0")
+    idx_var = tk.StringVar(value="1")          # traces count from 1, as plot.py's -1
 
     def open_file():
         path = filedialog.askopenfilename(initialdir=folder_var.get() or str(out_dir),
@@ -2396,7 +2353,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             blbl.config(text=f"{Path(path).name}: 0 traces")
             return
         browse.update(session=s, path=path, n=len(s), hist=None)
-        idx_var.set("0")
+        idx_var.set("1")
         blbl.config(text=f"{Path(path).name}: {len(s)} traces")
         show_saved()
 
@@ -2407,11 +2364,11 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         try:
             i = int(idx_var.get()) + delta
         except ValueError:
-            i = 0
-        i = max(0, min(i, browse["n"] - 1))
+            i = 1
+        i = max(1, min(i, browse["n"]))
         idx_var.set(str(i))
         live["paused"] = True
-        draw_saved(s, i)
+        draw_saved(s, i - 1)
 
     ttk.Button(bb, text="Open .h5 ...", command=open_file).grid(
         row=0, column=0, padx=2, pady=1, sticky="ew")
@@ -2431,10 +2388,10 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             set_status("open a saved session first")
             return
         try:
-            fig2, info = plots.figure_for_session(browse["path"],
-                                                  int(idx_var.get()))
+            number = int(idx_var.get())
+            fig2, info = session_plots.trace_figure(browse["path"], number)
             out = Path(browse["path"]).with_name(
-                f"{Path(browse['path']).stem}_trace{info['index']:04d}.png")
+                f"{Path(browse['path']).stem}_trace{info['number']:04d}.png")
             fig2.savefig(out, dpi=110)
         except Exception as exc:                 # noqa: BLE001
             set_status(f"PNG not written: {exc}")
@@ -2706,7 +2663,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
 
     def redraw_now():
         if live["paused"] and browse["session"] is not None:
-            draw_saved(browse["session"], int(idx_var.get()))
+            draw_saved(browse["session"], int(idx_var.get()) - 1)
         else:
             draw_live()
 
@@ -2721,7 +2678,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                   piezo=grid[1, 0], hist=grid[1, 1])
         fig.tight_layout(pad=2.0, w_pad=3.0)   # room for the right-hand axes
         if live["paused"] and browse["session"] is not None:
-            draw_saved(browse["session"], int(idx_var.get()))
+            draw_saved(browse["session"], int(idx_var.get()) - 1)
         else:
             live["dirty"] = True
             canvas.draw_idle()
@@ -2775,10 +2732,10 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         verdict = analysis.select_trace(g0, scfg.ramp)
         sense = s.piezo_sense(i, in_nm=False)
         plots.plot_record(ax["record"], scfg, np.stack([voltage, current]), fs,
-                          title=f"saved trace {i}: junction V and current "
+                          title=f"saved trace {i + 1}: junction V and current "
                                 f"(the file keeps the trace only)")
         plots.plot_trace(ax["trace"], scfg, g0, disp, verdict,
-                         title=f"saved trace {i}", sense_v=sense)
+                         title=f"saved trace {i + 1}", sense_v=sense)
         t = np.arange(voltage.size) / fs
         cmd = start_v - scfg.cal.nm_to_piezo_volts(disp)
         plots.plot_piezo(ax["piezo"], scfg, t, cmd, sense,
@@ -2787,7 +2744,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             browse["hist"] = analysis.log_histogram(s.conductances())
         plots.plot_histogram(ax["hist"], scfg, *browse["hist"], browse["n"],
                              title="histogram of the file")
-        banner.config(text=f"BROWSING {Path(browse['path']).name} trace {i}; "
+        banner.config(text=f"BROWSING {Path(browse['path']).name} trace {i + 1}; "
                            f"live plots paused")
         apply_limits()
         canvas.draw_idle()

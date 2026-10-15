@@ -108,6 +108,12 @@ def step_devices(cfg: RigConfig) -> int:
             ("ao1 junction bias", cfg.channels.path(cfg.channels.ao_bias), ao_names)):
         r.add(PASS if path in available else FAIL, label, path)
 
+    # The piezo sense line on the record's own card, when configured so.
+    if cfg.channels.sense_in_record:
+        sense_path = cfg.channels.piezo_sense_path
+        r.add(PASS if sense_path in ai_names else FAIL,
+              "piezo sense (in the record's task)", sense_path)
+
     # The second card and the piezo sense line, when configured. Inputs only,
     # so nothing here can move anything.
     low_res = cfg.channels.low_res_device

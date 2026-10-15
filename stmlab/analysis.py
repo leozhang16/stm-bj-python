@@ -347,21 +347,26 @@ def histogram_2d(traces, disp_nm: np.ndarray,
     each trace is shifted so that 0 nm is where its conductance first drops
     below ``align_at_g0`` (0.5 G0: the gold contact breaking), which is how
     the community draws these; ``None`` leaves 0 nm at the start of the
-    pull. Returns ``(counts, x_edges, y_edges)`` with counts per trace,
-    ``counts[i, j]`` for displacement bin i and log-conductance bin j.
+    pull. ``disp_nm`` is one displacement axis for every trace, or a list
+    of them, one per trace (files with different point spacings in one
+    histogram). Returns ``(counts, x_edges, y_edges)`` with counts per
+    trace, ``counts[i, j]`` for displacement bin i and log-conductance
+    bin j.
     """
     x_edges = np.linspace(x_range[0], x_range[1], n_x + 1)
     y_edges = np.linspace(y_range[0], y_range[1], n_y + 1)
     counts = np.zeros((n_x, n_y), dtype=float)
-    disp_nm = np.asarray(disp_nm, dtype=float)
+    per_trace = isinstance(disp_nm, (list, tuple))
+    if not per_trace:
+        disp_nm = np.asarray(disp_nm, dtype=float)
     n_used = 0
-    for trace in traces:
+    for k, trace in enumerate(traces):
         g0 = np.asarray(trace, dtype=float)
         if g0.size == 0:
             continue
         keep = max(1, int(g0.size * keep_fraction))
         g0 = boxcar(g0[:keep], smooth_width)
-        x = disp_nm[:keep]
+        x = np.asarray(disp_nm[k] if per_trace else disp_nm, dtype=float)[:keep]
         if align_at_g0 is not None:
             below = np.flatnonzero(g0 < align_at_g0)
             if below.size == 0:

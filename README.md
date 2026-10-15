@@ -2,6 +2,8 @@
 
 **The experiment:** `python pullout.py --config configs/labpc_rig.json` is the day-to-day pull-out program (simulate with `--simulate`); see its docstring and `rigtests/README.md`.
 
+**The data:** `python plot.py <session>.h5 1D` (conductance histogram), `2D` (against displacement), `-1` (trace 1; `-2` the second ...), nothing (both histograms); `--save` writes a PNG instead of opening a window; `python plot.py -h` lists the knobs. It reads this program's `.h5` and `.txt` files and Igor's own `.ibw` blocks (`pip install igor2`), mixed in one histogram if you like. The window's histogram windows draw through the same file.
+
 Everything the Igor procedures in `../igor_code/` could run, as one Python
 folder — **including the GUI**. This is `../python_code_entire_igor/`
 (the complete command-line translation: `stmlab/`, eight `experiments/`,
