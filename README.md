@@ -2,6 +2,8 @@
 
 **The experiment:** `python pullout.py --config configs/labpc_rig.json` is the day-to-day pull-out program (simulate with `--simulate`); see its docstring and `rigtests/README.md`.
 
+**The bench:** `python rigcheck.py` (or `--simulate`) is the hardware test window for a new rig: the card the driver sees with its details and self-test, any inputs read live with a scope trace, any outputs driven with a DC level or a sine or square wave under a voltage limit, the Keithley over GPIB, and the actuator with a click test that asks whether you heard it. Nothing in it is automatic; `python -m stmlab.main bringup 1..4` is the pass/fail version of the same checks.
+
 **The data:** `python plot.py <session>.h5 1D` (conductance histogram), `2D` (against displacement), `-1` (trace 1; `-2` the second ...), nothing (both histograms); `--save` writes a PNG instead of opening a window; `python plot.py -h` lists the knobs. It reads this program's `.h5` and `.txt` files and Igor's own `.ibw` blocks (`pip install igor2`), mixed in one histogram if you like. The window's histogram windows draw through the same file.
 
 Everything the Igor procedures in `../igor_code/` could run, as one Python
