@@ -49,7 +49,7 @@ if str(_ROOT) not in sys.path:
 from stmlab.config import RigConfig                                  # noqa: E402
 from stmlab.tklook import _light_window, windows_look                # noqa: E402
 
-__version__ = "v1"
+__version__ = "v2"
 log = logging.getLogger("rigcheck")
 
 TERMINALS = ("card default", "differential", "RSE", "NRSE")
@@ -472,10 +472,40 @@ def run(cfg: RigConfig, simulate: bool, autoclose: float | None = None,
     table = tk.Text(rb, width=70, height=9, font=("Courier", 10), relief="flat",
                     state="disabled", background=root.cget("background"))
     table.pack(fill="x", padx=4, pady=3)
+    # The scope's y axis: blank boxes follow the data, numbers pin it.
+    yb = ttk.Frame(right)
+    yb.pack(fill="x", pady=(6, 0))
+    ylo_var, yhi_var = tk.StringVar(value=""), tk.StringVar(value="")
+    ttk.Label(yb, text="y from").pack(side="left", padx=(4, 2))
+    ttk.Entry(yb, textvariable=ylo_var, width=7).pack(side="left")
+    ttk.Label(yb, text="to").pack(side="left", padx=2)
+    ttk.Entry(yb, textvariable=yhi_var, width=7).pack(side="left")
+    ttk.Label(yb, text="V   (blank: auto)").pack(side="left", padx=(2, 8))
+    ttk.Button(yb, text="Auto", command=lambda: (ylo_var.set(""), yhi_var.set(""),
+                                                 redraw_scope())).pack(side="left")
     fig = Figure(figsize=(7.2, 4.2), dpi=100)
     ax = fig.add_subplot(111)
     canvas = FigureCanvasTkAgg(fig, master=right)
-    canvas.get_tk_widget().pack(fill="both", expand=True, pady=(6, 0))
+    canvas.get_tk_widget().pack(fill="both", expand=True, pady=(4, 0))
+    last = {"burst": None}
+
+    def y_limits():
+        """(lo, hi) from the boxes, or None for auto; a half-filled or
+        backwards pair counts as auto."""
+        try:
+            lo = float(ylo_var.get()) if ylo_var.get().strip() else None
+            hi = float(yhi_var.get()) if yhi_var.get().strip() else None
+        except ValueError:
+            return None
+        if lo is None or hi is None or lo >= hi:
+            return None
+        return lo, hi
+
+    def redraw_scope(_e=None):
+        if last["burst"] is not None:
+            show_burst(*last["burst"])
+    for var in (ylo_var, yhi_var):
+        var.trace_add("write", lambda *_a: redraw_scope())
 
     def set_table(text: str):
         table.config(state="normal")
@@ -531,6 +561,7 @@ def run(cfg: RigConfig, simulate: bool, autoclose: float | None = None,
             say("input reading stopped")
 
     def show_burst(channels, data, rate):
+        last["burst"] = (channels, data, rate)
         lines = [f"{'channel':<10}{'mean V':>12}{'rms noise':>12}{'min V':>10}{'max V':>10}"]
         for ch, row in zip(channels, data):
             lines.append(f"{ch.split('/')[-1]:<10}{row.mean():>12.5f}{row.std():>12.5f}"
@@ -545,6 +576,9 @@ def run(cfg: RigConfig, simulate: bool, autoclose: float | None = None,
         ax.grid(True, alpha=0.3)
         ax.legend(loc="upper right", fontsize=8)
         ax.set_title("the last burst", fontsize=9)
+        lim = y_limits()
+        if lim is not None:
+            ax.set_ylim(*lim)
         canvas.draw_idle()
 
     def apply_outputs():
@@ -909,6 +943,7 @@ def run(cfg: RigConfig, simulate: bool, autoclose: float | None = None,
                                   k_do("zero check ON", lambda i: i.zero_check(True))))
         root.after(1600, lambda: (nb.select(at), find_ports(), a_connect(), a_move(False)))
         root.after(2600, lambda: nb.select(card))
+        root.after(2800, lambda: (ylo_var.set("-2"), yhi_var.set("3")))   # pinned y axis
         root.after(3600, show_details)
         root.after(int(autoclose * 1000), on_close)
     root.mainloop()
