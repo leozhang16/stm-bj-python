@@ -113,7 +113,7 @@ log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v58"
+__version__ = "v59"
 
 
 # --------------------------------------------------------------------------
@@ -901,7 +901,7 @@ class Worker(threading.Thread):
         ai0 and the record plot are all exercised on the real cards. The
         result is shown but never saved or counted: it is a hardware test,
         not data. (Igor's selector, reproduced here, would in fact *accept*
-        a never-engaged trace unless "require engaged start" is on.)
+        a never-engaged trace unless --require-engaged is given.)
         """
         if self.bias_dirty:
             self.cmd_bias()
@@ -2077,14 +2077,8 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         ent.grid(row=r, column=c + 1, padx=2, pady=1, sticky="w")
         ent.bind("<Return>", lambda _e: apply_settings())
         ent.bind("<FocusOut>", lambda _e: apply_settings())
-    req_var = tk.BooleanVar(value=False)
-    ttk.Checkbutton(sb, text="require engaged start (Igor: off)",
-                    variable=req_var,
-                    command=lambda: setattr(worker, "require_engaged",
-                                            req_var.get())).grid(
-        row=per_col, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 0))
     ttk.Button(sb, text="Apply", command=lambda: apply_settings()).grid(
-        row=per_col, column=2, sticky="w", padx=2, pady=(6, 0))
+        row=per_col, column=0, sticky="w", padx=6, pady=(6, 0))
     # How the two record inputs are wired, switched live: the card says
     # which modes it has (the worker asks it at start-up). RSE for a BNC
     # whose centre goes to the AI+ terminal and whose shield goes to AI GND

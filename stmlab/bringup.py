@@ -228,8 +228,8 @@ def step_timing(cfg: RigConfig) -> int:
         r.add(PASS if session.idle_behavior == "maintain" else CHECK,
               "AO idle behaviour",
               "MAINTAIN_EXISTING_VALUE" if session.idle_behavior == "maintain"
-              else "card refused MAINTAIN; outputs fall to 0 V between plays. "
-                   "Step 3 measures whether this matters.")
+              else "this card has no idle-output setting; step 3 measures "
+                   "whether it holds the piezo between plays anyway")
 
         retrig = getattr(session, "_retriggerable", None)
         r.add(PASS if retrig else CHECK, "retriggerable AI",

@@ -33,12 +33,21 @@ arrive faster than the consumer, which at one pull per second they do not.
 from __future__ import annotations
 
 import logging
+import warnings
 
 import numpy as np
 
 from .config import RigConfig
 
 log = logging.getLogger(__name__)
+
+# DAQmx warning 200010, "finite acquisition or generation has been stopped
+# before the requested number of samples", is what the driver says every
+# time this session stops an armed input task on purpose: switching between
+# the approach's short records and the pull's long one, or rebuilding the
+# task in another wiring mode. It is the expected sound of the design, not
+# a fault, and it would otherwise print a nine-line notice per step.
+warnings.filterwarnings("ignore", message=r"Warning 200010")
 
 
 class DaqError(RuntimeError):
@@ -141,13 +150,16 @@ class DaqSession:
                     AOIdleOutputBehavior.MAINTAIN_EXISTING_VALUE
             self.idle_behavior = "maintain"
         except Exception as exc:                      # device may not support
-            self.idle_behavior = "zero"
-            log.warning(
-                "card refused MAINTAIN_EXISTING_VALUE (%s). Outputs will fall "
-                "to 0 V in the gap between plays. 0 V is retracted on this "
-                "piezo so it is safe, but the approach will lose position "
-                "every step and each play starts with a mechanical kick. "
-                "Check this on a scope before trusting an approach.", exc)
+            # No such setting on this card. Most cards without it hold the
+            # last value anyway (the DAC simply keeps its register); a few
+            # drop to 0 V between plays, which would make the approach walk
+            # in place. Bring-up step 3 measures which this card is.
+            self.idle_behavior = "unknown"
+            log.info(
+                "this card has no AO idle-output setting (%s); whether it "
+                "holds the piezo between plays is what bring-up step 3 "
+                "measures (ao piezo looped to ai voltage)",
+                str(exc).splitlines()[0])
 
         self._open_ai()
 
