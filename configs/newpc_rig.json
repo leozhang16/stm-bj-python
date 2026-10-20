@@ -1,8 +1,8 @@
 {
   "channels": {
     "device": "Dev1",
-    "ao_piezo": "ao1",
-    "ao_bias": "ao2",
+    "ao_piezo": "ao2",
+    "ao_bias": "ao1",
     "ai_voltage": "ai1",
     "ai_current": "ai2",
     "ai_range_v": 10.0,
@@ -13,7 +13,8 @@
     "ai_piezo_sense": "ai3",
     "sense_device": "Dev1",
     "sense_ai_range_v": 10.0,
-    "sense_terminal": "default"
+    "sense_terminal": "rse",
+    "ai_terminal": "rse"
   },
   "limits": {
     "piezo_ao_min_v": 0.0,
@@ -141,5 +142,5 @@
     "max_v": 10.0
   },
   "simulate": false,
-  "notes": "new rig, NI USB-6453 (one card, 32 AI / 4 AO), config made 2026-10-15 from the program defaults. Wiring: piezo command ao1, bias ao2, junction voltage ai1, current ai2, piezo sense ai3 (sense_device Dev1: read in the record's own task). cal.piezo_nm_per_volt, cal.sense_nm_per_volt and keithley.series_resistance_ohm are the OLD rig's numbers until measured on this one. actuator.port: check Device Manager."
+  "notes": "new rig, NI USB-6453 (one card, 32 AI / 4 AO). Wiring: piezo command ao2, bias ao1, junction voltage ai1, current ai2, piezo sense ai3 (sense_device Dev1: read in the record's own task). All inputs RSE: BNC centre to the AI+ terminal, shield to AI GND or nowhere. cal.piezo_nm_per_volt, cal.sense_nm_per_volt and keithley.series_resistance_ohm are the OLD rig's numbers until measured on this one."
 }
