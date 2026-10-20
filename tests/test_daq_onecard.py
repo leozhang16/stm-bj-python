@@ -214,6 +214,7 @@ def test_the_simulator_switches_the_mode_and_the_config_follows():
         assert "rse" in rig.ai_terminal_modes()
         rig.set_ai_terminal("RSE")
         assert cfg.channels.ai_terminal == "rse"
+        assert cfg.channels.sense_terminal == "rse"       # same card: switched together
         rig.hold(n_samples=100)                       # still reads afterwards
         with pytest.raises(ValueError):
             rig.set_ai_terminal("sideways")
@@ -236,6 +237,22 @@ def test_daq_session_rebuilds_the_input_task_in_the_new_mode(fake_nidaqmx):
         assert second is not first
         assert [c.kw["terminal_config"] for c in second.ai_channels][:2] == [tc.RSE, tc.RSE]
         assert second.ai_channels.names == ["Dev1/ai1", "Dev1/ai2", "Dev1/ai3"]  # the sense rides along
+        assert second.ai_channels._objs[2].kw["terminal_config"] == tc.RSE      # in the same mode
+        assert cfg.channels.sense_terminal == "rse"
         assert cfg.channels.ai_terminal == "rse"
         record = s.play(np.zeros((2, 20)))            # timed again, still (2, n)
         assert record.shape == (2, 20) and s.last_sense_v.shape == (20,)
+
+
+def test_a_two_card_rig_keeps_its_own_sense_mode():
+    cfg = RigConfig()
+    cfg.channels.low_res_device = "dev2"               # the original layout
+    cfg.simulate = True
+    rig = Rig(cfg, session=SimulatedDaqSession(cfg, seed=4))
+    rig.open()
+    try:
+        rig.set_ai_terminal("rse")
+        assert cfg.channels.ai_terminal == "rse"
+        assert cfg.channels.sense_terminal == "default"   # the other card: untouched
+    finally:
+        rig.close()

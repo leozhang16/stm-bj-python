@@ -104,6 +104,8 @@ class SimulatedDaqSession:
         if str(name).lower() not in AI_TERMINALS:
             raise ValueError(f"terminal mode {name!r} is not one of {sorted(AI_TERMINALS)}")
         self.cfg.channels.ai_terminal = str(name).lower()
+        if self.cfg.channels.sense_in_record:
+            self.cfg.channels.sense_terminal = self.cfg.channels.ai_terminal
         self.ai_terminal_set.append(self.cfg.channels.ai_terminal)
 
     def ai_terminal_modes(self) -> list[str]:

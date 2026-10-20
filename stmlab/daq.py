@@ -47,7 +47,9 @@ log = logging.getLogger(__name__)
 # the approach's short records and the pull's long one, or rebuilding the
 # task in another wiring mode. It is the expected sound of the design, not
 # a fault, and it would otherwise print a nine-line notice per step.
-warnings.filterwarnings("ignore", message=r"Warning 200010")
+# (The driver's text begins with a line break, and a filter's pattern is
+# matched from the first character, hence the leading ".*".)
+warnings.filterwarnings("ignore", message=r"(?s).*Warning 200010")
 
 
 class DaqError(RuntimeError):
@@ -212,6 +214,10 @@ class DaqSession:
         piezo stays where it is."""
         name = str(name).lower()
         terminal_config(name)                       # a bad name fails here
+        if self.cfg.channels.sense_in_record:
+            # One card, one wiring: the sense line is switched with the
+            # record inputs (on a two-card rig it keeps its own setting).
+            self.cfg.channels.sense_terminal = name
         if self._ai is not None:
             try:
                 self._ai.stop()

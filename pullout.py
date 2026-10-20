@@ -113,7 +113,7 @@ log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v59"
+__version__ = "v61"
 
 
 # --------------------------------------------------------------------------
@@ -469,9 +469,12 @@ class Worker(threading.Thread):
             return
         self.rig.set_ai_terminal(name)
         self.cmd_newfile()                     # the next file carries the mode
-        self.status(f"inputs {', '.join(self.cfg.channels.ai_channels)} now in "
-                    f"{name} mode. To keep it, put \"ai_terminal\": \"{name}\" in "
-                    "the config's channels", level="ok")
+        m = self.cfg.channels
+        inputs = list(m.ai_channels) + ([m.piezo_sense_path] if m.sense_in_record else [])
+        keep = f'"ai_terminal": "{name}"' + (f', "sense_terminal": "{name}"'
+                                             if m.sense_in_record else "")
+        self.status(f"inputs {', '.join(inputs)} now in {name} mode. To keep it, "
+                    f"put {keep} in the config's channels", level="ok")
 
     def cmd_monitor(self) -> None:
         """One quiet 10 ms hold at the present position and bias, for the
@@ -2088,7 +2091,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     mode_frame = ttk.Frame(sb)
     mode_frame.grid(row=per_col + 1, column=0, columnspan=4, sticky="w", padx=6,
                     pady=(4, 0))
-    ttk.Label(mode_frame, text="Input mode (how ai voltage/current are wired)").pack(
+    ttk.Label(mode_frame, text="Input mode (how the inputs on this card are wired)").pack(
         side="left")
     ai_mode_var = tk.StringVar(value=MODE_WORDS.get(cfg.channels.ai_terminal.lower(),
                                                     cfg.channels.ai_terminal))

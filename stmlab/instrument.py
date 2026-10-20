@@ -110,7 +110,8 @@ class Rig:
 
     def set_ai_terminal(self, name: str) -> None:
         """Switch the record inputs' wiring mode (rse/nrse/diff/default)
-        live; the config follows, so the next file records it."""
+        live, and the sense line's with them when it is on the same card;
+        the config follows, so the next file records it."""
         self._session.set_ai_terminal(name)
 
     def ai_terminal_modes(self) -> list[str]:

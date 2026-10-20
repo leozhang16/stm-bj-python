@@ -221,7 +221,11 @@ def step_timing(cfg: RigConfig) -> int:
     the signal and its return, so a single cable makes both connections.
     """
     r = Result()
-    print("Wiring for this step: ao1 -> ai0, one BNC cable.\n")
+    m = cfg.channels
+    print(f"Wiring for this step: {m.path(m.ao_bias)} (bias out) -> "
+          f"{m.path(m.ai_voltage)} (voltage in): the centre to the AI+ terminal "
+          f"and, in differential mode, the shield to its AI- terminal "
+          f"(input mode now: {m.ai_terminal}).\n")
 
     with Rig(cfg) as rig:
         session = rig._session
@@ -274,7 +278,9 @@ def step_hold(cfg: RigConfig) -> int:
     and every step kicks the piezo from 0 V back up to where it was.
     """
     r = Result()
-    print("Wiring for this step: ao0 -> ai0, one BNC. Piezo NOT connected.\n")
+    m = cfg.channels
+    print(f"Wiring for this step: {m.path(m.ao_piezo)} (piezo out) -> "
+          f"{m.path(m.ai_voltage)} (voltage in). Piezo NOT connected.\n")
 
     probe_v = 4.0
     with Rig(cfg) as rig:
@@ -338,7 +344,7 @@ def step_preamp(cfg: RigConfig, resistance_ohm: float = 1e6) -> int:
 
     expected_v = calibrate.expected_resistor_v(cfg, resistance_ohm)
     print(f"At {cfg.ramp.bias_v * 1e3:.0f} mV through {resistance_ohm:.3g} "
-          f"ohm, expect {expected_v:.4f} V on ai1.\n")
+          f"ohm, expect {expected_v:.4f} V on {cfg.channels.path(cfg.channels.ai_current)}.\n")
 
     with Rig(cfg) as rig:
         zero = calibrate.measure_zero(rig)
@@ -474,8 +480,8 @@ def step_actuator(cfg: RigConfig, move: bool = False) -> int:
 
 STEPS = {
     1: ("devices", "no connections", step_devices),
-    2: ("timing", "BNC: ao1 -> ai0", step_timing),
-    3: ("output hold", "BNC: ao0 -> ai0", step_hold),
+    2: ("timing", "a loop: bias out -> voltage in", step_timing),
+    3: ("output hold", "a loop: piezo out -> voltage in", step_hold),
     4: ("preamp gain", "resistor at the preamp input", step_preamp),
     5: ("coarse actuator", "NanoPZ on USB", step_actuator),
 }
