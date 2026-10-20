@@ -355,7 +355,23 @@ class AgilisActuator(Actuator):
             self._pyvisa = None
 
         try:
-            rm = rm_factory(A.visa_backend or "")
+            try:
+                rm = rm_factory(A.visa_backend or "")
+            except Exception as exc:             # noqa: BLE001
+                # No NI-VISA on this PC. The pure-Python backend (pyvisa-py,
+                # over pyserial) drives a serial controller just as well, so
+                # use it when it is installed rather than stop here.
+                if A.visa_backend or "VISA implementation" not in str(exc):
+                    raise
+                try:
+                    rm = rm_factory("@py")
+                except Exception:                # noqa: BLE001
+                    raise ActuatorError(
+                        "no VISA on this PC: install NI-VISA (ni.com; the "
+                        "Keithley over GPIB needs it too), or for the actuator "
+                        "alone `pip install pyvisa-py` in the venv") from exc
+                log.info("NI-VISA not found; the Agilis is driven through "
+                         "pyvisa-py instead")
             self.inst = rm.open_resource(self.resource)
             self._configure()
         except ActuatorError:

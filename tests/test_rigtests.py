@@ -908,3 +908,29 @@ def test_an_applied_bias_reaches_the_output_at_once(ap, cfg, tmp_path):
     finally:
         worker.close_file()
         ap.close_rig(guard, rig)
+
+
+def test_agilis_falls_back_to_pyvisa_py_when_ni_visa_is_missing(cfg, monkeypatch):
+    """A PC without NI-VISA (the new lab PC, the first time): pyvisa's
+    default backend raises "Could not locate a VISA implementation"; the
+    driver then asks for "@py" and carries on. With neither, the message
+    names both ways out."""
+    from stmlab.actuator import AgilisActuator, ActuatorError
+    monkeypatch.setattr(AgilisActuator, "GAP_S", 0.0)
+    fake = FakeVisa()
+    asked = []
+
+    def rm_factory(backend):
+        asked.append(backend)
+        if backend == "":
+            raise ValueError("Could not locate a VISA implementation. Install "
+                             "either the IVI binary or pyvisa-py.")
+        return fake
+    act = AgilisActuator(cfg, port="COM4", rm_factory=rm_factory)
+    assert asked == ["", "@py"] and fake.resource == "ASRL4::INSTR"
+    assert act.identify()["version"] == "AG-UC2 v2.2.1"
+
+    def nothing(backend):
+        raise ValueError("Could not locate a VISA implementation.")
+    with pytest.raises(ActuatorError, match="install NI-VISA|pyvisa-py"):
+        AgilisActuator(cfg, port="COM4", rm_factory=nothing)

@@ -48,6 +48,7 @@ def run(cfg: RigConfig, out_path: Path, n_traces: int,
             rig.set_bias(cfg.ramp.bias_v)
 
             if coarse:
+                rig.connect_actuator()
                 approach.coarse_approach(rig, stop_flag=stop)
 
             if approach.recover_headroom(rig) is not RigState.ENGAGED:

@@ -113,7 +113,7 @@ log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v62"
+__version__ = "v64"
 
 
 # --------------------------------------------------------------------------

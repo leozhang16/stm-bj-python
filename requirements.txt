@@ -16,6 +16,8 @@ igor2>=0.5
 # nidaqmx>=0.9        # the PXI-4461 (and the low-res card if present)
 # pyserial>=3.5       # NanoPZ coarse actuator
 # pyvisa>=1.13        # Keithley 428 over GPIB (needs NI-488.2 or equivalent)
+#                     # and the Agilis actuator over its serial port (NI-VISA,
+#                     # or `pip install pyvisa-py` for the actuator alone)
 
 # Development
 pytest>=7.0

@@ -256,3 +256,24 @@ def test_a_two_card_rig_keeps_its_own_sense_mode():
         assert cfg.channels.sense_terminal == "default"   # the other card: untouched
     finally:
         rig.close()
+
+
+def test_a_rig_opens_without_touching_the_actuator_port():
+    """Bring-up, the piezo sweep and a pull need the card, not the actuator:
+    an Agilis in the config with no NI-VISA, no port, or Igor holding it
+    must not stop the rig from opening. The port opens on connect_actuator()."""
+    from stmlab.actuator import ActuatorError, UnconnectedActuator
+    cfg = RigConfig()
+    cfg.channels.device = "Dev1"
+    cfg.actuator.kind = "agilis"
+    cfg.actuator.port = "COM99"                        # nothing there
+    rig = Rig(cfg, session=SimulatedDaqSession(cfg, seed=1))
+    rig.open()                                         # no exception
+    try:
+        assert isinstance(rig.actuator, UnconnectedActuator)
+        with pytest.raises(ActuatorError):
+            rig.coarse_step(closer=False)              # a move says: connect first
+        with pytest.raises(ActuatorError):
+            rig.connect_actuator()                     # and connecting fails loudly
+    finally:
+        rig.close()

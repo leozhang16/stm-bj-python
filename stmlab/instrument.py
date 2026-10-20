@@ -51,16 +51,32 @@ class Rig:
                 from .daq import DaqSession
                 self._session = DaqSession(self.cfg).open()
 
-        if self._actuator is None:
-            from .actuator import make_actuator
-            # The simulated actuator moves the simulated surface, so a
-            # coarse approach on a laptop ends the way the real one does.
-            self._actuator = make_actuator(
-                self.cfg, rig_sim=self._session if self.cfg.simulate else None)
+        try:
+            if self._actuator is None:
+                from .actuator import make_actuator
+                # The actuator's port is NOT opened here: a rig opens for a
+                # bring-up step, a piezo sweep or a pull with no actuator in
+                # the room, and a serial port that is missing, held by Igor
+                # or without NI-VISA must not stop the card from being used.
+                # connect_actuator() opens it when a coarse move is wanted
+                # (the window's Connect, main.run --coarse). The simulated
+                # one is made at once: it moves the simulated surface, so a
+                # coarse approach on a laptop ends the way the real one does.
+                self._actuator = make_actuator(
+                    self.cfg, rig_sim=self._session if self.cfg.simulate else None,
+                    connect=False)
 
-        # Establish a known output state, and with it a truthful tracker.
-        self.piezo_goto(self.cfg.ramp.piezo_park_v)
-        self.state = RigState.RETRACTED
+            # Establish a known output state, and with it a truthful tracker.
+            self.piezo_goto(self.cfg.ramp.piezo_park_v)
+            self.state = RigState.RETRACTED
+        except Exception:
+            # Leave no task reserved on the card behind a failed open.
+            try:
+                self._session.close()
+            except Exception:
+                pass
+            self._session = None
+            raise
 
         rate = self.sample_rate_hz
         if self.cfg.cal.granted_sample_rate_hz is None:
@@ -275,6 +291,18 @@ class Rig:
                     >= fraction)
 
     # -- coarse actuator --------------------------------------------------
+
+    def connect_actuator(self):
+        """Open the configured actuator's port now (the placeholder from
+        open() is replaced). Returns the actuator; raises ActuatorError when
+        the port cannot be opened."""
+        from .actuator import make_actuator
+        if getattr(self._actuator, "connected", False):
+            return self._actuator                   # already open
+        act = make_actuator(self.cfg, rig_sim=self._session if self.cfg.simulate
+                            else None, connect=True)
+        self.attach_actuator(act)
+        return act
 
     def attach_actuator(self, actuator) -> None:
         """Swap the actuator in (Connect in the window): the placeholder or
