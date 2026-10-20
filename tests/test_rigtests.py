@@ -884,3 +884,27 @@ def test_headless_cycles_save_and_export(ap, cfg, tmp_path):
     traces, params = storage.split_igor_block(storage.load_ibw(ibw[0]))
     assert traces.shape == (worker.accepted, cfg.ramp.n_pull_samples)
     assert np.all(params[:, 10] == pytest.approx(cfg.ramp.bias_v * 1e3))
+
+
+def test_an_applied_bias_reaches_the_output_at_once(ap, cfg, tmp_path):
+    """The window's Apply sends "bias" after "newfile", so the output and
+    the readout show the new bias without waiting for the next move."""
+    guard, rig = ap.open_rig(cfg)
+    mon = ap.Monitor(rig)
+    worker = ap.Worker(cfg, rig, mon, save=False, out_dir=tmp_path,
+                       igor_export=False)
+    try:
+        worker.cmd_bias()
+        assert rig.bias_v == pytest.approx(cfg.ramp.bias_v)
+        cfg.ramp.bias_v = 0.15                           # what Apply does ...
+        worker.bias_dirty = True
+        worker.cmd_newfile()
+        worker.cmd_bias()                                # ... and then sends
+        assert rig.bias_v == pytest.approx(0.15)
+        worker.readout()
+        readouts = [p for k, p in list(worker.events.queue) if k == "readout"]
+        assert readouts and readouts[-1]["bias_mv"] == pytest.approx(150.0)
+        assert not worker.bias_dirty
+    finally:
+        worker.close_file()
+        ap.close_rig(guard, rig)

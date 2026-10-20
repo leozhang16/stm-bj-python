@@ -113,7 +113,7 @@ log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v61"
+__version__ = "v62"
 
 
 # --------------------------------------------------------------------------
@@ -2186,9 +2186,12 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         for path, value in changes.items():
             _set(cfg, path, value)
             applied["values"][path] = value
-        if "ramp.bias_v" in changes:
-            worker.bias_dirty = True
         worker.send("newfile")                     # the config travels with the data
+        if "ramp.bias_v" in changes:
+            # Put the new bias on the output now, so the readout and the
+            # junction show it at once rather than at the next move.
+            worker.bias_dirty = True
+            worker.send("bias")
         names = ", ".join(labels[p] for p in changes)
         if warnings:
             verdict(f"applied {names}; warning: " + " | ".join(warnings), "#b06000")
