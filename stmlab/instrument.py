@@ -108,6 +108,16 @@ class Rig:
 
     # -- the funnel -------------------------------------------------------
 
+    def set_ai_terminal(self, name: str) -> None:
+        """Switch the record inputs' wiring mode (rse/nrse/diff/default)
+        live; the config follows, so the next file records it."""
+        self._session.set_ai_terminal(name)
+
+    def ai_terminal_modes(self) -> list[str]:
+        """The input modes this card offers, "default" first."""
+        fn = getattr(self._session, "ai_terminal_modes", None)
+        return fn() if fn else ["default"]
+
     def play(self, waveform: np.ndarray) -> np.ndarray:
         """Output a waveform, capture the inputs, and update the tracker.
 

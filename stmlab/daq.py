@@ -45,18 +45,42 @@ class DaqError(RuntimeError):
     pass
 
 
-def sense_terminal_config(m):
-    """ChannelMap.sense_terminal -> nidaqmx TerminalConfiguration."""
+TERMINAL_NAMES = {"default": "DEFAULT", "rse": "RSE", "nrse": "NRSE", "diff": "DIFF"}
+
+
+def terminal_config(name: str):
+    """A ChannelMap terminal spelling -> nidaqmx TerminalConfiguration."""
     from nidaqmx.constants import TerminalConfiguration as TC
-    names = {"default": "DEFAULT", "rse": "RSE", "nrse": "NRSE", "diff": "DIFF"}
-    key = names.get(m.sense_terminal.lower())
+    key = TERMINAL_NAMES.get(str(name).lower())
     if key is None:
-        raise DaqError(f"channels.sense_terminal {m.sense_terminal!r} is not "
-                       f"one of {sorted(names)}")
+        raise DaqError(f"terminal mode {name!r} is not one of {sorted(TERMINAL_NAMES)}")
     member = getattr(TC, key, None)
     if member is None and key == "DIFF":        # older nidaqmx spelling
         member = getattr(TC, "DIFFERENTIAL")
     return member
+
+
+def sense_terminal_config(m):
+    """ChannelMap.sense_terminal -> nidaqmx TerminalConfiguration."""
+    return terminal_config(m.sense_terminal)
+
+
+def device_terminal_modes(device: str) -> list[str]:
+    """The input terminal modes a card offers, in this package's spellings
+    ("rse", "nrse", "diff"), "default" first. A card that will not say
+    gets all three."""
+    from nidaqmx.constants import TerminalConfiguration as TC
+    import nidaqmx.system
+    modes = ["default"]
+    try:
+        offered = nidaqmx.system.System.local().devices[device].ai_term_cfgs
+    except Exception:                                 # noqa: BLE001
+        return modes + ["rse", "nrse", "diff"]
+    for ours, theirs in (("rse", "RSE"), ("nrse", "NRSE"), ("diff", "DIFF")):
+        member = getattr(TC, theirs, None) or getattr(TC, "DIFFERENTIAL", None)
+        if member in offered:
+            modes.append(ours)
+    return modes
 
 
 class DaqSession:
@@ -125,22 +149,11 @@ class DaqSession:
                 "every step and each play starts with a mechanical kick. "
                 "Check this on a scope before trusting an approach.", exc)
 
-        self._ai = nidaqmx.Task("stmbj_ai")
-        for chan in m.ai_channels:
-            self._ai.ai_channels.add_ai_voltage_chan(
-                chan, min_val=-m.ai_range_v, max_val=m.ai_range_v)
+        self._open_ai()
 
         sense_path = m.piezo_sense_path
         if sense_path is not None and m.sense_in_record:
-            # One card: the sense line is a third input of the record's own
-            # task, sampled on the record's clock. Nothing to synchronise.
-            self._ai.ai_channels.add_ai_voltage_chan(
-                sense_path, terminal_config=sense_terminal_config(m),
-                min_val=-m.sense_ai_range_v, max_val=m.sense_ai_range_v)
-            self._sense_in_record = True
-            self.sense_sync = "hardware"
-            log.info("piezo sense readback on %s (%s), in the record's task",
-                     sense_path, m.sense_terminal)
+            pass                                     # in the record's task above
         elif sense_path is not None:
             # Two cards: the sense line lives on the other card, so it cannot
             # join the task above (a DSA card and an X-series card never
@@ -155,6 +168,54 @@ class DaqSession:
         # Timing and triggering are deferred to configure(), which the first
         # play() calls with the record length it needs.
         return self
+
+    def _open_ai(self) -> None:
+        """The record's input task: the two record inputs in the terminal
+        mode the config names, plus the sense line when it is on this card."""
+        import nidaqmx
+        m = self.cfg.channels
+        self._ai = nidaqmx.Task("stmbj_ai")
+        for chan in m.ai_channels:
+            self._ai.ai_channels.add_ai_voltage_chan(
+                chan, terminal_config=terminal_config(m.ai_terminal),
+                min_val=-m.ai_range_v, max_val=m.ai_range_v)
+        log.info("record inputs %s in terminal mode %s", ", ".join(m.ai_channels),
+                 m.ai_terminal)
+        sense_path = m.piezo_sense_path
+        if sense_path is not None and m.sense_in_record:
+            # One card: the sense line is a third input of the record's own
+            # task, sampled on the record's clock. Nothing to synchronise.
+            self._ai.ai_channels.add_ai_voltage_chan(
+                sense_path, terminal_config=sense_terminal_config(m),
+                min_val=-m.sense_ai_range_v, max_val=m.sense_ai_range_v)
+            self._sense_in_record = True
+            self.sense_sync = "hardware"
+            log.info("piezo sense readback on %s (%s), in the record's task",
+                     sense_path, m.sense_terminal)
+
+    def set_ai_terminal(self, name: str) -> None:
+        """Switch the record inputs' terminal mode now: the input task is
+        rebuilt (a channel's wiring mode is fixed when its task is made) and
+        timed again on the next play. The outputs are not touched, so the
+        piezo stays where it is."""
+        name = str(name).lower()
+        terminal_config(name)                       # a bad name fails here
+        if self._ai is not None:
+            try:
+                self._ai.stop()
+            except Exception:
+                pass
+            try:
+                self._ai.close()
+            except Exception:
+                pass
+            self._ai = None
+        self.cfg.channels.ai_terminal = name
+        self._open_ai()
+        self._n = 0                                 # configure() again next play
+
+    def ai_terminal_modes(self) -> list[str]:
+        return device_terminal_modes(self.cfg.channels.device)
 
     def close(self) -> None:
         for task in (self._sense, self._ai, self._ao):

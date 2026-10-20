@@ -108,6 +108,16 @@ def step_devices(cfg: RigConfig) -> int:
             ("ao1 junction bias", cfg.channels.path(cfg.channels.ao_bias), ao_names)):
         r.add(PASS if path in available else FAIL, label, path)
 
+    try:
+        from .daq import device_terminal_modes
+        modes = device_terminal_modes(cfg.channels.device)
+        r.add(PASS if cfg.channels.ai_terminal.lower() in modes else FAIL,
+              "input wiring mode",
+              f"config says {cfg.channels.ai_terminal!r}; the card offers "
+              f"{', '.join(modes)}")
+    except Exception as exc:                                  # noqa: BLE001
+        r.add(CHECK, "input wiring mode", f"could not ask the card: {exc}")
+
     # The piezo sense line on the record's own card, when configured so.
     if cfg.channels.sense_in_record:
         sense_path = cfg.channels.piezo_sense_path

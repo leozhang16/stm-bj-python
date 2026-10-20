@@ -190,3 +190,52 @@ def test_daq_session_keeps_a_separate_task_on_two_cards(fake_nidaqmx):
         assert sense.ai_channels.names == ["dev2/ai2"]
         record = s.play(np.zeros((2, 20)))
         assert record.shape == (2, 20) and s.last_sense_v.shape == (20,)
+
+
+# --------------------------------------------------------------------------
+# The record inputs' wiring mode: channels.ai_terminal, switched live
+# --------------------------------------------------------------------------
+
+def test_ai_terminal_is_checked_by_validate():
+    from stmlab.config import ConfigError, validate
+    cfg = RigConfig()
+    cfg.channels.ai_terminal = "rse"
+    validate(cfg)
+    cfg.channels.ai_terminal = "sideways"
+    with pytest.raises(ConfigError):
+        validate(cfg)
+
+
+def test_the_simulator_switches_the_mode_and_the_config_follows():
+    cfg = _one_card_with_sense()
+    rig = Rig(cfg, session=SimulatedDaqSession(cfg, seed=2))
+    rig.open()
+    try:
+        assert "rse" in rig.ai_terminal_modes()
+        rig.set_ai_terminal("RSE")
+        assert cfg.channels.ai_terminal == "rse"
+        rig.hold(n_samples=100)                       # still reads afterwards
+        with pytest.raises(ValueError):
+            rig.set_ai_terminal("sideways")
+    finally:
+        rig.close()
+
+
+def test_daq_session_rebuilds_the_input_task_in_the_new_mode(fake_nidaqmx):
+    from stmlab.daq import DaqSession
+    cfg = _one_card_with_sense()
+    cfg.simulate = False
+    cfg.channels.ai_terminal = "default"
+    with DaqSession(cfg) as s:
+        first = next(t for t in FakeTask.made if t.name == "stmbj_ai")
+        tc = fake_nidaqmx.constants.TerminalConfiguration
+        assert [c.kw["terminal_config"] for c in first.ai_channels][:2] == [tc.DEFAULT, tc.DEFAULT]
+        s.play(np.zeros((2, 20)))
+        s.set_ai_terminal("rse")
+        second = [t for t in FakeTask.made if t.name == "stmbj_ai"][-1]
+        assert second is not first
+        assert [c.kw["terminal_config"] for c in second.ai_channels][:2] == [tc.RSE, tc.RSE]
+        assert second.ai_channels.names == ["Dev1/ai1", "Dev1/ai2", "Dev1/ai3"]  # the sense rides along
+        assert cfg.channels.ai_terminal == "rse"
+        record = s.play(np.zeros((2, 20)))            # timed again, still (2, n)
+        assert record.shape == (2, 20) and s.last_sense_v.shape == (20,)

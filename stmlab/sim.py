@@ -45,6 +45,7 @@ class SimulatedDaqSession:
         self.rng = np.random.default_rng(seed)
         self.granted_rate_hz = cfg.ramp.sample_rate_hz
         self.idle_behavior = "maintain"
+        self.ai_terminal_set: list[str] = []      # every live switch, for tests
         self._retriggerable = True      # the fake card is an obliging one
 
         self.group_delay = int(group_delay_samples)
@@ -97,6 +98,16 @@ class SimulatedDaqSession:
     @property
     def effective_rate_hz(self) -> float:
         return self.granted_rate_hz
+
+    def set_ai_terminal(self, name: str) -> None:
+        from .config import AI_TERMINALS
+        if str(name).lower() not in AI_TERMINALS:
+            raise ValueError(f"terminal mode {name!r} is not one of {sorted(AI_TERMINALS)}")
+        self.cfg.channels.ai_terminal = str(name).lower()
+        self.ai_terminal_set.append(self.cfg.channels.ai_terminal)
+
+    def ai_terminal_modes(self) -> list[str]:
+        return ["default", "rse", "nrse", "diff"]
 
     def play(self, waveform: np.ndarray, timeout_s: float = 10.0) -> np.ndarray:
         waveform = np.asarray(waveform, dtype=float)

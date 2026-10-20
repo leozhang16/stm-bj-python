@@ -124,6 +124,8 @@ class RealDaq:
             lambda x: f"{x:,.0f} S/s")
         row("AI max rate, many channels", lambda: d.ai_max_multi_chan_rate,
             lambda x: f"{x:,.0f} S/s (aggregate)")
+        row("AI terminal modes", lambda: d.ai_term_cfgs,
+            lambda t: ", ".join(str(x).split(".")[-1] for x in t))
         row("AI voltage ranges", lambda: d.ai_voltage_rngs,
             lambda r: ", ".join(f"{r[i]:g}..{r[i + 1]:g} V" for i in range(0, len(r), 2)))
         row("AO channels", lambda: len(d.ao_physical_chans))

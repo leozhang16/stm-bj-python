@@ -43,9 +43,10 @@ class ConfigError(Exception):
 # Channels
 # --------------------------------------------------------------------------
 
-# Accepted spellings of ChannelMap.sense_terminal, mapped to DAQmx's
-# TerminalConfiguration names in daq.py.
+# Accepted spellings of ChannelMap.ai_terminal and sense_terminal, mapped to
+# DAQmx's TerminalConfiguration names in daq.py.
 SENSE_TERMINALS = {"default", "rse", "nrse", "diff"}
+AI_TERMINALS = SENSE_TERMINALS
 
 
 @dataclass
@@ -103,6 +104,13 @@ class ChannelMap:
     # slow drift that follows nothing; if the readback ignores the command,
     # try "rse" before suspecting the cable.
     sense_terminal: str = "default"
+    # How the two record inputs (junction voltage, current) are wired:
+    # "default" (the card's own default: pseudo-differential on the
+    # PXI-4461, differential on a USB-6453), "rse", "nrse" or "diff". A BNC
+    # whose centre goes to the AI+ terminal and whose shield goes to AI GND
+    # (or nowhere, with a grounded source) is "rse"; centre to AI+ and shield
+    # to AI- is "diff". The window can switch this live (Settings tab).
+    ai_terminal: str = "default"
 
     # Row indices into the (2, n) arrays that cross the DAQ boundary. ClassVar
     # so they stay out of asdict() and therefore out of the data files: they
@@ -828,7 +836,13 @@ def validate(cfg: RigConfig) -> list[str]:
     if A.scan_step_nm <= 0:
         problems.append("actuator.scan_step_nm must be positive")
 
-    # Piezo sense readback: only checked on a two-card rig that reads it.
+    # The record inputs' wiring mode, on every rig.
+    if M.ai_terminal.lower() not in AI_TERMINALS:
+        raise ConfigError(
+            f"channels.ai_terminal must be one of {sorted(AI_TERMINALS)}, "
+            f"not {M.ai_terminal!r}")
+
+    # Piezo sense readback: only checked on a rig that reads it.
     if M.has_piezo_sense:
         if C.sense_nm_per_volt <= 0:
             problems.append("cal.sense_nm_per_volt must be positive")

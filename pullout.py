@@ -113,7 +113,7 @@ log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v57"
+__version__ = "v58"
 
 
 # --------------------------------------------------------------------------
@@ -452,6 +452,26 @@ class Worker(threading.Thread):
 
     def cmd_noop(self) -> None:
         return
+
+    def cmd_ai_modes(self) -> None:
+        """Tell the window which input wiring modes this card offers and
+        which one is in use (the Settings tab's Input mode box)."""
+        self.post("ai_modes", modes=self.rig.ai_terminal_modes(),
+                  current=self.cfg.channels.ai_terminal.lower())
+
+    def cmd_ai_terminal(self, name: str) -> None:
+        """Switch the record inputs' wiring mode live: the input task is
+        rebuilt, the piezo and bias stay where they are, the next file
+        carries the new mode in its header."""
+        if self.rig.state is RigState.ENGAGED:
+            self.status("input mode refused: the tip is in contact; step apart "
+                        "first (the inputs are rebuilt, and a reading is lost)")
+            return
+        self.rig.set_ai_terminal(name)
+        self.cmd_newfile()                     # the next file carries the mode
+        self.status(f"inputs {', '.join(self.cfg.channels.ai_channels)} now in "
+                    f"{name} mode. To keep it, put \"ai_terminal\": \"{name}\" in "
+                    "the config's channels", level="ok")
 
     def cmd_monitor(self) -> None:
         """One quiet 10 ms hold at the present position and bias, for the
@@ -2065,12 +2085,39 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         row=per_col, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 0))
     ttk.Button(sb, text="Apply", command=lambda: apply_settings()).grid(
         row=per_col, column=2, sticky="w", padx=2, pady=(6, 0))
+    # How the two record inputs are wired, switched live: the card says
+    # which modes it has (the worker asks it at start-up). RSE for a BNC
+    # whose centre goes to the AI+ terminal and whose shield goes to AI GND
+    # or nowhere; differential for centre to AI+ and shield to AI-.
+    MODE_WORDS = {"default": "card default", "rse": "RSE (single-ended)",
+                  "nrse": "NRSE", "diff": "differential"}
+    mode_frame = ttk.Frame(sb)
+    mode_frame.grid(row=per_col + 1, column=0, columnspan=4, sticky="w", padx=6,
+                    pady=(4, 0))
+    ttk.Label(mode_frame, text="Input mode (how ai voltage/current are wired)").pack(
+        side="left")
+    ai_mode_var = tk.StringVar(value=MODE_WORDS.get(cfg.channels.ai_terminal.lower(),
+                                                    cfg.channels.ai_terminal))
+    ai_mode_box = ttk.Combobox(mode_frame, textvariable=ai_mode_var, width=18,
+                               state="readonly", values=tuple(MODE_WORDS.values()))
+    ai_mode_box.pack(side="left", padx=4)
+
+    def on_ai_mode(_e=None):
+        name = next((k for k, v in MODE_WORDS.items() if v == ai_mode_var.get()),
+                    "default")
+        worker.send("ai_terminal", name)
+    ai_mode_box.bind("<<ComboboxSelected>>", on_ai_mode)
+
+    def show_ai_modes(p: dict):
+        ai_mode_box.config(values=tuple(MODE_WORDS[m] for m in p["modes"]
+                                        if m in MODE_WORDS))
+        ai_mode_var.set(MODE_WORDS.get(p["current"], p["current"]))
     # The safety check, in its own box and large. Every value is tried on a
     # copy of the config as it is typed -- green when it would be accepted,
     # red with the reason when not -- and applied on Enter, Apply or
     # leaving the box.
     cb = ttk.LabelFrame(sb, text="Safety check")
-    cb.grid(row=per_col + 1, column=0, columnspan=4, sticky="ew", padx=4,
+    cb.grid(row=per_col + 2, column=0, columnspan=4, sticky="ew", padx=4,
             pady=(8, 2))
     smsg = tk.Label(cb, text="all settings as loaded", font=("Arial", 11, "bold"),
                     wraplength=px(540), justify="left", anchor="w", fg="#006000")
@@ -2719,6 +2766,8 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                 live["dirty"] = True
             elif kind == "keithley":
                 show_keithley(p)
+            elif kind == "ai_modes":
+                show_ai_modes(p)
             elif kind == "paused":
                 set_continue(bool(p["remaining"]))
             elif kind == "actuator":
@@ -2870,6 +2919,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                                      root.winfo_screenheight() - 170))
 
     worker.send("noop")                              # first readout
+    worker.send("ai_modes")                          # the card's input modes
     root.after(150, poll)
     if readback:
         root.after(400, open_readback)
@@ -2888,6 +2938,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         root.after(4500, lambda: (nb.select(sb), left_canvas.yview_moveto(1.0),
                                   svars["ramp.bias_v"].set("900")))
         root.after(6500, lambda: svars["ramp.bias_v"].set("150"))
+        root.after(6700, lambda: (ai_mode_var.set(MODE_WORDS["rse"]), on_ai_mode()))
         # The coarse approach on the simulated actuator: Connect, then
         # Start approach (lands, backs off one step), then a piezo Approach.
         root.after(6900, lambda: (mode_var.set("actuator"), show_mode(),
