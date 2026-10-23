@@ -18,3 +18,6 @@ manual_build/*.toc
 # Operating-system clutter
 .DS_Store
 Thumbs.db
+
+# Igor: outputs of the Mac-side test harness, regenerated on each run
+Igor_for_New_DAQ/tests/_generated/

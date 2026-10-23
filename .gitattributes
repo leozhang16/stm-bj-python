@@ -2,3 +2,7 @@
 *.pdf binary
 *.png binary
 *.h5 binary
+
+# Igor Pro procedures: always Windows line endings on checkout (the lab PC runs Igor on Windows)
+*.ipf text eol=crlf
+*.xop binary
