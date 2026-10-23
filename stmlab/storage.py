@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -256,6 +257,34 @@ class Session:
 # Igor interoperability
 # --------------------------------------------------------------------------
 
+# Igor's DateTime counts seconds from 1904-01-01 00:00, Unix time from
+# 1970-01-01 00:00: the two epochs are 24107 days apart.
+IGOR_EPOCH_OFFSET = 2082844800
+
+
+def igor_datetime(unix: float) -> float:
+    """Igor's ``DateTime`` for a Unix time: seconds since 1904-01-01 in
+    **local** time, which is how Igor keeps it, both in the IBW header's
+    creation and modification dates and in the lab's ``PullOutTime``
+    parameter. Checked on the July 2026 files: the header's ``modDate`` is
+    ``mtime + 2082844800 - 14400``, 14400 s being EDT's offset from UTC.
+    The offset applied is the one in force at ``unix`` itself (standard or
+    daylight time), from ``time.localtime``."""
+    unix = float(unix)
+    return unix + IGOR_EPOCH_OFFSET + time.localtime(unix).tm_gmtoff
+
+
+def unix_from_igor_datetime(x: float) -> float:
+    """The Unix time of an Igor ``DateTime`` (local seconds since 1904):
+    the inverse of :func:`igor_datetime`. The UTC offset is the one in
+    force at that moment, found with one correction step, so a stamp
+    inside the hour a daylight-time switch repeats or skips is right to
+    within that hour and every other stamp exactly."""
+    local = float(x) - IGOR_EPOCH_OFFSET          # local clock seconds since 1970
+    unix = local - time.localtime(local).tm_gmtoff
+    return local - time.localtime(unix).tm_gmtoff
+
+
 def load_ibw(path: str | Path) -> np.ndarray:
     """Load an Igor binary wave. Needs ``igor2``.
 
@@ -279,10 +308,14 @@ def load_igor_block(path: str | Path) -> dict:
     has none), ``x0_nm``, ``name`` and ``note``.
 
     A SavePullOut block ends every column with two blank points and the 20
-    parameters; that tail is recognised by its two blank rows. A wave
-    without it (a single trace, or a block cut by hand) is taken whole.
+    parameters. Igor's blank points are exactly 0 (``Redimension`` fills
+    with 0); this package's legacy ``_bNNN`` export wrote NaN there. Both
+    are recognised, by :func:`igor_scheme.split_block`, and only the
+    filled columns (traces actually taken) are returned. A wave without
+    the tail (a single trace, or a block cut by hand) is taken whole.
     """
     from igor2 import binarywave
+    from . import igor_scheme
     w = binarywave.load(str(path))["wave"]
     block = np.asarray(w["wData"], dtype=float)
     header = w["wave_header"]
@@ -290,11 +323,11 @@ def load_igor_block(path: str | Path) -> dict:
         block = block[:, None]
     elif block.ndim != 2:
         raise ValueError(f"{path}: a {block.ndim}-D wave is not a block of traces")
-    n_rows = block.shape[0]
-    tail = 2 + IGOR_PARAMETER_SLOTS
     parameters = None
-    if n_rows > tail and np.isnan(block[n_rows - tail:n_rows - tail + 2, :]).all():
-        traces_2d, parameters = split_igor_block(block, IGOR_PARAMETER_SLOTS)
+    if igor_scheme.has_parameter_tail(block):
+        g0_all, params_all, filled = igor_scheme.split_block(block)
+        traces_2d = g0_all[:, filled].T
+        parameters = params_all[filled]
     else:
         traces_2d = block.T
     traces = [np.asarray(t, dtype=float) for t in traces_2d]
@@ -356,8 +389,7 @@ def write_ibw(path: str | Path, name: str, data: np.ndarray,
         n_dim[1] = int(data.shape[1])
     npnts = int(data.size)
     note_bytes = note.encode("utf-8")
-    igor_epoch = 2082844800                       # 1904-01-01 -> 1970-01-01
-    now = int(time.time()) + igor_epoch
+    now = int(igor_datetime(time.time()))         # Igor's local-time DateTime
 
     def units(s: str) -> bytes:
         s = s.encode("ascii", "ignore")
@@ -420,10 +452,30 @@ def write_ibw(path: str | Path, name: str, data: np.ndarray,
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as fh:
-        fh.write(head)
-        fh.write(payload)
-        fh.write(note_bytes)
+    # Write beside the target and rename onto it. ``os.replace`` is atomic
+    # on every platform Python runs on, so a crash, a full disk or a NAS
+    # that goes away mid-write never leaves a torn block under the real
+    # name, and a reader (plot.py, Igor, the next run's folder scan) never
+    # sees a half-written file. The ``.tmp`` name is not an ``.ibw``, so
+    # the folder scan ignores it.
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(head)
+            fh.write(payload)
+            fh.write(note_bytes)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass                 # some network mounts refuse it; the rename still is atomic
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -453,7 +505,7 @@ def igor_parameters(cfg: RigConfig, start_piezo_v: float = 0.0,
     p[15] = 0.0                                    # Vzero
     p[16] = 0.0                                    # Izero (Find Offset result)
     t = time.time() if timestamp is None else timestamp
-    p[17] = t + 2082844800                         # Igor datetime (from 1904)
+    p[17] = igor_datetime(t)                       # Igor DateTime: local s from 1904
     p[18] = cfg.echem.gate_mv                      # gate voltage
     p[19] = K.suppress_const                       # current suppress
     return p
@@ -464,11 +516,17 @@ def save_igor_block(path: str | Path, cfg: RigConfig, traces_g0,
                     name: str | None = None) -> Path:
     """Write conductance traces as one Igor block, Igor's SavePullOut layout.
 
-    One column per trace: the conductance in G0, two blank points (NaN),
-    then the 20 parameters. Loads straight into Igor and into the analysis
-    procedures that expect ``PullOut`` blocks; :func:`load_ibw` +
-    :func:`split_igor_block` read it back here. Single precision, as Igor's
-    waves were. ``name`` defaults to the file's stem.
+    **Legacy.** This is the old ``_bNNN`` export; new data goes through
+    :mod:`stmlab.igor_scheme` (``IgorDayWriter``), which writes Igor's
+    exact day-folder scheme (100-trace blocks, zero blank rows, the
+    companion blocks, the resume). Kept for the old tests and for reading
+    old exports back.
+
+    One column per trace: the conductance in G0, two blank points (NaN,
+    where Igor itself wrote 0), then the 20 parameters. Loads into Igor and
+    into the analysis procedures that expect ``PullOut`` blocks;
+    :func:`load_ibw` + :func:`split_igor_block` read it back here. Single
+    precision, as Igor's waves were. ``name`` defaults to the file's stem.
     """
     traces = [np.asarray(t, dtype=float) for t in traces_g0]
     if not traces:

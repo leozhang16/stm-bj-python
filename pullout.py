@@ -17,22 +17,36 @@ checked against the safety rules before it is accepted, and four live plots:
     piezo in/out    commanded position (and the readback) over the whole cycle
     histogram       counts per trace over the accepted traces so far
 
-Saving is per experiment: every Start N is one experiment, filed under
-<data folder>/<date>/<your name>/<experiment>_<HHMMSS of the click>, and
-when the run ends the files are renamed with the number of traces they hold
-(``..._<N>traces``). The .h5 always (raw volts, the config, per-trace
-scalars: ``storage.SessionWriter``); Igor .ibw blocks in SavePullOut's
-layout and a .txt table (displacement, then one G/G0 column per trace) as
-ticked. Name, experiment, folder and the boxes are remembered between
+Saving is Igor's scheme (``stmlab.igor_scheme``, the layout of Igor's
+``SavePullOut``), so the lab's Igor analysis macro and plot.py read a
+Python day exactly as they read an Igor day. Every accepted trace goes into
+the day folder <data folder>/MM_DD<SetupID>YYMerge (``10_22_26Merge`` on
+22 Oct 2026 with the default Setup ID ``_``), numbered through the day
+from 1 -- Igor's ``Saved`` -- 100 traces to a block: block k is
+``PullOutConductanceBlock_k.ibw`` (G/G0, then the 20 Igor parameters per
+column) with ``PullOutVoltageBlock_k``, ``PullOutCurrentBlock_k``,
+``PullOutExtensionBlock_k`` (the sense readback, when the rig has one),
+``PullOutConductanceBlockHist_k`` and ``PullOutPiezoBiasWave_k`` as the
+Save boxes say. A block is written when its 100th trace is taken and, as
+Igor could not, at the end of every run (Stop, pause, quit) with its
+empty columns NaN; the next run continues the numbering from the folder
+and refills that block. Beside the Igor files, in the same day folder:
+the raw .h5 session of each Start N (raw volts, the config, per-trace
+scalars: ``storage.SessionWriter``; <experiment>_<HHMMSS>_<N>traces.h5),
+``experiment_log.csv`` (one row per run, every day) and the .txt table
+(displacement, then one G/G0 column per trace) when ticked. Folder,
+Setup ID, name, experiment, notes and the boxes are remembered between
 launches in data/pullout_saving.json. The Run box is Start N (every trace
 is its own approach + pull, from an open junction), Continue, Stop and
 Calibrate zero; the single-cycle commands (engage, pull, cycle, withdraw,
 smash) are still there for --headless and the tests, and the smash-every
-line runs the smash inside Start N. A saved session can be browsed in the
-same plots (traces counted from 1), and its histograms opened in windows
+line runs the smash inside Start N. Saved data -- an .h5 session, an Igor
+day folder (this program's or Igor's own) or one PullOutConductanceBlock
+-- can be browsed in the same plots, and its histograms opened in windows
 of their own, drawn by plot.py -- the same file that works alone:
-``python plot.py <session>.h5 1D | 2D | -1`` (trace 1). Under Run, the
-Status box: the rig's numbers (state, piezo, junction, current, zero, file,
+``python plot.py <session>.h5 1D | 2D | -1`` (trace 1), or
+``python plot.py <day folder> 1D``. Under Run, the Status box: the rig's
+numbers (state, piezo, junction, current, zero, traces saved today, file,
 Keithley) and the last message, in colour.
 
 The Piezo box is Igor's PiezoGroupbox: a slider over the piezo's whole
@@ -88,6 +102,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -101,7 +116,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import plot as session_plots                     # noqa: E402  (plot.py, beside this file)
-from stmlab import analysis, approach, calibrate, plots, storage, trace   # noqa: E402
+from stmlab import analysis, approach, calibrate, igor_scheme, plots, storage, trace   # noqa: E402,E501
 from stmlab.actuator import ActuatorError                           # noqa: E402
 from stmlab.approach import ApproachError                           # noqa: E402
 from stmlab.config import ConfigError, G0_SIEMENS, RigConfig, validate   # noqa: E402
@@ -113,7 +128,27 @@ log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v64"
+__version__ = "v65"
+
+# What the Saving tab holds when nothing is remembered yet. ``folder`` is
+# the data folder (the day folder is made under it); ``setup_id`` is Igor's
+# SetupID, the letters between the day and the year of the folder name;
+# the five flags are Igor's save check boxes (igor_scheme.SaveFlags: which
+# companion files a block gets); ``h5`` keeps the raw session file beside
+# the Igor files; ``txt`` adds the plain-text table.
+DEFAULT_SAVING = {"folder": "", "setup_id": "_", "name": "", "experiment": "",
+                  "notes": "", "h5": True, "txt": False,
+                  "bias": True, "current": True, "sense": True, "hist": True,
+                  "piezo_wave": False}
+IGOR_FLAG_KEYS = ("bias", "current", "sense", "hist", "piezo_wave")
+
+
+def next_trace_number(folder) -> int:
+    """The number the next trace saved into this day folder gets -- Igor's
+    ``Saved`` -- read from the block files already there: 1 for a missing
+    or empty folder, else 100 * (last block - 1) + its filled columns + 1."""
+    k_last, filled = igor_scheme.IgorDayWriter.scan(folder)
+    return 1 if k_last == 0 else igor_scheme.BLOCK * (k_last - 1) + filled + 1
 
 
 # --------------------------------------------------------------------------
@@ -344,15 +379,25 @@ class Worker(threading.Thread):
         self._quit = threading.Event()
 
         self.save = save
+        # Write the Igor files (the day folder's PullOut*Block_k.ibw). Off
+        # only with --no-igor, for bench tests; the raw .h5 still goes.
         self.igor_export = igor_export
         self.out_dir = out_dir
-        # Where and under what name the next run's files go (the Saving
-        # tab); the run's file stem while a run is going, else None.
-        self.saving: dict = {"folder": Path(out_dir), "name": "",
-                             "experiment": "", "notes": "", "txt": False}
+        # The Saving tab: the data folder, Igor's Setup ID, who, what, the
+        # notes and the save boxes (DEFAULT_SAVING has the keys); the run's
+        # file stem (day folder / <experiment>_<HHMMSS>) while a run is
+        # going, else None.
+        self.saving: dict = dict(DEFAULT_SAVING, folder=Path(out_dir))
+        self.run_saving: dict = dict(self.saving)  # the copy a run keeps (_sv)
         self.config_name = ""                  # for the session log
         self.run_stem: Path | None = None
         self.run_started: float | None = None
+        # The day's Igor writer (igor_scheme.IgorDayWriter): numbers the
+        # traces through the day, keeps the block in progress and writes
+        # its files. Made when first needed, remade when the folder, the
+        # Setup ID or the date changes; None with --no-igor.
+        self.igor: igor_scheme.IgorDayWriter | None = None
+        self.run_numbers: list[int] = []       # the day numbers this run's traces got
         # Measured junction voltage per saved trace, sign-corrected, in mV:
         # at the start of the pull (in contact) and at its end (open).
         self.run_v_contact: list[float] = []
@@ -364,8 +409,8 @@ class Worker(threading.Thread):
         # file stays open so Continue can carry on into it.
         self.paused: dict | None = None
         self.writer: storage.SessionWriter | None = None
-        self.file_traces: list = []            # (g0, start_v, ts) for Igor export
-        self.n_saved = 0
+        self.file_traces: list = []            # this run's (g0, start_v, ts), for the .txt
+        self.n_saved = 0                       # traces written to .h5 since launch
         self.save_test_pulls = False           # into a TESTPULLS file, never data
         self.writer_is_test = False
         self.accepted = 0
@@ -958,10 +1003,14 @@ class Worker(threading.Thread):
                 done += 1
             self.readout()
         if done < n and (self.stop_flag.is_set() or failed):
+            why = "approach failed" if failed else "Stop"
             self.paused = {"remaining": n - done}
-            self.run_pauses.append({"after_trace": self.accepted,
-                                    "why": "approach failed" if failed else "Stop",
+            self.run_pauses.append({"after_trace": self.accepted, "why": why,
                                     "stopped": time.time(), "continued": None})
+            # The block in progress goes to disk now (a partial block), so
+            # the traces taken so far are in the Igor files while the run
+            # waits; the .h5 stays open for Continue.
+            self.flush_igor(why)
             self.post("paused", remaining=n - done)
             self.status(f"run paused with {n - done} of {n} traces still to "
                         f"take ({self.accepted} accepted so far). Continue "
@@ -987,27 +1036,161 @@ class Worker(threading.Thread):
                           for ch in text.strip())
         return cleaned or fallback
 
+    def _sv(self) -> dict:
+        """The saving settings that apply: while a run is going, the copy
+        taken at its Start N (``run_saving``), so a folder or a box changed
+        in the window during the run waits for the next one; otherwise the
+        Saving tab as it is now."""
+        return self.run_saving if self.run_stem is not None else self.saving
+
+    def setup_id(self) -> str:
+        """Igor's SetupID from the Saving tab: the letters between the day
+        and the year of the folder name (``_`` by default)."""
+        return str(self._sv().get("setup_id") or "_")
+
+    def day_folder(self, when: float | None = None) -> Path:
+        """Igor's day folder for a run started at ``when`` (now if None):
+        the data folder, then ``MM_DD<SetupID>YYMerge``
+        (``igor_scheme.day_folder_name``, Igor's ``MakePath``)."""
+        return (Path(self._sv()["folder"])
+                / igor_scheme.day_folder_name(when, self.setup_id()))
+
     def experiment_paths(self, when: float | None = None) -> tuple[Path, str]:
-        """(folder, stem) a run started at ``when`` would use: the data
-        folder, the date, the person's name, then <experiment>_<HHMMSS>."""
+        """(folder, stem) a run started at ``when`` would use: the day
+        folder, and <experiment>_<HHMMSS> for the run's own files (.h5,
+        .txt). The Igor files have Igor's names and need no stem."""
         t = time.localtime(when)
-        folder = (Path(self.saving["folder"])
-                  / time.strftime("%Y-%m-%d", t)
-                  / self._safe(self.saving["name"], "unknown"))
-        stem = (f"{self._safe(self.saving['experiment'], 'experiment')}_"
+        stem = (f"{self._safe(self._sv()['experiment'], 'experiment')}_"
                 f"{time.strftime('%H%M%S', t)}")
-        return folder, stem
+        return self.day_folder(when), stem
+
+    def flags(self) -> igor_scheme.SaveFlags:
+        """Igor's save check boxes, from the Saving tab."""
+        s, d = self._sv(), DEFAULT_SAVING
+        return igor_scheme.SaveFlags(**{key: bool(s.get(key, d[key]))
+                                        for key in IGOR_FLAG_KEYS})
+
+    def offsets(self) -> tuple[float, float]:
+        """Igor's ``Vzero`` (mV) and ``Izero`` (uA) for ParameterWave slots
+        15 and 16. Igor's Find Offset fitted the junction's I-V at zero
+        bias: Izero was the current it read with no bias applied and Vzero
+        the bias that would null it. This program applies no bias
+        correction, so Vzero is 0; Izero is what Calibrate zero measured
+        (``cal.current_zero_v``, the preamp's output at 0 V bias) as a
+        current, in uA -- the same quantity, measured the simpler way."""
+        C = self.cfg.cal
+        return 0.0, C.current_zero_v / C.preamp_gain_v_per_a * 1e6
+
+    def _note_fields(self) -> dict:
+        """What goes into the ConductanceBlock's wave note besides the
+        trace range: the program version, the experiment and who ran it
+        (semicolons separate the fields, so none may be inside one)."""
+        fields = {"version": __version__}
+        for key, word in (("experiment", "experiment"), ("name", "operator")):
+            value = str(self._sv().get(key, "")).replace(";", ",").strip()
+            if value:
+                fields[word] = value
+        return fields
+
+    def igor_writer(self, when: float | None = None):
+        """The day's Igor writer, or None when the Igor files are off.
+
+        Made the first time it is needed -- which scans the day folder so
+        the numbering continues where the last run (today, with this Setup
+        ID) stopped, and reads a partial block back to refill it -- and
+        remade when the folder, the Setup ID or the date has changed. The
+        save flags and the note follow the Saving tab every time.
+        """
+        if not self.igor_export:
+            return None
+        folder = self.day_folder(when)
+        if self.igor is not None and self.igor.folder != folder:
+            self.flush_igor("folder changed")
+            self.igor = None
+        if self.igor is None:
+            try:
+                self.igor = igor_scheme.IgorDayWriter(
+                    self._sv()["folder"], self.cfg, setup_id=self.setup_id(),
+                    flags=self.flags(), when=when, note_fields=self._note_fields())
+            except Exception as exc:               # noqa: BLE001
+                # The folder holds blocks and reading them back (to continue
+                # the numbering) needs igor2; or the folder cannot be looked
+                # at or its last block read (the NAS gone, a file that will
+                # not parse). Writing might still work, but it would start
+                # again at 1 over what is there: refuse, for the session,
+                # rather than fail every Start N.
+                self.igor_export = False
+                if isinstance(exc, ImportError):
+                    why = (f"continuing the numbering in {folder} needs the igor2 "
+                           f"package (pip install igor2): {exc}")
+                else:
+                    log.exception("Igor day folder %s could not be opened", folder)
+                    why = (f"the Igor day folder {folder} could not be opened: "
+                           f"{type(exc).__name__}: {exc}")
+                self.post("error", fatal=False,
+                          text=f"Igor files OFF for this session: {why}. The .h5 is "
+                               "still written")
+                return None
+            self.status(f"Igor folder {self.igor.folder}: next trace (Saved) "
+                        f"{self.igor.saved}", level="ok")
+        else:
+            self.igor.flags = self.flags()
+            self.igor.note_fields = self._note_fields()
+        return self.igor
+
+    def flush_igor(self, why: str = "") -> list[Path]:
+        """Put the Igor block in progress on disk now (``IgorDayWriter.flush``:
+        a partial block, NaN in the columns not yet taken), guarded: a write
+        that fails -- the NAS gone, the folder read-only -- is logged and
+        reported as a non-fatal error, never raised, so the run, the .h5 and
+        the window carry on. The traces stay in the writer and go out with
+        the next write that succeeds. Returns the files written ([] when
+        nothing changed or the write failed)."""
+        if self.igor is None:
+            return []
+        try:
+            return list(self.igor.flush())
+        except Exception as exc:                   # noqa: BLE001
+            log.exception("Igor block not written")
+            self.post("error", fatal=False,
+                      text=f"Igor block {self.igor.current_block} not written to "
+                           f"{self.igor.folder}{f' ({why})' if why else ''}: "
+                           f"{type(exc).__name__}: {exc}. Its traces are not in the "
+                           "Igor files; the .h5 is written separately")
+            return []
+
+    def igor_today(self) -> igor_scheme.IgorDayWriter | None:
+        """The day's Igor writer when it is the one for the day folder the
+        Saving tab names now (this folder, this Setup ID, today), else None:
+        after the folder, the Setup ID or the day has changed, the writer's
+        count is the old folder's, not the one the window shows."""
+        if self.igor is None or self.igor.folder != self.day_folder():
+            return None
+        return self.igor
+
+    def saved_today(self) -> int | None:
+        """Traces in today's Igor folder so far (Igor's ``Saved`` - 1), or
+        None before the folder has been looked at, or after the folder, the
+        Setup ID or the day changed (the window then shows its own count
+        from the files)."""
+        writer = self.igor_today()
+        return None if writer is None else writer.saved - 1
 
     def begin_experiment(self) -> None:
-        """A fresh set of files, histogram and counters for this run."""
+        """A fresh set of files, histogram and counters for this run; the
+        Igor writer for the day (the numbering carries on)."""
         if self.run_stem is not None:
             self.end_experiment()              # a paused run: its files are done
         elif self.writer is not None:
-            self.close_file(export=False)
+            self.close_file()
         self.paused = None
         self.run_started = time.time()
+        # The Saving tab as it is at this Start N, for the whole run.
+        self.run_saving = dict(self.saving)
         folder, stem = self.experiment_paths(self.run_started)
         self.run_stem = folder / stem
+        self.run_numbers = []
+        self.file_traces = []
         self.accepted = 0
         self.attempts = 0
         self.rejections = {}
@@ -1018,58 +1201,80 @@ class Worker(threading.Thread):
         self.hist_n = 0
         self.post("hist", centres=None, counts=None, n=0)
         self.post("experiment", stem=str(self.run_stem))
-        self.status(f"experiment {stem}: files go to {folder}")
+        writer = self.igor_writer(self.run_started)
+        self.status(f"experiment {stem}: files go to {folder}"
+                    + (f"; Igor trace numbers from {writer.saved}" if writer else ""))
 
     def end_experiment(self) -> list[str]:
-        """Close the run's file, name it after its trace count, and write
-        the Igor blocks and the .txt table beside it as ticked."""
+        """Finish the run: the Igor block in progress goes to disk (a
+        partial block, refilled by the next run), the .h5 is closed and
+        named after its trace count, the .txt table is written when ticked,
+        and the run gets its row in experiment_log.csv. Returns the names
+        of the files written.
+
+        Whatever fails on the way -- the Igor block, the .txt, the log row --
+        is reported as a non-fatal error and the rest still happens: the .h5
+        is closed and renamed even when the Igor block could not be
+        written, and the run is closed in the window (not paused, no
+        experiment, no file) in every case, so it never stays half-closed.
+        """
         stem = self.run_stem
-        self.run_stem = None
-        self.paused = None
-        self.post("paused", remaining=0)
-        if stem is None or self.writer is None:
+        if stem is None:
+            self.paused = None
+            self.post("paused", remaining=0)
             self.post("experiment", stem=None)
             return []
-        traces = list(self.file_traces)
-        auto = self.auto_notes(len(traces))
+        written: list[str] = []
         try:
-            self.writer.describe(auto_notes=auto)
-        except Exception:                          # noqa: BLE001
-            log.exception("could not write the automatic note into the file")
-        self.close_file(export=False)
-        h5 = stem.with_suffix(".h5")
-        final = stem.with_name(f"{stem.name}_{len(traces)}traces")
-        try:
-            h5 = h5.rename(final.with_suffix(".h5"))
-        except OSError as exc:
-            log.warning("could not rename %s: %s", h5.name, exc)
-        written = [h5.name]
-        if self.igor_export and traces:
-            self.file_traces = traces
-            self.export_igor(h5)
-            written += [f"{h5.stem}_b*.ibw"]
-        if self.saving.get("txt") and traces:
+            sv = self._sv()                        # the run's own settings
+            traces = list(self.file_traces)
+            if not traces:
+                # Nothing was taken: no files, no log row (a block an
+                # earlier run left in memory still goes to disk).
+                self.flush_igor()
+                return []
+            auto = self.auto_notes(len(traces))
+            written += [p.name for p in self.flush_igor()]
+            h5: Path | None = None
+            if self.writer is not None and not self.writer_is_test:
+                try:
+                    self.writer.describe(auto_notes=auto)
+                except Exception:                  # noqa: BLE001
+                    log.exception("could not write the automatic note into the file")
+                h5 = self.writer.path
+            self._close_h5()
+            final = stem.with_name(f"{stem.name}_{len(traces)}traces")
+            if h5 is not None:
+                try:
+                    h5 = h5.rename(final.with_suffix(".h5"))
+                except OSError as exc:
+                    log.warning("could not rename %s: %s", h5.name, exc)
+                written.insert(0, h5.name)
+            if sv.get("txt"):
+                try:
+                    data, info = storage.save_txt_block(
+                        final.with_suffix(".txt"), self.cfg, [t[0] for t in traces],
+                        start_piezo_v=[t[1] for t in traces],
+                        timestamps=[t[2] for t in traces],
+                        header_lines=[f"name={sv['name']} experiment={sv['experiment']} "
+                                      f"file={h5.name if h5 else final.parent.name}",
+                                      f"notes={sv.get('notes', '')}",
+                                      f"auto_notes={auto}"])
+                    written += [data.name, info.name]
+                except Exception as exc:           # noqa: BLE001
+                    log.exception("txt export failed")
+                    self.post("error", text=f"txt export failed: {exc}", fatal=False)
             try:
-                data, info = storage.save_txt_block(
-                    h5.with_suffix(".txt"), self.cfg, [t[0] for t in traces],
-                    start_piezo_v=[t[1] for t in traces],
-                    timestamps=[t[2] for t in traces],
-                    header_lines=[f"name={self.saving['name']} "
-                                  f"experiment={self.saving['experiment']} "
-                                  f"file={h5.name}",
-                                  f"notes={self.saving.get('notes', '')}",
-                                  f"auto_notes={auto}"])
-                written += [data.name, info.name]
+                self.log_session(h5 if h5 is not None else final.parent, traces, written)
             except Exception as exc:               # noqa: BLE001
-                log.exception("txt export failed")
-                self.post("error", text=f"txt export failed: {exc}", fatal=False)
-        try:
-            self.log_session(h5, traces, written)
-        except Exception as exc:                   # noqa: BLE001
-            log.exception("session log failed")
-            self.post("error", text=f"session log not written: {exc}", fatal=False)
-        self.post("experiment", stem=None)
-        self.post("file", path=None)
+                log.exception("session log failed")
+                self.post("error", text=f"session log not written: {exc}", fatal=False)
+        finally:
+            self.run_stem = None
+            self.paused = None
+            self.post("paused", remaining=0)
+            self.post("experiment", stem=None)
+            self.post("file", path=None)
         return written
 
     SESSION_LOG = "experiment_log.csv"
@@ -1080,7 +1285,7 @@ class Worker(threading.Thread):
         the bias set, the junction voltage measured with the junction open
         (what the tunnelling tail sees through the series resistor) and at
         the start of the pull (in contact), the resistor, the gain, the
-        preamp zero, and the pull."""
+        preamp zero, the pull, and which Igor trace numbers the run got."""
         R, C, K = self.cfg.ramp, self.cfg.cal, self.cfg.keithley
         v_open = float(np.median(self.run_v_open)) if self.run_v_open else float("nan")
         v_con = float(np.median(self.run_v_contact)) if self.run_v_contact else float("nan")
@@ -1092,6 +1297,9 @@ class Worker(threading.Thread):
                 f"{R.pull_length_nm:g} nm at {R.pull_rate_nm_per_s:g} nm/s, "
                 f"engage {R.engage_g0:g} G0, break {R.break_g0:g} G0, "
                 f"{C.piezo_nm_per_volt:g} nm/V")
+        if self.run_numbers:
+            note += (f"; Igor traces {min(self.run_numbers)}-{max(self.run_numbers)}"
+                     + (f" in {self.igor.folder.name}" if self.igor is not None else ""))
         for pz in self.run_pauses:
             clock = lambda t: time.strftime("%H:%M:%S", time.localtime(t))  # noqa: E731
             note += (f"; {pz['why']} after trace {pz['after_trace']} at "
@@ -1100,18 +1308,21 @@ class Worker(threading.Thread):
                         if pz["continued"] else ", not continued"))
         return note
 
-    def log_session(self, h5: Path, traces: list, written: list) -> Path:
-        """Two lines per experiment in <data folder>/experiment_log.csv, one
-        file for every day and everyone, readable as a notebook:
+    def log_session(self, data_path: Path, traces: list, written: list) -> Path:
+        """Two lines per experiment in <day folder>/experiment_log.csv, one
+        file per day folder for everyone, readable as a notebook:
 
             date, start time, name, experiment, traces, your notes, the
                 automatic note (bias set, junction measured, resistor,
-                gain, zero, the pull)
-            the full path of the data file, alone on the next line
+                gain, zero, the pull, the Igor trace numbers)
+            the full path of the data file (the .h5; the day folder when
+                the .h5 is off), alone on the next line
 
         The header is written once; lines are appended."""
         started = self.run_started or time.time()
-        path = Path(self.saving["folder"]) / self.SESSION_LOG
+        sv = self._sv()
+        path = self.day_folder(started) / self.SESSION_LOG
+        path.parent.mkdir(parents=True, exist_ok=True)
         new = not path.exists()
         with open(path, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -1120,12 +1331,12 @@ class Worker(threading.Thread):
                             "notes", "auto_notes"])
             w.writerow([time.strftime("%Y-%m-%d", time.localtime(started)),
                         time.strftime("%H:%M:%S", time.localtime(started)),
-                        self.saving.get("name", ""),
-                        self.saving.get("experiment", ""),
+                        sv.get("name", ""),
+                        sv.get("experiment", ""),
                         len(traces),
-                        self.saving.get("notes", ""),
+                        sv.get("notes", ""),
                         self.auto_notes(len(traces))])
-            w.writerow([str(h5.resolve())])
+            w.writerow([str(Path(data_path).resolve())])
         log.info("experiment log: %s (+1 row)", path)
         self.post("session_log", path=str(path))
         return path
@@ -1155,60 +1366,121 @@ class Worker(threading.Thread):
         return self.hist_sum / self.hist_n
 
     def _save(self, tr, verdict, test: bool = False) -> None:
-        """Append a trace to the session file, opening one if needed.
+        """Save one accepted trace: into the day's Igor block (the files
+        Igor's macro reads, through ``igor_scheme.IgorDayWriter``) and,
+        when the raw .h5 is ticked, into the run's session file.
 
-        Test pulls go to a file whose name says TESTPULLS, and never into a
-        file holding real traces (nor the other way round): a file is either
-        data or a format test.
+        Test pulls go to a .h5 whose name says TESTPULLS, never into the
+        Igor files nor into a file holding real traces (nor the other way
+        round): a file is either data or a format test.
         """
         if not test and (self.run_stem is None or self.paused is not None):
             return                                 # a single cycle: shown only
+        if test:
+            self._save_h5(tr, verdict, test=True)
+            self.post("saved", n=self.n_saved, number=None, block=None,
+                      saved=self.saved_today(), path=str(self.writer.path),
+                      folder=None, run=0)
+            return
+        number = block = None
+        writer = self.igor_writer(self.run_started)
+        if writer is not None:
+            vzero_mv, izero_ua = self.offsets()
+            t = igor_scheme.IgorTrace.from_record(tr, self.cfg, vzero_mv=vzero_mv,
+                                                  izero=izero_ua,
+                                                  bias_save=writer.flags.bias)
+            before = writer.current_block
+            try:
+                number = writer.append(t)
+            except Exception as exc:               # noqa: BLE001
+                # The NAS dropped, the folder went read-only: the trace is
+                # not in the Igor files. Say so and go on -- the .h5 (when
+                # ticked) still gets it below, and the run is not lost.
+                log.exception("Igor trace not written")
+                self.post("error", fatal=False,
+                          text=f"Igor block {before} in {writer.folder} not written: "
+                               f"{type(exc).__name__}: {exc}. This trace is "
+                               + ("still in the .h5" if self._sv().get("h5", True)
+                                  else "NOT saved (the .h5 is off)")
+                               + "; the run goes on")
+            else:
+                # Igor's numbering says which block the trace went into and
+                # whether it completed one (the 100th trace writes the files).
+                block = (number - 1) // igor_scheme.BLOCK + 1
+                self.run_numbers.append(number)
+                if number % igor_scheme.BLOCK == 0:
+                    self.status(f"Igor block {block} complete: traces "
+                                f"{(block - 1) * igor_scheme.BLOCK + 1}-{number} in "
+                                f"{writer.folder.name}", level="ok")
+                elif block != before:
+                    # A trace of another length than the block's: the writer
+                    # put the partial block on disk and started a new one
+                    # with this trace (igor_scheme.IgorDayWriter.append).
+                    self.status(f"trace length changed: partial block {before} "
+                                f"written, continuing in block {block} (trace "
+                                f"{number}) in {writer.folder.name}", level="warn")
+        if self._sv().get("h5", True):
+            self._save_h5(tr, verdict)
+        self.file_traces.append((tr.conductance_g0(self.cfg).astype(np.float32),
+                                 tr.start_piezo_v, tr.timestamp))
+        v = self.cfg.cal.voltage_input_sign * np.asarray(tr.voltage_v, float) * 1e3
+        n = v.size
+        # The first half-millisecond: the junction as it was when the
+        # pull began, before a shallow contact has had time to break.
+        self.run_v_contact.append(float(np.mean(v[:max(5, n // 500)])))
+        self.run_v_open.append(float(np.mean(v[int(n * 0.90):int(n * 0.94) + 1])))
+        self.post("saved", n=self.n_saved, number=number, block=block,
+                  saved=self.saved_today(), run=len(self.file_traces),
+                  path=str(self.writer.path) if self.writer is not None else None,
+                  folder=str(writer.folder) if writer is not None else None)
+
+    def _save_h5(self, tr, verdict, test: bool = False) -> None:
+        """Append a trace to the raw session file, opening one if needed
+        (in the day folder, or TESTPULLS in the data folder for a test)."""
         if self.writer is not None and self.writer_is_test != test:
             self.close_file()
         if self.writer is None:
+            sv = self._sv()
             if test:
-                path = (Path(self.saving["folder"]) /
+                path = (Path(sv["folder"]) /
                         f"pullout_TESTPULLS_{time.strftime('%Y%m%d_%H%M%S')}.h5")
             else:
                 path = self.run_stem.with_suffix(".h5")
             self.writer = storage.SessionWriter(path, self.cfg).open()
-            self.writer.describe(operator=self.saving.get("name", ""),
-                                 experiment=self.saving.get("experiment", ""),
-                                 notes=self.saving.get("notes", ""),
+            self.writer.describe(operator=sv.get("name", ""),
+                                 experiment=sv.get("experiment", ""),
+                                 notes=sv.get("notes", ""),
                                  program=f"pullout {__version__}",
+                                 setup_id=self.setup_id(),
                                  config=self.config_name)
             self.writer_is_test = test
-            self.file_traces = []
             self.post("file", path=str(path))
         self.writer.append(self.n_saved, tr, verdict)
         self.n_saved += 1
-        self.file_traces.append((tr.conductance_g0(self.cfg).astype(np.float32),
-                                 tr.start_piezo_v, tr.timestamp))
-        if not test:
-            v = self.cfg.cal.voltage_input_sign * np.asarray(tr.voltage_v, float) * 1e3
-            n = v.size
-            # The first half-millisecond: the junction as it was when the
-            # pull began, before a shallow contact has had time to break.
-            self.run_v_contact.append(float(np.mean(v[:max(5, n // 500)])))
-            self.run_v_open.append(float(np.mean(v[int(n * 0.90):int(n * 0.94) + 1])))
-        self.post("saved", n=self.n_saved, path=str(self.writer.path))
 
-    def close_file(self, export: bool | None = None) -> None:
-        """Close the session file; export it for Igor if asked."""
-        if self.writer is None:
-            return
-        path = self.writer.path
-        try:
-            self.writer.write_summary({"accepted": self.accepted,
-                                       "attempts": self.attempts,
-                                       "rejections": self.rejections})
-            self.writer.close()
-        finally:
-            self.writer = None
-        do_export = self.igor_export if export is None else export
-        if do_export and self.file_traces:
-            self.export_igor(path)
-        self.post("file", path=None)
+    def _close_h5(self) -> None:
+        """Close the session file, if one is open, with its summary."""
+        if self.writer is not None:
+            try:
+                self.writer.write_summary({"accepted": self.accepted,
+                                           "attempts": self.attempts,
+                                           "rejections": self.rejections})
+                self.writer.close()
+            finally:
+                self.writer = None
+            self.post("file", path=None)
+
+    def close_file(self) -> None:
+        """Close the session file, if one is open, and put the Igor block
+        in progress on disk (a partial block, NaN in the columns not yet
+        taken; the next run refills it). Called at the end of a run, on
+        pause, Stop, a settings change and quit. A block that cannot be
+        written is reported, not raised (``flush_igor``)."""
+        self._close_h5()
+        files = self.flush_igor()
+        if files:
+            log.info("Igor partial block written: %s",
+                     ", ".join(p.name for p in files))
 
     def cmd_newfile(self) -> None:
         """Something changed (a setting, the gain): the open experiment, if
@@ -1223,28 +1495,6 @@ class Worker(threading.Thread):
                         "starts a new one")
         else:
             self.close_file()
-
-    def cmd_export(self) -> None:
-        if self.writer is None or not self.file_traces:
-            self.status("nothing to export yet")
-            return
-        self.export_igor(self.writer.path)
-
-    def export_igor(self, h5_path: Path) -> None:
-        """Igor blocks of up to 100 traces, as SavePullOut wrote them."""
-        traces = self.file_traces
-        written = []
-        for b in range(0, len(traces), 100):
-            chunk = traces[b:b + 100]
-            name = f"{h5_path.stem}_b{b // 100:03d}"
-            out = h5_path.with_name(name + ".ibw")
-            storage.save_igor_block(out, self.cfg, [t[0] for t in chunk],
-                                    start_piezo_v=[t[1] for t in chunk],
-                                    timestamps=[t[2] for t in chunk],
-                                    name=storage._igor_name(name))
-            written.append(out.name)
-        self.status(f"Igor export: {', '.join(written)} ({len(traces)} traces)")
-        self.post("exported", files=written)
 
     def readout(self) -> None:
         rig = self.rig
@@ -1263,12 +1513,19 @@ class Worker(threading.Thread):
         sense = rig.last_sense_v
         sense_v = (float(np.mean(sense[sense.size // 2:]))
                    if sense is not None and sense.size else None)
+        # "saved" is the day counter (traces in today's Igor folder, Igor's
+        # Saved - 1), None until the folder has been looked at or when the
+        # Saving tab now names another folder, Setup ID or day than the
+        # writer's (the window then counts the folder's files itself).
+        writer = self.igor_today()
         self.post("readout", state=rig.state.name, piezo_v=rig.piezo_v,
                   piezo_nm=rig.piezo_nm, bias_mv=rig.bias_v * 1e3,
                   junction_mv=v_mv, current_ua=i_ua, g0=g0, railed=railed,
                   sense_nm=rig.sense_nm, sense_v=sense_v,
                   accepted=self.accepted, attempts=self.attempts,
-                  saved=self.n_saved, zero_uv=C.current_zero_v * 1e6)
+                  saved=None if writer is None else writer.saved - 1,
+                  igor_folder=str(writer.folder) if writer is not None else None,
+                  zero_uv=C.current_zero_v * 1e6)
 
 
 # --------------------------------------------------------------------------
@@ -1300,18 +1557,28 @@ def close_rig(guard: SafeSession, rig: Rig) -> None:
 
 
 # --------------------------------------------------------------------------
-# Headless: N cycles, save, export, report
+# Headless: N cycles into the day folder, report
 # --------------------------------------------------------------------------
 
 def run_headless(cfg: RigConfig, n: int, out_dir: Path, igor_export: bool,
                  require_engaged: bool, test_pull_v: float | None = None,
-                 save_test_pulls: bool = False) -> int:
+                 save_test_pulls: bool = False, setup_id: str = "_",
+                 saving: dict | None = None) -> int:
+    """No window: zero, then N cycles saved exactly as Start N saves them
+    -- the Igor block files in <out_dir>/MM_DD<setup_id>YYMerge (the
+    numbering carried on from what is there) and the raw .h5 beside them
+    -- then a report. ``saving`` is the Saving tab's entries that apply
+    (name, experiment, notes, the save boxes; ``main`` passes what the tab
+    remembered, with ``--name`` and ``--experiment`` over it)."""
     guard, rig = open_rig(cfg)
     mon = Monitor(rig)
     worker = Worker(cfg, rig, mon, save=True, out_dir=out_dir,
                     igor_export=igor_export)
     worker.require_engaged = require_engaged
     worker.save_test_pulls = save_test_pulls
+    worker.saving["setup_id"] = setup_id or "_"
+    if saving:
+        worker.saving.update(saving)
     try:
         worker.cmd_zero()
         if test_pull_v is not None:
@@ -1329,7 +1596,6 @@ def run_headless(cfg: RigConfig, n: int, out_dir: Path, igor_export: bool,
         close_rig(guard, rig)
     # drain the events for the printout
     last_status = ""
-    files = []
     while True:
         try:
             kind, payload = worker.events.get_nowait()
@@ -1337,8 +1603,6 @@ def run_headless(cfg: RigConfig, n: int, out_dir: Path, igor_export: bool,
             break
         if kind == "status":
             last_status = payload["text"]
-        elif kind == "exported":
-            files = payload["files"]
         elif kind == "error":
             print("error:", payload["text"])
     print(last_status)
@@ -1347,9 +1611,165 @@ def run_headless(cfg: RigConfig, n: int, out_dir: Path, igor_export: bool,
         peak = analysis.peak_position(worker.hist_centres, hist, around=0.0,
                                       window=0.4)
         print(f"1 G0 peak at {peak:+.4f} decades over {worker.hist_n} traces")
-    if files:
-        print("Igor files:", ", ".join(files))
+    if worker.igor is not None:
+        folder = worker.igor.folder
+        files = sorted(p.name for p in folder.glob("PullOut*.ibw")) if folder.is_dir() else []
+        print(f"Igor folder {folder}: {worker.igor.saved - 1} traces today, next "
+              f"trace (Saved) {worker.igor.saved}"
+              + (f"; files: {', '.join(files)}" if files else ""))
     return 0
+
+
+# --------------------------------------------------------------------------
+# Igor data opened for browsing: a day folder, or one block file
+# --------------------------------------------------------------------------
+
+class IgorDay:
+    """An Igor day folder -- Igor's own or this program's -- or one
+    ``PullOutConductanceBlock_k.ibw``, opened for the window's browser.
+
+    The traces keep Igor's numbering through the day (block k, column c
+    is trace (k-1)*100 + c + 1). ``trace(i)`` is the i-th trace present
+    (0-based, as the browser counts) with its displacement axis from the
+    block's parameters (``linspace(0, Size, N)``, Igor's ``SetScale/I``)
+    and, when the companion files exist, its junction voltage (V), current
+    (A) and sense readback (nm). Only the block being looked at is held in
+    memory with its companions; the histogram over everything is made once
+    when the folder is opened, block by block, so a whole day of 10,000
+    traces can be browsed without loading it all.
+
+    Any other ``.ibw`` holding traces in columns with the 22-row parameter
+    tail (this program's old ``_bNNN`` export) opens too, as one block
+    numbered 0 without companions.
+    """
+
+    _BLOCK_FILE = re.compile(r"^PullOutConductanceBlock_(\d+)\.ibw$")
+
+    def __init__(self, path):
+        path = Path(path)
+        self.path = path
+        self.name = path.name if path.is_dir() else path.stem
+        self.folder = path if path.is_dir() else path.parent
+        self._single: igor_scheme.IgorBlock | None = None
+        if path.is_dir():
+            self.ks = igor_scheme.list_blocks(path)
+            if not self.ks:
+                raise ValueError(f"{path.name}: no PullOutConductanceBlock_k.ibw in it")
+        else:
+            m = self._BLOCK_FILE.match(path.name)
+            if m:
+                self.ks = [int(m.group(1))]
+            else:
+                g0, params, filled = igor_scheme.split_block(igor_scheme.read_wave(path).data)
+                idx = np.flatnonzero(filled)
+                self._single = igor_scheme.IgorBlock(0, path.parent, g0[:, idx],
+                                                     params[idx], idx, idx + 1)
+                self.ks = [0]
+        self._cache: tuple[int, igor_scheme.IgorBlock] | None = None
+        # (block k, position j in the block's filled columns, Igor's number)
+        self.entries: list[tuple[int, int, int]] = []
+        self.cfg = RigConfig()
+        centres = total = None
+        for k in self.ks:
+            b = self._read(k, companions=False)
+            if b.n_traces == 0:
+                continue
+            if not self.entries:
+                self._settings_from(b.params[0])
+            self.entries += [(k, j, int(b.numbers[j])) for j in range(b.n_traces)]
+            c, counts = analysis.log_histogram(list(b.g0.T), igor_bins=True)
+            centres = c
+            total = counts * b.n_traces if total is None else total + counts * b.n_traces
+        # (centres, counts per trace) over every trace present, Igor's bins;
+        # each block's counts-per-trace weighted by its trace count (exact
+        # when every trace passes the noise-floor gate). The overview panel
+        # only; the histogram windows recompute from every trace.
+        self.hist = None if total is None else (centres, total / max(len(self.entries), 1))
+
+    def _settings_from(self, p: np.ndarray) -> None:
+        """The pull as the block's parameters record it, into the config the
+        plots and the selector use (as plot.py does for an Igor file)."""
+        R = self.cfg.ramp
+        if np.isfinite(p[0]) and p[0] > 0:
+            R.pull_length_nm = float(p[0])
+        if np.isfinite(p[1]) and p[1] > 0:
+            R.pull_rate_nm_per_s = float(p[1])
+        if np.isfinite(p[10]) and p[10] != 0:
+            R.bias_v = float(p[10]) * 1e-3
+        if np.isfinite(p[13]) and p[13] > 0:
+            R.engage_g0 = float(p[13])
+
+    def _read(self, k: int, companions: bool) -> igor_scheme.IgorBlock:
+        if self._single is not None:
+            return self._single
+        return igor_scheme.read_block(self.folder, k, companions=companions)
+
+    def block(self, k: int) -> igor_scheme.IgorBlock:
+        """Block ``k`` with its companions, the last one looked at kept."""
+        if self._cache is None or self._cache[0] != k:
+            self._cache = (k, self._read(k, companions=True))
+        return self._cache[1]
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def close(self) -> None:
+        self._cache = None
+
+    def describe(self) -> str:
+        if not self.entries:
+            return "no traces"
+        first, last = self.entries[0][2], self.entries[-1][2]
+        blocks = (f"block {self.ks[0]}" if len(self.ks) == 1
+                  else f"blocks {self.ks[0]}-{self.ks[-1]}")
+        return f"{blocks}, Igor traces {first}-{last}"
+
+    def trace(self, i: int) -> dict:
+        """The i-th trace present: Igor's number and block, the conductance
+        (G/G0), the displacement axis (nm), the sample rate the parameters
+        imply (N points over Size/Rate seconds), the companions (None when
+        their file is missing), the 20 parameters and the block's
+        histogram when its file exists."""
+        k, j, number = self.entries[i]
+        b = self.block(k)
+        p = np.asarray(b.params[j], dtype=float)
+        n = b.n_points
+        R = self.cfg.ramp
+        size = float(p[0]) if np.isfinite(p[0]) and p[0] > 0 else R.pull_length_nm
+        rate = float(p[1]) if np.isfinite(p[1]) and p[1] > 0 else R.pull_rate_nm_per_s
+        fs = n * rate / size if size > 0 else R.sample_rate_hz
+
+        def column(arr):
+            return None if arr is None else np.asarray(arr[:, j], dtype=float)
+
+        return {"number": number, "block": k, "g0": np.asarray(b.g0[:, j], dtype=float),
+                "disp": np.linspace(0.0, size, n), "fs": fs,
+                "voltage_v": column(b.voltage_v), "current_a": column(b.current_a),
+                "extension_nm": column(b.extension_nm), "params": p,
+                "block_hist": b.hist}
+
+    def conductances(self):
+        """Every trace's conductance in turn, block by block."""
+        for k in self.ks:
+            b = self._read(k, companions=False)
+            for j in range(b.n_traces):
+                yield np.asarray(b.g0[:, j], dtype=float)
+
+    def data(self) -> "session_plots.Data":
+        """plot.py's ``Data`` over every trace, for the histogram windows:
+        each trace with its own displacement axis from its block's
+        parameters. Reads every block (a full day of 10,000 traces is a few
+        hundred MB), so it is made only when a histogram window asks."""
+        traces, disps = [], []
+        for k in self.ks:
+            b = self._read(k, companions=False)
+            d = b.displacement_nm
+            for j in range(b.n_traces):
+                traces.append(np.asarray(b.g0[:, j], dtype=np.float32))
+                disps.append(d)
+        disp0 = disps[0] if disps else np.zeros(0)
+        return session_plots.Data(traces, disp0, self.cfg, self.name,
+                                  paths=[self.path], disps=disps)
 
 
 # --------------------------------------------------------------------------
@@ -1361,8 +1781,9 @@ def hist_window(win, session, stem: str, kind: str, tk, ttk, FigureCanvasTkAgg,
     """A window with one plot and the knobs that matter for it, applied on
     Redraw or Return; the matplotlib toolbar underneath gives zoom, pan and
     Save. The picture itself is plot.py's (hist_1d, hist_2d), the same one
-    ``python plot.py <file>.h5 1D`` draws. Returns the window's controls
-    (for tests)."""
+    ``python plot.py <file>.h5 1D`` draws. ``session`` is an open
+    ``storage.Session`` or, for Igor data, plot.py's ``Data`` already
+    loaded (``IgorDay.data()``). Returns the window's controls (for tests)."""
     from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
 
     bar = ttk.Frame(win)
@@ -1403,7 +1824,8 @@ def hist_window(win, session, stem: str, kind: str, tk, ttk, FigureCanvasTkAgg,
         except ValueError:
             return default
 
-    data = session_plots.from_session(session, stem)
+    data = (session if isinstance(session, session_plots.Data)
+            else session_plots.from_session(session, stem))
 
     if kind == "1d":
         entry(bar, "bins", "bins", 1000)
@@ -1485,7 +1907,8 @@ def save_saving(path: Path, saving: dict) -> None:
 def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             config_name: str, autoclose: float | None = None,
             readback: bool = False,
-            saving_file: Path | None = None, zoom: float | None = None) -> int:
+            saving_file: Path | None = None, zoom: float | None = None,
+            setup_id: str | None = None) -> int:
     saving_file = saving_file or (_ROOT / "data" / "pullout_saving.json")
     import tkinter as tk
     from tkinter import filedialog, ttk
@@ -2202,19 +2625,25 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     for var in svars.values():
         var.trace_add("write", preview_settings)
 
-    # -- saving: one experiment per Start N -----------------------------------------
-    # <data folder>/<date>/<your name>/<experiment>_<HHMMSS>_<N>traces.*
-    # Name, experiment, folder and the boxes are remembered between launches.
+    # -- saving: Igor's scheme, one experiment per Start N ---------------------------
+    # <data folder>/MM_DD<SetupID>YYMerge/PullOut*Block_k.ibw, 100 traces to a
+    # block, numbered through the day (igor_scheme); the raw .h5, the .txt
+    # and experiment_log.csv beside them. Everything typed here is
+    # remembered between launches.
     fb = ttk.Frame(nb)
     nb.add(fb, text="Saving")
-    remembered = load_saving(saving_file)
+    remembered = dict(DEFAULT_SAVING, **load_saving(saving_file))
+    if setup_id is not None:
+        remembered["setup_id"] = setup_id
     folder_var = tk.StringVar(value=str(remembered.get("folder") or out_dir))
+    setup_var = tk.StringVar(value=str(remembered.get("setup_id") or "_"))
     name_var = tk.StringVar(value=remembered.get("name", ""))
     exp_var = tk.StringVar(value=remembered.get("experiment", ""))
     notes_var = tk.StringVar(value=remembered.get("notes", ""))
+    h5_var = tk.BooleanVar(value=bool(remembered.get("h5", True)))
     txt_var = tk.BooleanVar(value=bool(remembered.get("txt", False)))
-    igor_var = tk.BooleanVar(value=bool(remembered.get("igor", igor_export)))
-    save_var = tk.BooleanVar(value=True)
+    flag_vars = {key: tk.BooleanVar(value=bool(remembered.get(key, DEFAULT_SAVING[key])))
+                 for key in IGOR_FLAG_KEYS}
 
     ttk.Label(fb, text="Data folder").grid(row=0, column=0, sticky="w", padx=2, pady=(4, 1))
     ttk.Entry(fb, textvariable=folder_var, width=36).grid(
@@ -2222,96 +2651,161 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
 
     def browse_folder():
         chosen = filedialog.askdirectory(initialdir=folder_var.get() or str(out_dir),
-                                         title="data folder (the date and your "
-                                               "name are added under it)")
+                                         title="data folder (Igor's day folder "
+                                               "MM_DD_YYMerge is made under it)")
         if chosen:
             folder_var.set(chosen)
     ttk.Button(fb, text="Browse...", command=browse_folder).grid(
         row=0, column=2, padx=2, pady=(4, 1), sticky="ew")
-    ttk.Label(fb, text="Your name").grid(row=1, column=0, sticky="w", padx=2, pady=1)
-    ttk.Entry(fb, textvariable=name_var, width=36).grid(row=1, column=1, sticky="ew", padx=2)
-    ttk.Label(fb, text="Experiment").grid(row=2, column=0, sticky="w", padx=2, pady=1)
-    ttk.Entry(fb, textvariable=exp_var, width=36).grid(row=2, column=1, sticky="ew", padx=2)
-    ttk.Label(fb, text="Notes").grid(row=3, column=0, sticky="w", padx=2, pady=1)
+    ttk.Label(fb, text="Setup ID").grid(row=1, column=0, sticky="w", padx=2, pady=1)
+    sf = ttk.Frame(fb)
+    sf.grid(row=1, column=1, columnspan=2, sticky="ew", padx=2)
+    ttk.Entry(sf, textvariable=setup_var, width=6).pack(side="left")
+    ttk.Label(sf, text="Igor's SetupID: the letters between the day and the year of "
+                       "the folder name ('_' gives 10_22_26Merge)",
+              font=("Arial", 9), foreground="#444").pack(side="left", padx=6)
+    ttk.Label(fb, text="Your name").grid(row=2, column=0, sticky="w", padx=2, pady=1)
+    ttk.Entry(fb, textvariable=name_var, width=36).grid(row=2, column=1, sticky="ew", padx=2)
+    ttk.Label(fb, text="Experiment").grid(row=3, column=0, sticky="w", padx=2, pady=1)
+    ttk.Entry(fb, textvariable=exp_var, width=36).grid(row=3, column=1, sticky="ew", padx=2)
+    ttk.Label(fb, text="Notes").grid(row=4, column=0, sticky="w", padx=2, pady=1)
     ttk.Entry(fb, textvariable=notes_var, width=36).grid(
-        row=3, column=1, columnspan=2, sticky="ew", padx=2)
+        row=4, column=1, columnspan=2, sticky="ew", padx=2)
     ttk.Label(fb, text="experiment: e.g. clean_gold, OPE3_1mM, changed any time, the "
-                       "next Start N uses it. Notes: molecule, solvent, tip, sample; "
-                       "they go into the file header and into experiment_log.csv in "
-                       "the data folder, one row per run, every day",
+                       "next Start N uses it (it names the .h5 and goes into the Igor "
+                       "block's note). Notes: molecule, solvent, tip, sample; they go "
+                       "into the .h5 header and into experiment_log.csv in the day "
+                       "folder, one row per run",
               font=("Arial", 9), foreground="#444", wraplength=px(560), justify="left").grid(
-        row=4, column=0, columnspan=3, sticky="w", padx=2)
+        row=5, column=0, columnspan=3, sticky="w", padx=2)
 
-    ttk.Checkbutton(fb, text="save accepted traces (.h5, raw volts + config; always "
-                             "the master file)", variable=save_var,
-                    command=lambda: setattr(worker, "save", save_var.get())).grid(
-        row=5, column=0, columnspan=3, sticky="w", padx=2, pady=(6, 0))
-    ttk.Checkbutton(fb, text="also write Igor .ibw blocks when the run ends",
-                    variable=igor_var,
-                    command=lambda: setattr(worker, "igor_export", igor_var.get())).grid(
-        row=6, column=0, columnspan=3, sticky="w", padx=2)
+    ff = ttk.LabelFrame(fb, text="Igor files per block of 100 traces "
+                                 "(PullOutConductanceBlock_k always; these as ticked)")
+    ff.grid(row=6, column=0, columnspan=3, sticky="ew", padx=2, pady=(6, 0))
+    for col, (key, text) in enumerate((("bias", "Save Bias (Voltage block, V)"),
+                                       ("current", "Save Current (A)"),
+                                       ("sense", "Save Sense (Extension block, nm)"),
+                                       ("hist", "Save Hist (block histogram)"),
+                                       ("piezo_wave", "Save Piezo wave (the ramp, V)"))):
+        ttk.Checkbutton(ff, text=text, variable=flag_vars[key]).grid(
+            row=col // 3, column=col % 3, sticky="w", padx=4, pady=1)
+    ttk.Checkbutton(fb, text="also keep the raw .h5 session (recommended: raw volts + "
+                             "config, so a re-measured gain reprocesses the file)",
+                    variable=h5_var).grid(row=7, column=0, columnspan=3,
+                                          sticky="w", padx=2, pady=(4, 0))
     ttk.Checkbutton(fb, text="also write a .txt table when the run ends "
                              "(nm, then one G/G0 column per trace)",
-                    variable=txt_var).grid(row=7, column=0, columnspan=3,
+                    variable=txt_var).grid(row=8, column=0, columnspan=3,
                                            sticky="w", padx=2)
     next_lbl = tk.Label(fb, text="", font=("Arial", 9), anchor="w", justify="left",
                         wraplength=px(560))
-    next_lbl.grid(row=8, column=0, columnspan=3, sticky="w", padx=2, pady=(4, 0))
+    next_lbl.grid(row=9, column=0, columnspan=3, sticky="w", padx=2, pady=(4, 0))
     file_lbl = tk.Label(fb, text="no run in progress", font=("Arial", 9), anchor="w",
                         wraplength=px(560), justify="left")
-    file_lbl.grid(row=9, column=0, columnspan=3, sticky="w", padx=2)
+    file_lbl.grid(row=10, column=0, columnspan=3, sticky="w", padx=2)
+    igor_next = {"n": None}                    # Igor's Saved, as read from the folder
 
     def saving_now() -> dict:
-        return {"folder": Path(folder_var.get().strip() or str(out_dir)),
-                "name": name_var.get(), "experiment": exp_var.get(),
-                "notes": notes_var.get(),
-                "txt": txt_var.get(), "igor": igor_var.get()}
+        sv = {"folder": Path(folder_var.get().strip() or str(out_dir)),
+              "setup_id": setup_var.get().strip() or "_",
+              "name": name_var.get(), "experiment": exp_var.get(),
+              "notes": notes_var.get(), "h5": h5_var.get(), "txt": txt_var.get()}
+        sv.update({key: var.get() for key, var in flag_vars.items()})
+        return sv
 
     def show_next():
+        """The line under the boxes: the day folder the next trace goes to
+        and the number it gets, read from the block files already there
+        (igor_scheme's scan); while a run is going the worker's own count
+        takes over (the readout event)."""
         worker.saving.update(saving_now())
-        folder, stem = worker.experiment_paths()
-        rel = Path(*folder.parts[-2:]) if len(folder.parts) >= 2 else folder
-        next_lbl.config(text=f"next Start N: {rel}{os.sep}{stem}_<N>traces.h5"
-                             + (" + .ibw" if igor_var.get() else "")
-                             + (" + .txt" if txt_var.get() else "")
-                             + "  (under the data folder)")
-    for var in (folder_var, name_var, exp_var, notes_var, txt_var, igor_var):
-        var.trace_add("write", lambda *_a: show_next())
+        folder = worker.day_folder()
+        try:
+            igor_next["n"] = next_trace_number(folder)
+            word = str(igor_next["n"])
+        except Exception as exc:                 # noqa: BLE001  (igor2 missing, a half-written file)
+            igor_next["n"] = None
+            word = f"? ({exc})"
+        extras = [k for k, on in (("h5", h5_var.get()), ("txt", txt_var.get())) if on]
+        next_lbl.config(text=f"Igor folder: {folder}   next trace (Saved): {word}"
+                             + (f"   (+ .{' + .'.join(extras)} beside the Igor files)"
+                                if extras else ""))
+
+    pending_scan = {"id": None}
+
+    def schedule_show_next(*_a):
+        """A keystroke in the folder box must not read a 4 MB block each
+        time: the scan runs 300 ms after the last change."""
+        if pending_scan["id"] is not None:
+            root.after_cancel(pending_scan["id"])
+        pending_scan["id"] = root.after(300, lambda: (pending_scan.update(id=None),
+                                                      show_next()))
+    for var in (folder_var, setup_var, name_var, exp_var, notes_var, h5_var, txt_var,
+                *flag_vars.values()):
+        var.trace_add("write", schedule_show_next)
     show_next()
 
-    # -- a saved session, at the bottom of the Saving tab ---------------------------
-    bb = ttk.LabelFrame(fb, text="A saved session: browse its traces, plot its histograms")
-    bb.grid(row=10, column=0, columnspan=3, sticky="ew", padx=2, pady=(6, 2))
+    # -- saved data, at the bottom of the Saving tab -----------------------------------
+    bb = ttk.LabelFrame(fb, text="Saved data: browse traces, plot histograms (.h5 session, "
+                                 "Igor day folder, or one PullOutConductanceBlock_k.ibw)")
+    bb.grid(row=11, column=0, columnspan=3, sticky="ew", padx=2, pady=(6, 2))
     browse = {"session": None, "path": None, "n": 0, "hist": None}
     idx_var = tk.StringVar(value="1")          # traces count from 1, as plot.py's -1
 
-    def open_file():
-        path = filedialog.askopenfilename(initialdir=folder_var.get() or str(out_dir),
-                                          filetypes=[("session", "*.h5")])
-        if not path:
-            return
+    def open_saved(path: str):
+        """Open saved data for browsing: a .h5 session of this program, an
+        Igor day folder (Igor's own or this program's), or one block file
+        (IgorDay)."""
+        p = Path(path)
         writer = worker.writer
-        if writer is not None and Path(path).resolve() == Path(writer.path).resolve():
+        if (writer is not None and p.suffix.lower() == ".h5"
+                and p.resolve() == Path(writer.path).resolve()):
             set_status("that file is still being written (a run is in "
-                               "progress or paused); open it when the run has ended")
+                       "progress or paused); open it when the run has ended")
             return
         if browse["session"] is not None:
             browse["session"].close()
             browse.update(session=None, path=None, n=0, hist=None)
         try:
-            s = storage.Session(path)
+            if p.is_dir() or p.suffix.lower() == ".ibw":
+                set_status(f"reading {p.name} ...", level="busy")
+                root.update_idletasks()
+                s = IgorDay(p)
+            else:
+                s = storage.Session(p)
         except Exception as exc:                 # noqa: BLE001
-            set_status(f"could not open {Path(path).name}: {exc}")
+            set_status(f"could not open {p.name}: {exc}")
             return
         if len(s) == 0:
             s.close()
-            set_status(f"{Path(path).name} holds no traces")
-            blbl.config(text=f"{Path(path).name}: 0 traces")
+            set_status(f"{p.name} holds no traces")
+            blbl.config(text=f"{p.name}: 0 traces")
             return
-        browse.update(session=s, path=path, n=len(s), hist=None)
+        browse.update(session=s, path=str(p), n=len(s), hist=None)
         idx_var.set("1")
-        blbl.config(text=f"{Path(path).name}: {len(s)} traces")
+        blbl.config(text=f"{p.name}: {len(s)} traces"
+                         + (f" ({s.describe()})" if isinstance(s, IgorDay) else ""))
+        if (isinstance(s, IgorDay) and worker.igor is not None
+                and s.folder.resolve() == worker.igor.folder.resolve()):
+            set_status("this is today's folder: traces saved from now on are not "
+                       "shown until you open it again", level="warn")
+        else:
+            set_status(f"opened {p.name}: {len(s)} traces", level="ok")
         show_saved()
+
+    def open_file():
+        path = filedialog.askopenfilename(
+            initialdir=folder_var.get() or str(out_dir),
+            filetypes=[("session or Igor block", "*.h5 *.ibw"), ("session", "*.h5"),
+                       ("Igor block", "*.ibw")])
+        if path:
+            open_saved(path)
+
+    def open_folder():
+        path = filedialog.askdirectory(initialdir=folder_var.get() or str(out_dir),
+                                       title="an Igor day folder, e.g. 10_22_26Merge")
+        if path:
+            open_saved(path)
 
     def show_saved(delta: int = 0):
         s = browse["session"]
@@ -2326,7 +2820,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         live["paused"] = True
         draw_saved(s, i - 1)
 
-    ttk.Button(bb, text="Open .h5 ...", command=open_file).grid(
+    ttk.Button(bb, text="Open .h5 / .ibw ...", command=open_file).grid(
         row=0, column=0, padx=2, pady=1, sticky="ew")
     ttk.Button(bb, text="<", width=3, command=lambda: show_saved(-1)).grid(
         row=0, column=1, padx=1)
@@ -2340,27 +2834,37 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         row=0, column=5, padx=2, pady=1, sticky="ew")
 
     def save_png():
-        if browse["path"] is None:
-            set_status("open a saved session first")
+        s = browse["session"]
+        if s is None:
+            set_status("open saved data first")
             return
         try:
             number = int(idx_var.get())
-            fig2, info = session_plots.trace_figure(browse["path"], number)
-            out = Path(browse["path"]).with_name(
-                f"{Path(browse['path']).stem}_trace{info['number']:04d}.png")
-            fig2.savefig(out, dpi=110)
+            if isinstance(s, IgorDay):
+                # The window's four panels as drawn for this trace, into
+                # the folder, named by Igor's trace number.
+                t = s.trace(max(1, min(number, len(s))) - 1)
+                out = s.folder / f"{s.name}_trace{t['number']:04d}.png"
+                fig.savefig(out, dpi=110)
+            else:
+                fig2, info = session_plots.trace_figure(browse["path"], number)
+                out = Path(browse["path"]).with_name(
+                    f"{Path(browse['path']).stem}_trace{info['number']:04d}.png")
+                fig2.savefig(out, dpi=110)
         except Exception as exc:                 # noqa: BLE001
             set_status(f"PNG not written: {exc}")
             return
         set_status(f"wrote {out}")
-    ttk.Button(bb, text="Save PNG of trace", command=save_png).grid(
+    ttk.Button(bb, text="Open Igor day folder ...", command=open_folder).grid(
         row=1, column=0, padx=2, pady=1, sticky="ew")
+    ttk.Button(bb, text="Save PNG of trace", command=save_png).grid(
+        row=1, column=1, columnspan=3, padx=2, pady=1, sticky="ew")
     ttk.Button(bb, text="Plot 1D histogram",
                command=lambda: open_hist_window("1d")).grid(
-        row=1, column=1, columnspan=3, padx=2, pady=1, sticky="ew")
+        row=1, column=4, padx=2, pady=1, sticky="ew")
     ttk.Button(bb, text="Plot 2D histogram",
                command=lambda: open_hist_window("2d")).grid(
-        row=1, column=4, columnspan=2, padx=2, pady=1, sticky="ew")
+        row=1, column=5, padx=2, pady=1, sticky="ew")
     blbl = tk.Label(bb, text="", font=("Arial", 9), anchor="w", wraplength=px(560),
                     justify="left")
     blbl.grid(row=2, column=0, columnspan=6, sticky="w", padx=2)
@@ -2368,13 +2872,24 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     def open_hist_window(kind: str):
         s = browse["session"]
         if s is None:
-            set_status("open a saved session first (Open .h5 ...)")
+            set_status("open saved data first (Open .h5 / .ibw ... or Open Igor "
+                       "day folder ...)")
             return
+        source = s
+        if isinstance(s, IgorDay):
+            set_status(f"reading every trace of {s.name} for the histogram ...",
+                       level="busy")
+            root.update_idletasks()
+            try:
+                source = s.data()
+            except Exception as exc:             # noqa: BLE001
+                set_status(f"could not read {s.name}: {exc}")
+                return
         win = tk.Toplevel(root)
         _light_window(win)
         win.title(f"{Path(browse['path']).name}: "
                   + ("1D histogram" if kind == "1d" else "2D histogram"))
-        hist_window(win, s, Path(browse["path"]).stem, kind, tk, ttk,
+        hist_window(win, source, Path(browse["path"]).stem, kind, tk, ttk,
                     FigureCanvasTkAgg, Figure, status)
 
     # -- the plots --------------------------------------------------------------------
@@ -2678,7 +3193,55 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         apply_limits()
         canvas.draw_idle()
 
-    def draw_saved(s: storage.Session, i: int):
+    def draw_igor(s: IgorDay, i: int):
+        """The four panels for a trace of an Igor day folder or block: the
+        junction voltage and current from the Voltage and Current blocks
+        when they were saved, the conductance against its own displacement
+        axis with the sense readback (Extension block) over it, the piezo
+        command the parameters imply, and the histogram over everything
+        opened."""
+        t = s.trace(i)
+        scfg = s.cfg
+        C = scfg.cal
+        g0, disp, fs = t["g0"], t["disp"], t["fs"]
+        verdict = analysis.select_trace(g0, scfg.ramp)
+        who = f"Igor trace {t['number']} (block {t['block']})"
+        if t["voltage_v"] is not None and t["current_a"] is not None:
+            # Back to raw volts with this config's calibration, which the
+            # record panel undoes again: an exact round trip.
+            rec = np.stack([t["voltage_v"] * C.voltage_input_sign,
+                            t["current_a"] * C.preamp_gain_v_per_a + C.current_zero_v])
+            plots.plot_record(ax["record"], scfg, rec, fs,
+                              title=f"{who}: junction V and current (Voltage and "
+                                    "Current blocks)")
+        else:
+            ax["record"].clear()
+            ax["record"].set_title(f"{who}: no Voltage/Current block saved", fontsize=9)
+        sense_v = None
+        if t["extension_nm"] is not None:
+            sense_v = t["extension_nm"] / C.sense_nm_per_volt + C.sense_zero_v
+        plots.plot_trace(ax["trace"], scfg, g0, disp, verdict, title=who, sense_v=sense_v)
+        tt = np.arange(g0.size) / fs
+        p = t["params"]
+        # Slot 3 is the piezo position after the pull, slot 0 the pull.
+        start_nm = (p[3] + p[0]) if np.isfinite(p[3]) and np.isfinite(p[0]) else disp[-1]
+        plots.plot_piezo(ax["piezo"], scfg, tt, C.nm_to_piezo_volts(start_nm - disp),
+                         sense_v, title="piezo during the pull (from the parameters, "
+                                        "this config's nm/V)")
+        if browse["hist"] is None:
+            browse["hist"] = s.hist if s.hist is not None else \
+                analysis.log_histogram(list(s.conductances()), igor_bins=True)
+        plots.plot_histogram(ax["hist"], scfg, *browse["hist"], browse["n"],
+                             title=f"histogram of {s.name}")
+        banner.config(text=f"BROWSING {s.name}: {who}, Igor's numbering; "
+                           f"live plots paused")
+        apply_limits()
+        canvas.draw_idle()
+
+    def draw_saved(s, i: int):
+        if isinstance(s, IgorDay):
+            draw_igor(s, i)
+            return
         scfg = s.cfg
         voltage, current = s.raw(i)
         g0 = s.conductance(i)
@@ -2734,6 +3297,15 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                     banner.config(text="SAFETY STOP: see the status line; close "
                                        "and restart", fg="#b00000")
             elif kind == "readout":
+                # "saved" is the day counter: the worker's once it has the
+                # day's Igor writer, else what the Saving tab read from the
+                # folder's files.
+                saved = p["saved"]
+                if saved is None:
+                    saved = igor_next["n"] - 1 if igor_next["n"] is not None else "?"
+                elif p.get("igor_folder") and live.get("experiment") is not None:
+                    next_lbl.config(text=f"Igor folder: {p['igor_folder']}   "
+                                         f"next trace (Saved): {saved + 1}")
                 left_col = [
                     f"state     {p['state']}",
                     f"piezo     {p['piezo_v']:7.4f} V",
@@ -2747,7 +3319,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                     f"current   {p['current_ua']:9.4f} uA" + (" RAILED" if p["railed"] else ""),
                     f"G         {p['g0']:.3e} G0",
                     f"zero      {p['zero_uv']:+.1f} uV",
-                    f"accepted  {p['accepted']} / {p['attempts']}, {p['saved']} saved",
+                    f"accepted  {p['accepted']} / {p['attempts']}, {saved} saved today",
                 ]
                 lines = [f"{a:<27}{b}" for a, b in zip(left_col, right_col)]
                 lines.append(f"file      {live.get('file') or 'none open'}")
@@ -2780,6 +3352,8 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                 file_lbl.config(text=(f"experiment {Path(p['stem']).name}: waiting "
                                       "for the first accepted trace" if p["stem"]
                                       else "no run in progress"))
+                if not p["stem"]:
+                    schedule_show_next()       # the run's blocks are on disk: re-read
             elif kind == "cycle":
                 live["cycle"] = p["cycle"]
                 live["trace"] = p if p.get("record") is not None else None
@@ -2794,10 +3368,17 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                 elif live.get("experiment") is None:
                     file_lbl.config(text="no file open")
             elif kind == "saved":
-                live["file"] = Path(p["path"]).name
-                file_lbl.config(text=f"writing {live['file']}: {p['n']} traces")
-            elif kind == "exported":
-                pass
+                live["file"] = Path(p["path"]).name if p["path"] else None
+                words = []
+                if p.get("number") is not None:
+                    words.append(f"Igor trace {p['number']} -> "
+                                 f"{Path(p['folder']).name}{os.sep}"
+                                 f"PullOutConductanceBlock_{p['block']}")
+                if p["path"]:
+                    words.append(f"{live['file']}: {p['run']} traces" if p["run"]
+                                 else f"{live['file']}: {p['n']} test pulls")
+                file_lbl.config(text="writing " + "; ".join(words) if words
+                                else "nothing is being written")
             elif kind == "monitor":
                 rec = p["record"]
                 tail = rec[:, rec.shape[1] // 2:]
@@ -2934,6 +3515,16 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             trace={"x": (-0.5, 3.0), "y": (-7.0, 1.0), "y2": None}), redraw_now()))
         root.after(3000, lambda: (lim_state["win"].destroy(),   # and close again
                                   mon_state["win"].destroy()))
+
+        def smoke_browse_igor():
+            # The run of 3 is over by now: its block is on disk. Open the
+            # day folder in the browser, show a trace, draw its histogram.
+            if worker.igor is not None and worker.run_stem is None:
+                open_saved(str(worker.igor.folder))
+                if isinstance(browse["session"], IgorDay):
+                    show_saved(+1)
+                    open_hist_window("1d")
+        root.after(3300, smoke_browse_igor)
         # The Settings tab: a refused value and an accepted one, previewed.
         root.after(4500, lambda: (nb.select(sb), left_canvas.yview_moveto(1.0),
                                   svars["ramp.bias_v"].set("900")))
@@ -2984,23 +3575,36 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--simulate", action="store_true", help="fake card, no hardware")
     p.add_argument("--out", type=Path, default=None,
                    help="data folder (default: the one the Saving tab last "
-                        "used, else data/); the date and your name are "
-                        "added under it")
+                        "used, else data/); Igor's day folder "
+                        "MM_DD<setup id>YYMerge is made under it")
+    p.add_argument("--setup-id", default=None, metavar="ID",
+                   help="Igor's SetupID in the day folder name (default: the "
+                        "one the Saving tab last used, else '_', which gives "
+                        "e.g. 10_22_26Merge)")
     p.add_argument("--no-igor", action="store_true",
-                   help="do not write Igor .ibw blocks when a file closes")
+                   help="do not write the Igor files (PullOut*Block_k.ibw); "
+                        "for bench tests, the raw .h5 is still written")
     p.add_argument("--require-engaged", action="store_true",
                    help="also require each trace to start in contact")
     p.add_argument("--headless", type=int, metavar="N",
-                   help="no window: zero, then N cycles, save, export, report")
+                   help="no window: zero, then N cycles saved into the day "
+                        "folder as Start N saves them, then a report")
     p.add_argument("--test-pull", type=float, metavar="VOLTS",
                    help="headless: instead of cycles, N pulls from this piezo "
                         "voltage with no approach and no contact (a rig with "
                         "no tip)")
+    p.add_argument("--name", default=None, metavar="WHO",
+                   help="headless: your name, for the .h5 and the log (default: "
+                        "the one the Saving tab last used)")
+    p.add_argument("--experiment", default=None, metavar="WHAT",
+                   help="headless: the experiment, which names the .h5 and goes "
+                        "into the Igor block's note (default: the one the Saving "
+                        "tab last used)")
     p.add_argument("--readback", action="store_true",
                    help="GUI: open the readback-only window at start")
     p.add_argument("--save-test-pulls", action="store_true",
                    help="headless with --test-pull: also save them to a "
-                        "TESTPULLS .h5 and export it for Igor (format test)")
+                        "TESTPULLS .h5 (a format test, never Igor data)")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--zoom", type=float, default=None,
                    help="make the window bigger or smaller: 1.2 is a fifth "
@@ -3020,22 +3624,35 @@ def main(argv: list[str] | None = None) -> int:
     if args.simulate:
         cfg.simulate = True
     try:
-        if args.headless is not None:
-            return run_headless(cfg, args.headless, args.out or _ROOT / "data",
-                                not args.no_igor,
-                                args.require_engaged, test_pull_v=args.test_pull,
-                                save_test_pulls=args.save_test_pulls)
         # The smoke run keeps its remembered settings in its own folder so
         # it never pre-fills a real session's Saving tab.
         saving_file = (args.out / "pullout_saving.json"
                        if args.autoclose is not None and args.out is not None
                        else _ROOT / "data" / "pullout_saving.json")
-        out = args.out or Path(load_saving(saving_file).get("folder")
-                               or _ROOT / "data")
+        remembered = load_saving(saving_file)
+        if args.headless is not None:
+            # Saved exactly as Start N saves: the name, experiment, notes
+            # and save boxes the Saving tab remembered apply; the folder
+            # and the Setup ID come from the flags (the Setup ID is
+            # remembered too).
+            saving = {key: remembered[key] for key in DEFAULT_SAVING
+                      if key in remembered and key not in ("folder", "setup_id")}
+            if args.name is not None:
+                saving["name"] = args.name
+            if args.experiment is not None:
+                saving["experiment"] = args.experiment
+            return run_headless(cfg, args.headless, args.out or _ROOT / "data",
+                                not args.no_igor,
+                                args.require_engaged, test_pull_v=args.test_pull,
+                                save_test_pulls=args.save_test_pulls,
+                                setup_id=args.setup_id or remembered.get("setup_id") or "_",
+                                saving=saving)
+        out = args.out or Path(remembered.get("folder") or _ROOT / "data")
         return run_gui(cfg, out, not args.no_igor,
                        args.config.name if args.config else "defaults",
                        autoclose=args.autoclose, readback=args.readback,
-                       saving_file=saving_file, zoom=args.zoom)
+                       saving_file=saving_file, zoom=args.zoom,
+                       setup_id=args.setup_id)
     except (ConfigError, SafetyViolation) as exc:
         log.error("%s", exc)
         return 1

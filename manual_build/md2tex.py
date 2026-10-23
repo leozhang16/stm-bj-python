@@ -40,7 +40,7 @@ PARTS = [
         "00_overview", "01_architecture", "02_config_reference",
         "03_hardware", "04_snippets", "10_constant_bias", "11_push_pull",
         "12_iv_sweep", "13_ac_hold", "14_high_bias_hold", "15_echem_gate_cv",
-        "16_lateral_monolayer", "17_bias_series", "20_keithley",
+        "16_lateral_monolayer", "17_bias_series", "18_igor_data_scheme", "20_keithley",
         "21_vzero", "30_quick_reference"]),
 ]
 

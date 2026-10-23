@@ -93,7 +93,14 @@ wiring serves both programs.
    junction-voltage, current and piezo-sense BNCs into **AI 9, AI 10, AI 11** (shields to AI GND) and
    open the Test Panel once to confirm each reads a known voltage in RSE (see caveat 2).
 2. Put `DaqMxFunctions.xop` in the **32-bit** Igor's `Igor Extensions` folder (caveat 1) and start the
-   32-bit Igor.
+   32-bit Igor. On the lab PC (Igor Pro 7.08) that means: copy the file to
+   `C:\Users\<you>\Documents\WaveMetrics\Igor Pro 7 User Files\Igor Extensions` (not the folder named
+   `Igor Extensions (64-bit)`), quit Igor, and start **`Igor.exe`** from
+   `C:\Program Files\WaveMetrics\Igor Pro 7 Folder\IgorBinaries_Win32\` (pin it to the taskbar), not
+   `Igor64.exe` from `IgorBinaries_x64\`. The program folder's own `Igor Extensions` folder works too.
+   Double-clicking an `.ipf` file opens the 64-bit one, so start Igor first and open the file from
+   inside it. Check with `Print IgorInfo(0)` (must say `IGORKIND:pro`, not `pro64`) and
+   `Print exists("MXCreateTask")` (must print `3`).
 3. File > Open File > Procedure: `Setup_NewDAQ_STMBJ.ipf`. Compile. Then **Macros > STM Break Junction
    Measurement** (that runs `InitializeExperiment` and opens the panels). Start from a new experiment.
 4. Set the amplifier gain on its front panel **and** type the same number into the panel's Gain box.
@@ -109,7 +116,10 @@ wiring serves both programs.
 1. **The DAQ extension is 32-bit Windows.** `DaqMxFunctions.xop` is a PE32 (32-bit) DLL. It loads
    only in the **32-bit Igor Pro** (`Igor.exe`, Igor 7 or 8), not in Igor64 and not in Igor 9. Put it
    in the 32-bit `Igor Extensions` folder as before. Its source is not in `STM_Igor`; if you ever want
-   64-bit Igor, the XOP has to be rebuilt or replaced.
+   64-bit Igor, the XOP has to be rebuilt or replaced. **Install only this one extension.** The old
+   folder also held `VISA.xop`, `VDT2.xop` (actuator) and `NIGPIB2.xop` (Keithley); none is used any
+   more, and without the NI-VISA driver `VISA.xop` pops up "VISA Error: The specified module could not
+   be found" every time Igor starts. Remove them from the `Igor Extensions` folder.
 2. **Inputs are RSE, and that is why they are on AI 9, 10, 11.** `MXCreateAIVoltageChan` has no
    terminal-configuration argument, so the card's *default* mode applies to each channel and Igor
    cannot ask for RSE. From NI's USB-6453 specification: **AI 0-7 and AI 16-23** default to
@@ -133,7 +143,7 @@ wiring serves both programs.
 6. **Engage threshold.** `G_ConductanceThreshold = 5` G0 cannot be reached with a 1e6 V/A preamp at
    100 mV (the input rails at 1.29 G0). Set the gain to 1e5 on the amplifier and in the panel, or lower
    the threshold, as before.
-7. **Data path** is still `D:Experiments:` (`DataDir`). Change it if the new PC differs.
+7. **Data path** is `C:Data:` (`DataDir` in the setup file), so blocks land in `C:\Data\<date>Merge\`. Create `C:\Data` once, or point `DataDir` elsewhere (Igor colon notation, parent folder must exist).
 8. Start from a **new experiment**: old `.pxp` files carry the old globals and wave sizes.
 
 ## Pre-existing quirks the tests found (not changed)

@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from stmlab import approach, storage
+from stmlab import approach, igor_scheme, storage
 from stmlab.config import RigConfig
 from stmlab.instrument import Rig
 from stmlab.sim import SimulatedDaqSession
@@ -182,7 +182,8 @@ def test_a_run_files_its_traces_under_date_name_experiment(ap, cfg, tmp_path):
         assert list(tmp_path.rglob("*.h5")) == []
         worker.cmd_run(2, {"folder": tmp_path, "name": "Leo Z",
                            "experiment": "clean gold", "txt": True})
-        folder = tmp_path / time.strftime("%Y-%m-%d") / "Leo_Z"
+        # Igor's day folder: <root>/MM_DD<SetupID>YYMerge, everything of the day in it
+        folder = tmp_path / igor_scheme.day_folder_name()
         h5 = list(folder.glob("clean_gold_*_2traces.h5"))
         assert len(h5) == 1
         txt = h5[0].with_suffix(".txt")
@@ -221,7 +222,8 @@ def test_every_run_adds_a_row_to_the_experiment_log(ap, cfg, tmp_path):
     finally:
         worker.close_file()
         ap.close_rig(guard, rig)
-    log = tmp_path / "experiment_log.csv"           # one file, every day
+    # one log per day folder, beside the Igor blocks
+    log = tmp_path / igor_scheme.day_folder_name() / "experiment_log.csv"
     with open(log, newline="") as f:
         lines = list(csv.reader(f))
     # A header, then two lines per experiment: the facts, then the path alone.
@@ -287,7 +289,8 @@ def test_stop_pauses_a_run_and_continue_finishes_it_in_the_same_file(ap, cfg, tm
         # The note says where the run was stopped and that it was continued.
         import csv
         import h5py
-        with open(tmp_path / "experiment_log.csv", newline="") as f:
+        with open(tmp_path / igor_scheme.day_folder_name() / "experiment_log.csv",
+                  newline="") as f:
             lines = list(csv.reader(f))
         assert "Stop after trace 0 at " in lines[1][6] and ", continued " in lines[1][6]
         with h5py.File(files[0]) as h:
@@ -872,18 +875,22 @@ def test_headless_cycles_save_and_export(ap, cfg, tmp_path):
         ap.close_rig(guard, rig)
     h5 = list(tmp_path.rglob("*.h5"))
     assert len(h5) == 1
-    # <folder>/<date>/<name>/<experiment>_<HHMMSS>_<N>traces.h5
-    assert h5[0].parent.name == "unknown"
-    assert h5[0].parent.parent.name == time.strftime("%Y-%m-%d")
+    # <folder>/MM_DD<SetupID>YYMerge/<experiment>_<HHMMSS>_<N>traces.h5, Igor's day folder
+    day = tmp_path / igor_scheme.day_folder_name()
+    assert h5[0].parent == day
     assert h5[0].name.endswith(f"_{worker.accepted}traces.h5")
     with storage.Session(h5[0]) as s:
         assert len(s) == worker.accepted >= 1
     pytest.importorskip("igor2")
-    ibw = list(tmp_path.rglob("*.ibw"))
-    assert len(ibw) == 1
-    traces, params = storage.split_igor_block(storage.load_ibw(ibw[0]))
-    assert traces.shape == (worker.accepted, cfg.ramp.n_pull_samples)
-    assert np.all(params[:, 10] == pytest.approx(cfg.ramp.bias_v * 1e3))
+    # Igor's own block files, partial (3 of 100 columns filled), plus the companions and the histogram
+    names = sorted(p.name for p in day.glob("PullOut*.ibw"))
+    assert names == ["PullOutConductanceBlockHist_1.ibw", "PullOutConductanceBlock_1.ibw",
+                     "PullOutCurrentBlock_1.ibw", "PullOutVoltageBlock_1.ibw"]
+    block = igor_scheme.read_block(day, 1)
+    assert block.g0.shape == (cfg.ramp.n_pull_samples, worker.accepted)
+    assert list(block.numbers) == list(range(1, worker.accepted + 1))
+    assert np.all(block.params[:, 10] == pytest.approx(cfg.ramp.bias_v * 1e3))
+    assert igor_scheme.IgorDayWriter.scan(day) == (1, worker.accepted)
 
 
 def test_an_applied_bias_reaches_the_output_at_once(ap, cfg, tmp_path):

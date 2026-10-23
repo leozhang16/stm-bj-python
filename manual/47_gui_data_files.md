@@ -1,5 +1,15 @@
 # 47. What the GUI writes, and how to read it back
 
+> **Since pullout v65, the day-to-day program (`pullout.py`) writes Igor's
+> own saving scheme**: a day folder named as Igor's `MakePath` named it
+> (`10_22_26Merge`), 100-trace blocks `PullOutConductanceBlock_k.ibw` with
+> their Voltage / Current / Extension / Hist companions, and the raw `.h5`
+> session and `experiment_log.csv` beside them. That scheme — every file,
+> its units and shape, the numbering, and how `plot.py` reads the old Igor
+> data — is **[chapter 18](18_igor_data_scheme.md)**. This chapter
+> describes the older `stmgui` window's (`gui.py`) HDF5 / CSV layout,
+> which that window still writes.
+
 *Igor: `MakePath`, Functions_STMBJ.ipf:200; `SavePullOut`, :438; `LogHistFromBlocks`, :785. Modules: `stmgui/controller.py` (naming, headers), `stmlab/storage.py` (formats).*
 
 Igor wrote its data as `.ibw` blocks — one two-dimensional wave per
@@ -187,7 +197,10 @@ Igor's conductance columns and `Session.conductance(i)` here — same
 displacement axis, same bias, same gain. The 1 G0 peak position of the
 two histograms is the whole-chain check (chapter 10).
 
-> That comparison has not been done. No `.ibw` file from this rig was
-> available when the package was written, and the 1 G0 peak has only been
-> reproduced from the simulator. Until an archived block has been read
-> and matched, the analysis is self-consistent, not validated.
+> Done in October 2026 (pullout v65): the archived July 2026 blocks on the
+> NAS read back trace for trace through `stmlab.igor_scheme`, and a day
+> folder written by pullout.py loads in Igor through the analysis macro's
+> own `LoadCond` with every number matching. Chapter 18 has the scheme;
+> `tests/test_igor_scheme.py` holds the real-data test. Note that
+> `storage.split_igor_block` expected NaN blank rows; real Igor files have
+> two **zero** rows there, which `igor_scheme.split_block` handles.

@@ -88,7 +88,7 @@ Strconstant CounterElectrodeOut= "Dev1/ao3"	// [NEWDAQ] was LowResCounterElectro
 // that are named in the group convention for identifying
 // the date and setup used for experiments
 Strconstant SetupID= "_"
-Strconstant DataDir= "D:Experiments:"
+Strconstant DataDir= "C:Data:"	// [NEWDAQ] was "D:Experiments:" (old PC). Parent folder must exist; Igor creates the dated subfolder. Change to taste.
 
 // create item in 'Macros' menu
 Menu "Macros"

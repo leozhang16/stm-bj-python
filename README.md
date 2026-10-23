@@ -4,7 +4,9 @@
 
 **The bench:** `python rigcheck.py` (or `--simulate`) is the hardware test window for a new rig: the card the driver sees with its details and self-test, any inputs read live with a scope trace, any outputs driven with a DC level or a sine or square wave under a voltage limit, the Keithley over GPIB, and the actuator with a click test that asks whether you heard it. Nothing in it is automatic; `python -m stmlab.main bringup 1..4` is the pass/fail version of the same checks.
 
-**The data:** `python plot.py <session>.h5 1D` (conductance histogram), `2D` (against displacement), `-1` (trace 1; `-2` the second ...), nothing (both histograms); `--save` writes a PNG instead of opening a window; `python plot.py -h` lists the knobs. It reads this program's `.h5` and `.txt` files and Igor's own `.ibw` blocks (`pip install igor2`), mixed in one histogram if you like. The window's histogram windows draw through the same file.
+**The data:** `pullout.py` saves exactly what Igor's `SavePullOut` saved: a day folder named as Igor named it (`10_22_26Merge`) holding 100-trace blocks `PullOutConductanceBlock_k.ibw` with their Voltage / Current / Extension / Hist companions, so Igor's analysis macro opens a Python day and Python opens an Igor day. `python plot.py <day folder> 1D` (conductance histogram, Igor's bins), `2D` (against displacement), `-250` (trace 250 of the day, with its voltage, current and extension when the companions exist), nothing (both histograms); `--blocks 1-5,9` or `--traces 1-500` pick part of a folder; `--save` writes a PNG instead of opening a window; `python plot.py -h` lists the knobs. It reads a day folder, any `PullOut*.ibw` block, a saved `Loghist*.ibw`, and this program's raw `.h5` and `.txt` files, mixed in one histogram if you like (`pip install igor2` for the `.ibw` files). The raw `.h5` session and `experiment_log.csv` go into the same day folder. Chapter 18 of the manual (`manual/18_igor_data_scheme.md`) is the whole scheme, file by file. The window's histogram windows draw through the same `plot.py`.
+
+**Version note:** pullout **v65** writes Igor's saving scheme (`stmlab/igor_scheme.py`); the earlier `<data folder>/<date>/<name>/` layout and the `_bNNN.ibw` export are gone, and `--no-igor` now means "do not write the Igor files".
 
 Everything the Igor procedures in `../igor_code/` could run, as one Python
 folder — **including the GUI**. This is `../python_code_entire_igor/`
@@ -22,7 +24,8 @@ experiments/      01_constant_bias ... 08_bias_series (unchanged)
 snippets/         01 ... 16 (unchanged)
 manual/           chapters 00-30 (unchanged) + 40_gui.md (new)
 tests/            93 core tests + 28 GUI tests
-data/             where the GUI writes: data/<date>/*.h5, *.csv
+data/             where gui.py writes (data/<date>/*.h5, *.csv); pullout.py writes Igor's
+                  day folders <root>/MM_DD_YYMerge/PullOut*.ibw + the raw .h5 (manual chapter 18)
 ```
 
 ## Quick start
@@ -142,8 +145,13 @@ session to regenerate the graph figures (`make_figures.py`).
 Inherited from the base folder: the constant-bias path carries 93 tests and
 the 1 G₀ self-check on the simulator; the hardware-only paths (Keithley
 GPIB, second-card EChem/X-piezo, every `nidaqmx` call) have never met their
-instruments, and the comparison against archived Igor `.ibw` data has not
-been done. The GUI adds 28 tests and changes none of that: it calls the
+instruments. The GUI adds 28 tests and changes none of that: it calls the
 same functions, so it is exactly as trustworthy as they are, and no more.
+Since pullout v65 the file format is Igor's own: the archived July 2026
+blocks (`Raw_data/07_16_26`) read back trace for trace, and a day folder
+written by pullout.py was loaded in Igor Pro by the lab's own analysis
+macro (`LoadCond`, `LoadVoltage`, `LoadCurrent`) with every number matching
+(`tests/test_igor_scheme.py`; the Igor side lives in
+`STM_Igor/Igor_for_New_DAQ/tests/RoundTrip_IgorScheme.ipf`).
 
 Simulate first, scope second, tip last.

@@ -44,9 +44,13 @@ def average_deviation(x: np.ndarray) -> float:
 def boxcar(x: np.ndarray, width: int = 11) -> np.ndarray:
     """Igor's ``Smooth/B width``: a sliding box average.
 
-    Igor pads by holding the end values, which is what ``mode="nearest"``
-    reproduces; a zero-padded convolution would drag the ends of every trace
-    toward zero and bias the low-conductance tail.
+    Igor's default end treatment is *Bounce* (``/E=0``): the points missing
+    beyond each end are the wave reflected about its end point, ``w[-i] =
+    w[i]`` and ``w[n-1+i] = w[n-1-i]``, which is ``np.pad(mode="reflect")``.
+    ``LogHistFromBlocks`` calls plain ``Smooth/B 11``, so that is what the
+    histogram saw. (Holding the end value is Igor's ``/E=3``, numpy's
+    ``"edge"``; a zero-padded convolution would drag the ends of every trace
+    toward zero and bias the low-conductance tail.)
     """
     x = np.asarray(x, dtype=float)
     if width <= 1 or x.size == 0:
@@ -54,7 +58,7 @@ def boxcar(x: np.ndarray, width: int = 11) -> np.ndarray:
     if width % 2 == 0:
         width += 1                       # Igor rounds even widths up
     pad = width // 2
-    padded = np.pad(x, pad, mode="edge")
+    padded = np.pad(x, pad, mode="reflect")
     kernel = np.ones(width) / width
     return np.convolve(padded, kernel, mode="valid")
 
@@ -271,7 +275,9 @@ def log_histogram(traces,
                   keep_fraction: float = 0.95,
                   smooth_width: int = 11,
                   zero_cutoff: float | None = None,
-                  subtract_floor: bool = True) -> tuple[np.ndarray, np.ndarray]:
+                  subtract_floor: bool = True,
+                  igor_bins: bool = False,
+                  tail_rows: int = 0) -> tuple[np.ndarray, np.ndarray]:
     """Accumulate log10(G/G0) over many traces. Igor's ``LogHistFromBlocks``.
 
     This is the measurement. Individual traces prove nothing; configurations
@@ -292,13 +298,31 @@ def log_histogram(traces,
 
     Returns ``(bin_centres, counts_per_trace)``.
 
-    One deliberate difference from Igor: Igor's ``SetScale/I x -8,2`` over
-    1000 points gives a bin width of 10/999, half a percent wider than 10/1000
-    and with the last bin hanging past 2.0. This uses even bins across
-    [lo, hi]. The resulting peak shift is under 0.005 decade, an order of
-    magnitude below the 0.05 decade agreement target.
+    Two ways to bin. By default the bins are even across [lo, hi]
+    (``linspace(lo, hi, n_bins + 1)``). With ``igor_bins=True`` they are
+    Igor's: ``SetScale/I x lo, hi`` over ``n_bins`` points puts point i at
+    ``lo + i*(hi-lo)/(n_bins-1)`` and ``Histogram/A`` bins by that scaling,
+    so bin i runs from that point to the next -- with -8, 2 and 1000 points
+    the edges are ``-8 + arange(1001) * 10/999``, half a percent wider than
+    10/1000 and the last bin hanging past 2.0. ``igor_bins=True`` is what
+    the Igor-scheme block histogram (``igor_scheme.block_histogram``) and
+    plot.py use, so the peak positions can be compared with Igor's bin for
+    bin; the difference between the two binnings is under 0.005 decade, an
+    order of magnitude below the 0.05 decade agreement target.
+
+    ``tail_rows`` reproduces Igor's cut on a block column. ``LogHistFromBlocks``
+    ran on the whole ConductanceBlock column -- the N trace points *plus*
+    the 22 rows of zeros and parameters -- so its ``Redimension/N=(0.95*N)``
+    kept ``floor(0.95 * (N + 22))`` points of the trace. With ``tail_rows``
+    the cut is ``int((N + tail_rows) * keep_fraction)``, capped at N;
+    ``igor_scheme.block_histogram`` and plot.py pass 22 for Igor-block data
+    (with ``zero_cutoff`` set), so the two agree bin for bin. The default 0
+    is the plain cut of step 1.
     """
-    edges = np.linspace(lo, hi, n_bins + 1)
+    if igor_bins:
+        edges = lo + np.arange(n_bins + 1, dtype=float) * (hi - lo) / (n_bins - 1)
+    else:
+        edges = np.linspace(lo, hi, n_bins + 1)
     centres = 0.5 * (edges[:-1] + edges[1:])
     counts = np.zeros(n_bins, dtype=float)
 
@@ -308,7 +332,8 @@ def log_histogram(traces,
         if g0.size == 0:
             continue
 
-        keep = max(1, int(g0.size * keep_fraction))
+        keep = int((g0.size + tail_rows) * keep_fraction)
+        keep = max(1, min(g0.size, keep))
         g0 = boxcar(g0[:keep], smooth_width)
 
         window = g0[int(g0.size * 0.95):int(g0.size * 0.96) + 1]

@@ -41,6 +41,12 @@ exists only in this folder and is not in that PDF.
 | [16. Lateral monolayer](16_lateral_monolayer.md) | Site-by-site maps across a monolayer |
 | [17. Bias series](17_bias_series.md) | Igor's `rungo` campaign |
 
+## The data
+
+| Chapter | Covers |
+|---|---|
+| [18. The data: Igor's saving scheme](18_igor_data_scheme.md) | What `pullout.py` (v65) writes and `plot.py` reads: the `MM_DD_YYMerge` day folder, blocks of 100, every `PullOut*` file with its units and shape, the 20 parameter slots, the numbering and the resume, plotting the old Igor data (`--blocks`, `--traces`, `-N`, a `Loghist` file), the three differences from Igor |
+
 ## Support systems
 
 | Chapter | Covers |
@@ -64,7 +70,7 @@ working.
 | [44. The Electrochemistry panel](44_gui_echem_panel.md) | Counter-electrode gating; CV HighRes / LowRes; the keep mask; the simulated cell |
 | [45. The graph windows and the History window](45_gui_graphs.md) | The nine graphs with figures, what feeds each, the History format |
 | [46. Menus and macros](46_gui_macros.md) | File, Macros (rungo, LateralEXPT, X piezo), Windows, Help, keyboard |
-| [47. What the GUI writes, and how to read it back](47_gui_data_files.md) | Session HDF5 layout and headers, histogram CSVs, CV files, reading examples |
+| [47. What the GUI writes, and how to read it back](47_gui_data_files.md) | The older `stmgui` window's files: session HDF5 layout and headers, histogram CSVs, CV files, reading examples (what `pullout.py` writes is chapter 18) |
 | [48. How stmgui is built](48_gui_architecture.md) | state / controller / widgets / graphs / panels / app; threading rules; adding a control, a button, a graph; tests |
 | [49. Deviations, limitations, troubleshooting](49_gui_troubleshooting.md) | Every deliberate difference from Igor; config warnings; symptom → cause → fix |
 | [50. GUI quick reference](50_gui_quick_reference.md) | Buttons → methods → Igor procedures; events; keys; files; commands; the numbers you change most |
