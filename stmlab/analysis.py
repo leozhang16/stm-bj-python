@@ -70,10 +70,15 @@ def boxcar(x: np.ndarray, width: int = 11) -> np.ndarray:
 def to_conductance(current_v: np.ndarray,
                    cal: Calibration,
                    voltage_v: np.ndarray | None = None,
-                   bias_v: float | None = None) -> np.ndarray:
+                   bias_v: float | None = None,
+                   channel: int = 1) -> np.ndarray:
     """Preamp output volts -> conductance in units of G0.
 
         G/G0 = (V_out - V_zero) / (Rf * V_bias * G0)
+
+    ``channel`` picks whose gain and zero ``Rf`` and ``V_zero`` are: 1, or
+    2 for the second output of a two-channel amplifier
+    (``cal.preamp_gain_2_v_per_a``, ``cal.current_zero_2_v``).
 
     Pass ``voltage_v`` to divide by the *measured* junction voltage sample by
     sample, which is what Igor did (Functions_STMBJ.ipf:388-389) and what the
@@ -87,7 +92,7 @@ def to_conductance(current_v: np.ndarray,
     if (voltage_v is None) == (bias_v is None):
         raise ValueError("pass exactly one of voltage_v or bias_v")
 
-    amps = cal.volts_to_amps(np.asarray(current_v, dtype=float))
+    amps = cal.volts_to_amps(np.asarray(current_v, dtype=float), channel)
     if bias_v is not None:
         denominator = float(bias_v)
     else:
@@ -189,10 +194,37 @@ class Selection:
     plateau_counts: float = float("nan")
 
 
+def open_side(g0, g0_2=None, railed2=None) -> np.ndarray:
+    """The conductance the *open* side of a trace is judged on.
+
+    With one current channel that is the trace itself. With both outputs
+    of a two-channel amplifier it is channel 2 (``g0_2``, the higher-gain
+    output) wherever that is in range, and channel 1 (``g0``) wherever
+    channel 2 is at its rail (``railed2``, a boolean per point). At the
+    break threshold channel 1 is down in its own noise and offset; where
+    channel 2 is railed the current is large and channel 1 is good.
+    ``railed2=None`` takes channel 2 as it is, for data that keeps no raw
+    volts to tell by (the Igor day folders).
+
+    For decisions only -- did this trace end in an open junction -- never
+    for what is drawn or saved, where each channel stays as measured.
+    """
+    g0 = np.asarray(g0, dtype=float)
+    if g0_2 is None:
+        return g0
+    g0_2 = np.asarray(g0_2, dtype=float)
+    if g0_2.shape != g0.shape:
+        return g0
+    if railed2 is None:
+        return g0_2
+    return np.where(np.asarray(railed2, dtype=bool), g0, g0_2)
+
+
 def select_trace(g0: np.ndarray, ramp: RampConfig,
                  require_engaged: bool = False,
                  plateau_min_counts: float = 10.0,
-                 end_deviation_max: float = 0.01) -> Selection:
+                 end_deviation_max: float = 0.01,
+                 g0_open: np.ndarray | None = None) -> Selection:
     """Accept or reject one trace. Igor's ``TestTrace``.
 
     Two crude criteria, plus one that Igor left switched off:
@@ -215,14 +247,25 @@ def select_trace(g0: np.ndarray, ramp: RampConfig,
     Selection is the step where this measurement becomes unfalsifiable if you
     are careless, which is why all of it lives in this one function rather
     than being scattered through the acquisition code.
+
+    ``g0_open`` is the trace the first criterion is read from when that is
+    not ``g0`` itself: the open side of a two-channel amplifier
+    (:func:`open_side`, channel 2 where it is in range). The other two are
+    always read from ``g0``, channel 1.
     """
     g0 = np.asarray(g0, dtype=float)
     n = g0.size
     if n < 200:
         return Selection(False, "trace too short")
 
+    low = g0
+    if g0_open is not None:
+        low = np.asarray(g0_open, dtype=float)
+        if low.size != n:
+            raise ValueError(f"g0_open has {low.size} points, the trace {n}")
+
     # End of trace: Igor sampled the 90%-91% window.
-    tail = g0[int(n * 0.90):int(n * 0.91) + 1]
+    tail = low[int(n * 0.90):int(n * 0.91) + 1]
     end_mean = float(np.mean(tail))
     end_adev = average_deviation(tail)
 
@@ -277,7 +320,8 @@ def log_histogram(traces,
                   zero_cutoff: float | None = None,
                   subtract_floor: bool = True,
                   igor_bins: bool = False,
-                  tail_rows: int = 0) -> tuple[np.ndarray, np.ndarray]:
+                  tail_rows: int = 0,
+                  gate_by=None) -> tuple[np.ndarray, np.ndarray]:
     """Accumulate log10(G/G0) over many traces. Igor's ``LogHistFromBlocks``.
 
     This is the measurement. Individual traces prove nothing; configurations
@@ -318,6 +362,15 @@ def log_histogram(traces,
     ``igor_scheme.block_histogram`` and plot.py pass 22 for Igor-block data
     (with ``zero_cutoff`` set), so the two agree bin for bin. The default 0
     is the plain cut of step 1.
+
+    ``gate_by`` is a second list of traces, one per trace. Step 4's
+    condition is then read from *that* trace's floor, found by steps 1 to
+    3, while the floor that is subtracted stays the trace's own. The two
+    histograms of a two-channel amplifier both pass channel 2 here: a
+    trace is then in both curves or in neither, and channel 1's own floor
+    cannot drop it (on a low-gain output a few tens of microvolts of
+    offset are already more than the cutoff). An entry that is None leaves
+    that trace gated by itself.
     """
     if igor_bins:
         edges = lo + np.arange(n_bins + 1, dtype=float) * (hi - lo) / (n_bins - 1)
@@ -326,21 +379,32 @@ def log_histogram(traces,
     centres = 0.5 * (edges[:-1] + edges[1:])
     counts = np.zeros(n_bins, dtype=float)
 
+    def smoothed(values):
+        """Steps 1 to 3: (the kept, smoothed trace, its floor)."""
+        keep = int((values.size + tail_rows) * keep_fraction)
+        keep = max(1, min(values.size, keep))
+        values = boxcar(values[:keep], smooth_width)
+        window = values[int(values.size * 0.95):int(values.size * 0.96) + 1]
+        return values, (float(np.mean(window)) if window.size else 0.0)
+
+    gates = iter(gate_by) if gate_by is not None else None
     n_used = 0
     for trace in traces:
+        gate = next(gates, None) if gates is not None else None
+        if trace is None:
+            continue                  # no such trace on this channel
         g0 = np.asarray(trace, dtype=float)
         if g0.size == 0:
             continue
 
-        keep = int((g0.size + tail_rows) * keep_fraction)
-        keep = max(1, min(g0.size, keep))
-        g0 = boxcar(g0[:keep], smooth_width)
+        g0, floor = smoothed(g0)
 
-        window = g0[int(g0.size * 0.95):int(g0.size * 0.96) + 1]
-        floor = float(np.mean(window)) if window.size else 0.0
-
-        if zero_cutoff is not None and not floor < zero_cutoff:
-            continue
+        if zero_cutoff is not None:
+            judged = floor
+            if gate is not None and np.size(gate):
+                judged = smoothed(np.asarray(gate, dtype=float))[1]
+            if not judged < zero_cutoff:
+                continue
 
         if subtract_floor:
             g0 = boxcar(g0 - floor, smooth_width)
@@ -364,7 +428,8 @@ def histogram_2d(traces, disp_nm: np.ndarray,
                  x_range: tuple[float, float] = (-0.5, 2.0), n_x: int = 200,
                  y_range: tuple[float, float] = (-7.0, 1.0), n_y: int = 300,
                  keep_fraction: float = 0.95,
-                 smooth_width: int = 11) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                 smooth_width: int = 11,
+                 align_by=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Conductance against displacement over many traces: the 2D histogram.
 
     Per trace: keep the first ``keep_fraction`` of the points (the tail
@@ -377,6 +442,13 @@ def histogram_2d(traces, disp_nm: np.ndarray,
     histogram). Returns ``(counts, x_edges, y_edges)`` with counts per
     trace, ``counts[i, j]`` for displacement bin i and log-conductance
     bin j.
+
+    ``align_by`` is a second list of traces, one per trace, that the zero
+    is taken from instead: the histogram of channel 2 of a two-channel
+    amplifier is aligned where *channel 1* drops below ``align_at_g0``,
+    because channel 2 is railed while the gold contact is breaking and
+    cannot say where that happened. An entry that is None leaves that
+    trace out.
     """
     x_edges = np.linspace(x_range[0], x_range[1], n_x + 1)
     y_edges = np.linspace(y_range[0], y_range[1], n_y + 1)
@@ -386,6 +458,8 @@ def histogram_2d(traces, disp_nm: np.ndarray,
         disp_nm = np.asarray(disp_nm, dtype=float)
     n_used = 0
     for k, trace in enumerate(traces):
+        if trace is None:
+            continue                          # no such trace on this channel
         g0 = np.asarray(trace, dtype=float)
         if g0.size == 0:
             continue
@@ -393,8 +467,15 @@ def histogram_2d(traces, disp_nm: np.ndarray,
         g0 = boxcar(g0[:keep], smooth_width)
         x = np.asarray(disp_nm[k] if per_trace else disp_nm, dtype=float)[:keep]
         if align_at_g0 is not None:
-            below = np.flatnonzero(g0 < align_at_g0)
-            if below.size == 0:
+            judge = g0
+            if align_by is not None:
+                other = align_by[k]
+                if other is None:
+                    continue
+                other = np.asarray(other, dtype=float)
+                judge = boxcar(other[:min(keep, other.size)], smooth_width)
+            below = np.flatnonzero(judge < align_at_g0)
+            if below.size == 0 or below[0] >= x.size:
                 continue                      # never broke: no zero to align to
             x = x - x[below[0]]
         with np.errstate(divide="ignore", invalid="ignore"):

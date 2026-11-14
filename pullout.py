@@ -49,6 +49,28 @@ of their own, drawn by plot.py -- the same file that works alone:
 numbers (state, piezo, junction, current, zero, traces saved today, file,
 Keithley) and the last message, in colour.
 
+A current amplifier with two outputs is read as two channels (the Current
+amplifier box: one channel or two, and the gain of each. On a rig whose
+config names channel 2's input it stands in the left column where the
+Keithley box otherwise is, in view when the window opens, and the Keithley
+box is not shown: a two-output amplifier is not the 428. On a one-channel
+rig it is the first box of the Settings tab). Channel 1 is the lower-gain output, the one that follows the
+junction through contact, and contact is judged on it, as with one
+channel. Channel 2 is the higher-gain output for the low conductances,
+and the junction-open test (the Break threshold: the approach's separate
+step and the end of every trace) is read from it, because down there
+channel 1 is in its own noise; where channel 2 is at its rail channel 1
+is read instead. Channel 2 is read in the same task during every play,
+saved with every trace, and drawn beside channel 1 -- the trace panel and the
+histogram show both on one plot, channel 1 in blue and channel 2 in red,
+each as it was measured. Nothing is stitched, so the histogram has two
+noise floors and channel 2 is drawn railed where the junction was closed.
+Which card input channel 2 is on is the config's ``channels.ai_current_2``
+(``configs/newrig_2ch.json`` is such a rig); its raw volts go into the .h5
+(``current2_v``), and its Igor files into the day folder's ``ch2``
+subfolder under Igor's own names, same blocks and trace numbers, while
+channel 1's files stay exactly as they are.
+
 The Piezo box is Igor's PiezoGroupbox: a slider over the piezo's whole
 voltage range (applies when the mouse is released, as Igor's did), Step
 closer / Step apart by Z nm, and under them Igor's readouts -- I (uA),
@@ -100,6 +122,7 @@ import copy
 import csv
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -128,7 +151,7 @@ log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v65"
+__version__ = "v68"
 
 # What the Saving tab holds when nothing is remembered yet. ``folder`` is
 # the data folder (the day folder is made under it); ``setup_id`` is Igor's
@@ -175,7 +198,30 @@ SETTINGS = [
     # estimates use it; the conductance itself does not (it divides by the
     # measured junction voltage). 0 means there is no resistor.
     ("keithley.series_resistance_ohm", "Series resistor", "G_SeriesResistance", "ohm", float, 1),
+    # The gains of the current amplifier: what the amplifier is set to,
+    # typed in because the program cannot read them off the box (they tell
+    # the arithmetic, they program nothing). Channel 1 is the output
+    # contact is judged on; channel 2 is the second, higher-gain output of
+    # a two-channel amplifier, which the junction-open test is read from,
+    # and only matters while two channels are read.
+    # Both live in the Current amplifier box.
+    ("cal.preamp_gain_v_per_a", "Gain ch 1", "", "V/A", float, 1),
+    ("cal.preamp_gain_2_v_per_a", "Gain ch 2", "", "V/A", float, 1),
 ]
+AMPLIFIER_SETTINGS = ("cal.preamp_gain_v_per_a", "cal.preamp_gain_2_v_per_a")
+
+
+def follow_gain(cfg: RigConfig) -> None:
+    """Keep ``keithley.gain_exponent`` in step with a channel-1 gain typed
+    in the window, when that gain is a whole decade (1e5, 1e6, ...): the
+    exponent is what the Keithley box shows, and the validator compares
+    the two. A gain that is not a whole decade has no exponent to follow
+    and is left alone (the validator then compares nothing)."""
+    gain = cfg.cal.preamp_gain_v_per_a
+    if gain > 0:
+        decades = math.log10(gain)
+        if abs(decades - round(decades)) < 1e-9:
+            cfg.keithley.gain_exponent = int(round(decades))
 
 
 def _get(cfg, path: str):
@@ -205,6 +251,12 @@ def check_settings(cfg: RigConfig, changes: dict) -> tuple[list[str], list[str]]
     for path, value in changes.items():
         _set(trial, path, value)
     R = trial.ramp
+    if not trial.cal.preamp_gain_v_per_a > 0 or \
+            not trial.cal.preamp_gain_2_v_per_a > 0:
+        return ["an amplifier gain must be a positive number of V/A "
+                "(1e6, say)"], []
+    if "cal.preamp_gain_v_per_a" in changes:
+        follow_gain(trial)
     if R.pull_length_nm <= 0 or R.pull_rate_nm_per_s <= 0:
         problems.append("excursion and pull rate must be positive")
     if R.approach_step_nm <= 0 or R.retract_step_nm <= 0:
@@ -256,6 +308,9 @@ class CycleLog:
     rec_i: list = field(default_factory=list)
     last_record: np.ndarray | None = None
     last_waveform: np.ndarray | None = None
+    # Channel 2 of a two-channel amplifier over the same play as
+    # ``last_record`` (raw volts), or None while it is not read.
+    last_current2: np.ndarray | None = None
 
 
 class Monitor:
@@ -297,8 +352,10 @@ class Monitor:
         sense = self.rig.last_sense_v
         if sense is not None and sense.size != n:
             sense = None
+        second = self.rig.last_current2_v      # channel 2 of this same play
         with self.lock:
             c = self.cycle
+            c.last_current2 = second
             if self.quiet:
                 c.last_record = record
                 c.last_waveform = waveform
@@ -419,6 +476,15 @@ class Worker(threading.Thread):
         self.hist_sum = None
         self.hist_centres = None
         self.hist_n = 0
+        # The same histogram of channel 2 of a two-channel amplifier, on
+        # the same bins, summed over the run's accepted traces that have
+        # one. Its own sum and its own count: nothing is merged.
+        self.hist2_sum = None
+        self.hist2_n = 0
+        # The noise floor of each accepted trace of the run: the rms of its
+        # open end on channel 1 and, when it has one, on channel 2 (None
+        # otherwise). For the report; nothing is decided on it.
+        self.floors: list = []
         self.bias_dirty = True                 # set_bias before the next cycle
         self.busy = False                      # a command is running
         self.current: str | None = None        # its name
@@ -515,11 +581,79 @@ class Worker(threading.Thread):
         self.rig.set_ai_terminal(name)
         self.cmd_newfile()                     # the next file carries the mode
         m = self.cfg.channels
-        inputs = list(m.ai_channels) + ([m.piezo_sense_path] if m.sense_in_record else [])
+        inputs = list(m.record_inputs)         # channel 2 and the sense line too
         keep = f'"ai_terminal": "{name}"' + (f', "sense_terminal": "{name}"'
                                              if m.sense_in_record else "")
         self.status(f"inputs {', '.join(inputs)} now in {name} mode. To keep it, "
                     f"put {keep} in the config's channels", level="ok")
+
+    def amplifier_state(self) -> dict:
+        """The current amplifier as the config has it now, for the window's
+        Current amplifier box: how many outputs are read, whether the
+        config names an input for channel 2 at all, the inputs, the gains."""
+        m, C = self.cfg.channels, self.cfg.cal
+        return {"channels": 2 if m.two_current_channels else 1,
+                "available": bool(m.ai_current_2),
+                "ch1": m.path(m.ai_current),
+                "ch2": m.path(m.ai_current_2) if m.ai_current_2 else None,
+                "gain1": C.preamp_gain_v_per_a, "gain2": C.preamp_gain_2_v_per_a}
+
+    def cmd_amplifier(self) -> None:
+        """Tell the window how the current amplifier is read."""
+        self.post("amplifier", **self.amplifier_state())
+
+    def cmd_current_channels(self, n: int) -> None:
+        """Read one output of the current amplifier or both, live: the
+        input task is rebuilt with or without channel 2, the piezo and
+        the bias stay where they are, and the next file carries it.
+        Contact is channel 1's either way; the junction-open test moves to
+        channel 2 with two channels and back to channel 1 with one."""
+        n = int(n)
+        m = self.cfg.channels
+        if n == (2 if m.two_current_channels else 1):
+            self.post("amplifier", **self.amplifier_state())
+            return
+        if n == 2 and not m.ai_current_2:
+            self.status('two channels refused: the config names no input for '
+                        'channel 2. Put "ai_current_2": "ai4" (the card input '
+                        'channel 2 is wired to) in the config\'s channels',
+                        level="bad")
+            self.post("amplifier", **self.amplifier_state())
+            return
+        if self.rig.state is RigState.ENGAGED:
+            self.status("current channels refused: the tip is in contact; step "
+                        "apart first (the inputs are rebuilt, and a reading is lost)")
+            self.post("amplifier", **self.amplifier_state())
+            return
+        try:
+            self.rig.set_current_channels(n)
+        except Exception as exc:                   # noqa: BLE001
+            self.post("amplifier", **self.amplifier_state())
+            self.status(f"current channels: the card refused {m.path(m.ai_current_2)} "
+                        f"({type(exc).__name__}: {str(exc).splitlines()[0]}); still "
+                        "reading one channel", level="bad")
+            return
+        self.cmd_newfile()                     # the next file carries the count
+        self.hist2_sum, self.hist2_n = None, 0
+        if self.histogram() is not None:
+            # The run's histogram so far stays; channel 2's starts again.
+            self.post("hist", centres=self.hist_centres, counts=self.histogram(),
+                      n=self.hist_n, counts2=None)
+        self.post("amplifier", **self.amplifier_state())
+        C = self.cfg.cal
+        if n == 2:
+            self.status(f"two current channels: ch 1 on {m.path(m.ai_current)} "
+                        f"({C.preamp_gain_v_per_a:g} V/A), which contact is judged "
+                        f"on, and ch 2 on {m.current2_path} "
+                        f"({C.preamp_gain_2_v_per_a:g} V/A), drawn in red, which the "
+                        'Break threshold is judged on. Calibrate zero now takes '
+                        'both. To keep it, put "current_channels": 2 in the '
+                        'config\'s channels', level="ok")
+        else:
+            self.status(f"one current channel: {m.path(m.ai_current)} "
+                        f"({C.preamp_gain_v_per_a:g} V/A); channel 2 is not read. "
+                        'To keep it, put "current_channels": 1 in the config\'s '
+                        "channels", level="ok")
 
     def cmd_monitor(self) -> None:
         """One quiet 10 ms hold at the present position and bias, for the
@@ -534,7 +668,8 @@ class Worker(threading.Thread):
         sense_v = (float(np.mean(sense[sense.size // 2:]))
                    if sense is not None and sense.size else None)
         self.post("monitor", t=time.monotonic(), record=rec,
-                  piezo_v=self.rig.piezo_v, sense_v=sense_v)
+                  piezo_v=self.rig.piezo_v, sense_v=sense_v,
+                  ch2=self.rig.channel2_of(rec))
 
     # -- the Keithley 428 ----------------------------------------------------------
 
@@ -566,7 +701,10 @@ class Worker(threading.Thread):
         except Exception as exc:                 # noqa: BLE001
             self.status(f"Keithley: could not open {K.resource}: {exc}. "
                         "pyvisa and a VISA backend are needed (see the "
-                        "Keithley tab); the front-panel buttons do the same.")
+                        "Keithley tab); the front-panel buttons do the same."
+                        + (" The gain the program computes with needs no "
+                           "Keithley: type it in the Current amplifier box "
+                           "(Settings tab)." if action == "gain" else ""))
             return
         sim = " (simulated)" if self.cfg.simulate else ""
         if action == "connect":
@@ -819,6 +957,9 @@ class Worker(threading.Thread):
         was = self.rig.piezo_v
         self.rig.piezo_ramp_to(volts)
         g0, railed = self.rig.probe()
+        # The same probe on the open side: channel 2 of a two-channel
+        # amplifier while it is in range, else this same pair.
+        g_open, railed_open, ch_open = self.rig.open_side()
         R = self.cfg.ramp
         if railed or g0 > R.engage_g0:
             self.rig.state = RigState.ENGAGED
@@ -826,10 +967,12 @@ class Worker(threading.Thread):
         else:
             # Not parked, not engaged: the tip is wherever the hand left it.
             self.rig.state = RigState.UNKNOWN
-            word = "open" if g0 < R.break_g0 else "tunnelling"
+            word = ("open" if not railed_open and g_open < R.break_g0
+                    else "tunnelling")
         self.post("moved", cycle=self.mon.snapshot())
+        second = f" (ch 2: {g_open:.3e} G0)" if ch_open == 2 else ""
         self.status(f"piezo {was:.4f} -> {self.rig.piezo_v:.4f} V "
-                    f"({self.rig.piezo_nm:.1f} nm): G = {g0:.3e} G0, {word}")
+                    f"({self.rig.piezo_nm:.1f} nm): G = {g0:.3e} G0{second}, {word}")
 
     def cmd_step(self, delta_nm: float) -> None:
         """Igor's PiezoStepCloser / PiezoStepApart: closer is +nm."""
@@ -839,10 +982,22 @@ class Worker(threading.Thread):
 
     def cmd_zero(self) -> None:
         self.status("measuring the preamp zero at 0 V bias ...")
-        zero = calibrate.measure_zero(self.rig)
+        zero, zero2 = calibrate.measure_zeros(self.rig)
         self.cfg.cal.current_zero_v = zero
         self.bias_dirty = True
         text = f"preamp zero {zero * 1e6:+.2f} uV, written into cal"
+        if zero2 is not None:
+            # Channel 2 of a two-channel amplifier, from the same hold. A
+            # reading at the rail is not an offset: the junction is closed
+            # (a contact passes the amplifier's own offset current even at
+            # 0 V bias), and the old zero is kept.
+            if abs(zero2) >= self.cfg.limits.preamp_saturation_v:
+                text += (f"; channel 2 reads {zero2:+.2f} V at 0 V bias, which is "
+                         "its rail, not a zero: NOT taken. Open the junction "
+                         "(Step apart) and calibrate again")
+            else:
+                self.cfg.cal.current_zero_2_v = zero2
+                text += f"; channel 2 zero {zero2 * 1e6:+.2f} uV"
         # The sense line's zero drifts from day to day like any offset; the
         # slope is the stable property. Re-measure the zero here, at whatever
         # command the piezo sits at, assuming the config's slope.
@@ -858,7 +1013,7 @@ class Worker(threading.Thread):
                      f"{(today - was) * C.sense_nm_per_volt:+.0f} nm of offset "
                      f"removed for this session)")
         self.status(text)
-        self.post("zero", zero_v=zero)
+        self.post("zero", zero_v=zero, zero2_v=zero2)
 
     def cmd_bias(self) -> None:
         self.rig.set_bias(self.cfg.ramp.bias_v)
@@ -905,12 +1060,22 @@ class Worker(threading.Thread):
             self.post("cycle", cycle=cycle, record=None, verdict=None)
             return None
         g0 = tr.conductance_g0(self.cfg)
+        # Channel 2 of a two-channel amplifier, as it was measured: shown
+        # and saved beside channel 1. The verdict reads the end of the
+        # trace from it (the open side: channel 2 where it is in range,
+        # channel 1 where it is railed); the start of the trace and the
+        # gold plateau are channel 1's.
+        g0_2 = g0_open = None
+        if tr.current2_v is not None:
+            g0_2 = tr.conductance_g0(self.cfg, channel=2)
+            g0_open = tr.open_side_g0(self.cfg)
         verdict = analysis.select_trace(g0, self.cfg.ramp,
-                                        require_engaged=self.require_engaged)
+                                        require_engaged=self.require_engaged,
+                                        g0_open=g0_open)
         disp = tr.displacement_nm(self.cfg)
         if test:
             self.post("cycle", cycle=cycle, record=tr, g0=g0, disp=disp,
-                      verdict=verdict)
+                      verdict=verdict, g0_2=g0_2)
             saved = ""
             if self.save and self.save_test_pulls:
                 self._save(tr, verdict, test=True)
@@ -921,16 +1086,17 @@ class Worker(threading.Thread):
             return verdict
         if verdict.accepted:
             self.accepted += 1
-            self._accumulate(g0)
+            self._accumulate(g0, g0_2)
             if self.save:
                 self._save(tr, verdict)
         else:
             key = verdict.reason.split(":")[0].split("(")[0].strip()
             self.rejections[key] = self.rejections.get(key, 0) + 1
         self.post("cycle", cycle=cycle, record=tr, g0=g0, disp=disp,
-                  verdict=verdict)
+                  verdict=verdict, g0_2=g0_2)
         self.post("hist", centres=self.hist_centres,
-                  counts=self.histogram(), n=self.hist_n)
+                  counts=self.histogram(), n=self.hist_n,
+                  counts2=self.histogram2())
         word = "accepted" if verdict.accepted else "rejected"
         self.status(f"trace {word}: {verdict.reason}; {self.accepted} accepted "
                     f"in {self.attempts} attempts")
@@ -1081,6 +1247,13 @@ class Worker(threading.Thread):
         C = self.cfg.cal
         return 0.0, C.current_zero_v / C.preamp_gain_v_per_a * 1e6
 
+    def izero2(self) -> float:
+        """Slot 16 of channel 2's parameters in the ch2 subfolder: what
+        Calibrate zero measured on the amplifier's second output, as a
+        current in uA (``offsets`` gives channel 1's)."""
+        C = self.cfg.cal
+        return C.current_zero_2_v / C.preamp_gain_2_v_per_a * 1e6
+
     def _note_fields(self) -> dict:
         """What goes into the ConductanceBlock's wave note besides the
         trace range: the program version, the experiment and who ran it
@@ -1199,7 +1372,10 @@ class Worker(threading.Thread):
         self.run_pauses = []
         self.hist_sum = None
         self.hist_n = 0
-        self.post("hist", centres=None, counts=None, n=0)
+        self.hist2_sum = None
+        self.hist2_n = 0
+        self.floors = []
+        self.post("hist", centres=None, counts=None, n=0, counts2=None)
         self.post("experiment", stem=str(self.run_stem))
         writer = self.igor_writer(self.run_started)
         self.status(f"experiment {stem}: files go to {folder}"
@@ -1234,7 +1410,7 @@ class Worker(threading.Thread):
                 self.flush_igor()
                 return []
             auto = self.auto_notes(len(traces))
-            written += [p.name for p in self.flush_igor()]
+            written += [self._igor_file_name(p) for p in self.flush_igor()]
             h5: Path | None = None
             if self.writer is not None and not self.writer_is_test:
                 try:
@@ -1261,6 +1437,27 @@ class Worker(threading.Thread):
                                       f"notes={sv.get('notes', '')}",
                                       f"auto_notes={auto}"])
                     written += [data.name, info.name]
+                    # Channel 2 of a two-channel amplifier: its own table,
+                    # the same layout, from the traces that have one (the
+                    # others are a column of NaN, so the columns of the
+                    # two tables are the same traces).
+                    if any(t[3] is not None for t in traces):
+                        n_pts = max(t[0].size for t in traces)
+                        second = [t[3] if t[3] is not None
+                                  else np.full(n_pts, np.nan, dtype=np.float32)
+                                  for t in traces]
+                        data2, info2 = storage.save_txt_block(
+                            final.with_name(final.name + "_ch2.txt"), self.cfg, second,
+                            start_piezo_v=[t[1] for t in traces],
+                            timestamps=[t[2] for t in traces],
+                            header_lines=[f"name={sv['name']} experiment={sv['experiment']} "
+                                          f"file={h5.name if h5 else final.parent.name}",
+                                          "current channel 2 of a two-channel amplifier "
+                                          f"(channel 1: {data.name})",
+                                          f"notes={sv.get('notes', '')}",
+                                          f"auto_notes={auto}"],
+                            channel=2)
+                        written += [data2.name, info2.name]
                 except Exception as exc:           # noqa: BLE001
                     log.exception("txt export failed")
                     self.post("error", text=f"txt export failed: {exc}", fatal=False)
@@ -1279,6 +1476,16 @@ class Worker(threading.Thread):
 
     SESSION_LOG = "experiment_log.csv"
 
+    @staticmethod
+    def _igor_file_name(path: Path) -> str:
+        """A written Igor file as the messages name it: its name, with
+        ``ch2/`` in front for a file of channel 2's subfolder (which has
+        the same file names as the day folder)."""
+        path = Path(path)
+        if path.parent.name == igor_scheme.CH2_FOLDER:
+            return f"{igor_scheme.CH2_FOLDER}/{path.name}"
+        return path.name
+
     def auto_notes(self, n_traces: int) -> str:
         """The sentence a lab notebook would want written for every run,
         made from the settings and from what the junction actually read:
@@ -1289,11 +1496,21 @@ class Worker(threading.Thread):
         R, C, K = self.cfg.ramp, self.cfg.cal, self.cfg.keithley
         v_open = float(np.median(self.run_v_open)) if self.run_v_open else float("nan")
         v_con = float(np.median(self.run_v_contact)) if self.run_v_contact else float("nan")
+        # ":g", not ".0e": a gain typed in the Current amplifier box need
+        # not be a whole decade, and 4.7e5 must not be noted as 5e+05.
+        gain = f"gain {C.preamp_gain_v_per_a:g} V/A"
+        zero = f"preamp zero {C.current_zero_v * 1e6:+.1f} uV"
+        if self.cfg.channels.two_current_channels:
+            # Both outputs of the amplifier, each with its own numbers.
+            gain = (f"two current channels: ch 1 gain {C.preamp_gain_v_per_a:g} "
+                    f"V/A, ch 2 gain {C.preamp_gain_2_v_per_a:g} V/A")
+            zero = (f"zero ch 1 {C.current_zero_v * 1e6:+.1f} uV, ch 2 "
+                    f"{C.current_zero_2_v * 1e6:+.1f} uV")
         note = (f"bias set {R.bias_v * 1e3:g} mV; junction measured "
                 f"{v_open:.1f} mV open, {v_con:.1f} mV at pull start "
                 f"(medians over {n_traces} traces); series resistor "
-                f"{K.series_resistance_ohm:g} ohm; gain {C.preamp_gain_v_per_a:.0e} V/A; "
-                f"preamp zero {C.current_zero_v * 1e6:+.1f} uV; pull "
+                f"{K.series_resistance_ohm:g} ohm; {gain}; "
+                f"{zero}; pull "
                 f"{R.pull_length_nm:g} nm at {R.pull_rate_nm_per_s:g} nm/s, "
                 f"engage {R.engage_g0:g} G0, break {R.break_g0:g} G0, "
                 f"{C.piezo_nm_per_volt:g} nm/V")
@@ -1352,18 +1569,52 @@ class Worker(threading.Thread):
 
     # -- bookkeeping ---------------------------------------------------------
 
-    def _accumulate(self, g0: np.ndarray) -> None:
+    def _accumulate(self, g0: np.ndarray, g0_2: np.ndarray | None = None) -> None:
+        """Add an accepted trace to the run's histogram, and its channel 2
+        (when it has one) to channel 2's: the same recipe and bins, a
+        histogram of its own."""
         centres, counts = analysis.log_histogram([g0])
         if self.hist_sum is None:
             self.hist_centres, self.hist_sum = centres, np.zeros_like(counts)
         if counts.any():
             self.hist_sum += counts
             self.hist_n += 1
+        if g0_2 is not None:
+            _, counts2 = analysis.log_histogram([g0_2])
+            if self.hist2_sum is None:
+                self.hist2_sum = np.zeros_like(counts2)
+            if counts2.any():
+                self.hist2_sum += counts2
+                self.hist2_n += 1
+        # Each channel's noise floor on this trace: the rms over 85 to 95 %
+        # of the pull, where the junction is open (the last 5 % holds the
+        # alignment spike).
+        a, b = int(g0.size * 0.85), int(g0.size * 0.95)
+        if b - a >= 10:
+            self.floors.append((float(np.std(g0[a:b])),
+                                float(np.std(g0_2[a:b])) if g0_2 is not None
+                                else None))
+
+    def noise_floors(self) -> tuple[float | None, float | None]:
+        """(channel 1's noise floor, channel 2's) over the run's accepted
+        traces, in G0: the median of each trace's rms at its open end.
+        None for a channel with no traces."""
+        first = [f[0] for f in self.floors]
+        second = [f[1] for f in self.floors if f[1] is not None]
+        return (float(np.median(first)) if first else None,
+                float(np.median(second)) if second else None)
 
     def histogram(self) -> np.ndarray | None:
         if self.hist_sum is None or self.hist_n == 0:
             return None
         return self.hist_sum / self.hist_n
+
+    def histogram2(self) -> np.ndarray | None:
+        """Channel 2's histogram of the run so far, counts per trace, or
+        None while there is none (one channel read, or no trace yet)."""
+        if self.hist2_sum is None or self.hist2_n == 0:
+            return None
+        return self.hist2_sum / self.hist2_n
 
     def _save(self, tr, verdict, test: bool = False) -> None:
         """Save one accepted trace: into the day's Igor block (the files
@@ -1388,7 +1639,8 @@ class Worker(threading.Thread):
             vzero_mv, izero_ua = self.offsets()
             t = igor_scheme.IgorTrace.from_record(tr, self.cfg, vzero_mv=vzero_mv,
                                                   izero=izero_ua,
-                                                  bias_save=writer.flags.bias)
+                                                  bias_save=writer.flags.bias,
+                                                  izero2=self.izero2())
             before = writer.current_block
             try:
                 number = writer.append(t)
@@ -1421,8 +1673,12 @@ class Worker(threading.Thread):
                                 f"{number}) in {writer.folder.name}", level="warn")
         if self._sv().get("h5", True):
             self._save_h5(tr, verdict)
-        self.file_traces.append((tr.conductance_g0(self.cfg).astype(np.float32),
-                                 tr.start_piezo_v, tr.timestamp))
+        self.file_traces.append((
+            tr.conductance_g0(self.cfg).astype(np.float32),
+            tr.start_piezo_v, tr.timestamp,
+            # channel 2, for the second .txt table; None with one channel
+            tr.conductance_g0(self.cfg, channel=2).astype(np.float32)
+            if tr.current2_v is not None else None))
         v = self.cfg.cal.voltage_input_sign * np.asarray(tr.voltage_v, float) * 1e3
         n = v.size
         # The first half-millisecond: the junction as it was when the
@@ -1513,6 +1769,11 @@ class Worker(threading.Thread):
         sense = rig.last_sense_v
         sense_v = (float(np.mean(sense[sense.size // 2:]))
                    if sense is not None and sense.size else None)
+        # Channel 2 of a two-channel amplifier over that same play: its
+        # output volts, current, conductance and whether it is railed; None
+        # while it is not read.
+        ch2 = (rig.channel2_of(rec, c.last_current2)
+               if rec is not None and c.last_current2 is not None else None)
         # "saved" is the day counter (traces in today's Igor folder, Igor's
         # Saved - 1), None until the folder has been looked at or when the
         # Saving tab now names another folder, Setup ID or day than the
@@ -1525,7 +1786,9 @@ class Worker(threading.Thread):
                   accepted=self.accepted, attempts=self.attempts,
                   saved=None if writer is None else writer.saved - 1,
                   igor_folder=str(writer.folder) if writer is not None else None,
-                  zero_uv=C.current_zero_v * 1e6)
+                  zero_uv=C.current_zero_v * 1e6,
+                  two_channels=M.two_current_channels, ch2=ch2,
+                  zero2_uv=C.current_zero_2_v * 1e6)
 
 
 # --------------------------------------------------------------------------
@@ -1611,9 +1874,19 @@ def run_headless(cfg: RigConfig, n: int, out_dir: Path, igor_export: bool,
         peak = analysis.peak_position(worker.hist_centres, hist, around=0.0,
                                       window=0.4)
         print(f"1 G0 peak at {peak:+.4f} decades over {worker.hist_n} traces")
+    floor1, floor2 = worker.noise_floors()
+    if floor1 is not None and floor2 is not None:
+        # A two-channel amplifier: each channel's noise floor, as the rms
+        # of the open end of the traces.
+        print(f"two current channels: noise floor {floor1:.1e} G0 on ch 1 and "
+              f"{floor2:.1e} G0 on ch 2 (rms at the open end of the traces, "
+              f"{worker.hist2_n} traces)")
     if worker.igor is not None:
         folder = worker.igor.folder
         files = sorted(p.name for p in folder.glob("PullOut*.ibw")) if folder.is_dir() else []
+        sub = igor_scheme.channel2_folder(folder)
+        files += sorted(f"{sub.name}/{p.name}" for p in sub.glob("PullOut*.ibw")) \
+            if sub.is_dir() else []
         print(f"Igor folder {folder}: {worker.igor.saved - 1} traces today, next "
               f"trace (Saved) {worker.igor.saved}"
               + (f"; files: {', '.join(files)}" if files else ""))
@@ -1641,6 +1914,12 @@ class IgorDay:
     Any other ``.ibw`` holding traces in columns with the 22-row parameter
     tail (this program's old ``_bNNN`` export) opens too, as one block
     numbered 0 without companions.
+
+    A day taken with a two-channel amplifier has channel 2 in its ``ch2``
+    subfolder (``igor_scheme.CH2_FOLDER``): ``trace(i)`` then carries
+    ``g0_2``, the same trace as channel 2 read it, ``hist2`` is channel
+    2's histogram over the day and ``data()`` holds both. (The ``ch2``
+    subfolder opened by itself is simply a day folder of channel 2.)
     """
 
     _BLOCK_FILE = re.compile(r"^PullOutConductanceBlock_(\d+)\.ibw$")
@@ -1666,10 +1945,12 @@ class IgorDay:
                                                      params[idx], idx, idx + 1)
                 self.ks = [0]
         self._cache: tuple[int, igor_scheme.IgorBlock] | None = None
+        self._cache2: tuple[int, igor_scheme.IgorBlock | None] | None = None
         # (block k, position j in the block's filled columns, Igor's number)
         self.entries: list[tuple[int, int, int]] = []
         self.cfg = RigConfig()
-        centres = total = None
+        centres = total = total2 = None
+        n2 = 0
         for k in self.ks:
             b = self._read(k, companions=False)
             if b.n_traces == 0:
@@ -1680,11 +1961,26 @@ class IgorDay:
             c, counts = analysis.log_histogram(list(b.g0.T), igor_bins=True)
             centres = c
             total = counts * b.n_traces if total is None else total + counts * b.n_traces
+            # Channel 2 of the same block, when the day has a ch2 subfolder.
+            b2 = self._read2(k, companions=False)
+            if b2 is not None and b2.n_traces:
+                if n2 == 0:
+                    slot9 = float(b2.params[0][9])
+                    if np.isfinite(slot9) and slot9 > 0:
+                        self.cfg.cal.preamp_gain_2_v_per_a = 1e6 / slot9
+                _, counts2 = analysis.log_histogram(list(b2.g0.T), igor_bins=True)
+                total2 = (counts2 * b2.n_traces if total2 is None
+                          else total2 + counts2 * b2.n_traces)
+                n2 += b2.n_traces
         # (centres, counts per trace) over every trace present, Igor's bins;
         # each block's counts-per-trace weighted by its trace count (exact
         # when every trace passes the noise-floor gate). The overview panel
         # only; the histogram windows recompute from every trace.
         self.hist = None if total is None else (centres, total / max(len(self.entries), 1))
+        # Channel 2's histogram over the traces that have one (counts per
+        # trace, the same bins), or None for a day taken with one channel.
+        self.hist2 = None if total2 is None or n2 == 0 else total2 / n2
+        self.n2 = n2
 
     def _settings_from(self, p: np.ndarray) -> None:
         """The pull as the block's parameters record it, into the config the
@@ -1698,11 +1994,25 @@ class IgorDay:
             R.bias_v = float(p[10]) * 1e-3
         if np.isfinite(p[13]) and p[13] > 0:
             R.engage_g0 = float(p[13])
+        if np.isfinite(p[9]) and p[9] > 0:
+            self.cfg.cal.preamp_gain_v_per_a = 1e6 / float(p[9])   # slot 9: uA per V
 
     def _read(self, k: int, companions: bool) -> igor_scheme.IgorBlock:
         if self._single is not None:
             return self._single
         return igor_scheme.read_block(self.folder, k, companions=companions)
+
+    def _read2(self, k: int, companions: bool) -> igor_scheme.IgorBlock | None:
+        """Block ``k`` of channel 2 (the ``ch2`` subfolder), or None when
+        the day has none, or it cannot be read: channel 1 is still shown."""
+        if self._single is not None:
+            return None
+        try:
+            return igor_scheme.read_block_channel2(self.folder, k, companions=companions)
+        except Exception as exc:                   # noqa: BLE001
+            log.warning("channel 2 of block %d in %s cannot be read (%s: %s)",
+                        k, self.folder.name, type(exc).__name__, exc)
+            return None
 
     def block(self, k: int) -> igor_scheme.IgorBlock:
         """Block ``k`` with its companions, the last one looked at kept."""
@@ -1710,11 +2020,19 @@ class IgorDay:
             self._cache = (k, self._read(k, companions=True))
         return self._cache[1]
 
+    def block2(self, k: int) -> igor_scheme.IgorBlock | None:
+        """Block ``k`` of channel 2, the last one looked at kept; None when
+        the day has none."""
+        if self._cache2 is None or self._cache2[0] != k:
+            self._cache2 = (k, self._read2(k, companions=True))
+        return self._cache2[1]
+
     def __len__(self) -> int:
         return len(self.entries)
 
     def close(self) -> None:
         self._cache = None
+        self._cache2 = None
 
     def describe(self) -> str:
         if not self.entries:
@@ -1722,7 +2040,9 @@ class IgorDay:
         first, last = self.entries[0][2], self.entries[-1][2]
         blocks = (f"block {self.ks[0]}" if len(self.ks) == 1
                   else f"blocks {self.ks[0]}-{self.ks[-1]}")
-        return f"{blocks}, Igor traces {first}-{last}"
+        return (f"{blocks}, Igor traces {first}-{last}"
+                + (f", two current channels ({self.n2} traces have channel 2)"
+                   if self.hist2 is not None else ""))
 
     def trace(self, i: int) -> dict:
         """The i-th trace present: Igor's number and block, the conductance
@@ -1742,11 +2062,19 @@ class IgorDay:
         def column(arr):
             return None if arr is None else np.asarray(arr[:, j], dtype=float)
 
+        # The same trace as channel 2 read it, from the ch2 subfolder.
+        g0_2 = None
+        b2 = self.block2(k)
+        if b2 is not None and b2.n_points == n:
+            hit = np.flatnonzero(b2.numbers == number)
+            if hit.size:
+                g0_2 = np.asarray(b2.g0[:, int(hit[0])], dtype=float)
+
         return {"number": number, "block": k, "g0": np.asarray(b.g0[:, j], dtype=float),
                 "disp": np.linspace(0.0, size, n), "fs": fs,
                 "voltage_v": column(b.voltage_v), "current_a": column(b.current_a),
                 "extension_nm": column(b.extension_nm), "params": p,
-                "block_hist": b.hist}
+                "block_hist": b.hist, "g0_2": g0_2}
 
     def conductances(self):
         """Every trace's conductance in turn, block by block."""
@@ -1760,16 +2088,23 @@ class IgorDay:
         each trace with its own displacement axis from its block's
         parameters. Reads every block (a full day of 10,000 traces is a few
         hundred MB), so it is made only when a histogram window asks."""
-        traces, disps = [], []
+        traces, disps, traces2 = [], [], []
         for k in self.ks:
             b = self._read(k, companions=False)
             d = b.displacement_nm
+            b2 = self._read2(k, companions=False) if self.hist2 is not None else None
+            where = ({int(num): j2 for j2, num in enumerate(b2.numbers)}
+                     if b2 is not None and b2.n_points == b.n_points else {})
             for j in range(b.n_traces):
                 traces.append(np.asarray(b.g0[:, j], dtype=np.float32))
                 disps.append(d)
+                j2 = where.get(int(b.numbers[j]))
+                traces2.append(None if j2 is None
+                               else np.asarray(b2.g0[:, j2], dtype=np.float32))
         disp0 = disps[0] if disps else np.zeros(0)
         return session_plots.Data(traces, disp0, self.cfg, self.name,
-                                  paths=[self.path], disps=disps)
+                                  paths=[self.path], disps=disps,
+                                  traces2=traces2)
 
 
 # --------------------------------------------------------------------------
@@ -1826,16 +2161,24 @@ def hist_window(win, session, stem: str, kind: str, tk, ttk, FigureCanvasTkAgg,
 
     data = (session if isinstance(session, session_plots.Data)
             else session_plots.from_session(session, stem))
+    # Data of a two-channel amplifier: the 1D window draws both channels
+    # (blue and red) unless "channel" says 1 or 2, and starts a decade
+    # further down, where channel 2's floor is; the 2D window draws one
+    # channel, 1 unless "channel" says 2.
+    two = data.two_channels
+    x_low = -8 if two else -7
 
     if kind == "1d":
         entry(bar, "bins", "bins", 1000)
-        entry(bar, "x from", "x0", -7)
+        entry(bar, "x from", "x0", x_low)
         entry(bar, "x to", "x1", 1)
         entry(bar, "line width", "lw", 1.2)
         entry(bar, "color", "color", "k", width=8)
         entry(bar2, "smooth (points)", "smooth", 11)
         flag(bar2, "log y", "logy", False)
         flag(bar2, "fill", "fill", False)
+        if two:
+            entry(bar2, "channel (both, 1, 2)", "channel", "both", width=5)
     else:
         entry(bar, "x bins", "nx", 200)
         entry(bar, "y bins", "ny", 300)
@@ -1847,21 +2190,32 @@ def hist_window(win, session, stem: str, kind: str, tk, ttk, FigureCanvasTkAgg,
         entry(bar2, "colormap", "cmap", "viridis", width=9)
         entry(bar2, "color max (blank: auto)", "vmax", "")
         flag(bar2, "colorbar", "cbar", True)
+        if two:
+            entry(bar2, "channel (1, 2)", "channel", "1", width=3)
     ttk.Button(bar2, text="Redraw", command=lambda: redraw()).pack(side="right", padx=4)
+
+    def which_channel(default: str) -> str:
+        """What the "channel" box says (it is only there for two-channel
+        data): "both", "1" or "2"; anything else is the default."""
+        if "channel" not in ctl:
+            return default
+        word = ctl["channel"].get().strip().lower()
+        return word if word in ("both", "1", "2") else default
 
     def redraw():
         fig.clear()
         ax = fig.add_subplot(111)
         if kind == "1d":
-            x0, x1 = num("x0", -7.0), num("x1", 1.0)
+            x0, x1 = num("x0", float(x_low)), num("x1", 1.0)
             info = session_plots.hist_1d(
                 ax, data,
                 bins=num("bins", 1000, int) or 1000,
                 smooth=num("smooth", 11, int) or 11,
-                xlim=(-7.0 if x0 is None else x0, 1.0 if x1 is None else x1),
+                xlim=(float(x_low) if x0 is None else x0, 1.0 if x1 is None else x1),
                 lw=num("lw", 1.2) or 1.2,
                 color=ctl["color"].get().strip() or "k",
-                logy=ctl["logy"].get(), fill=ctl["fill"].get())
+                logy=ctl["logy"].get(), fill=ctl["fill"].get(),
+                channel=which_channel("both"))
         else:
             x0, x1 = num("x0", -0.5), num("x1", 2.0)
             y0, y1 = num("y0", -7.0), num("y1", 1.0)
@@ -1873,7 +2227,8 @@ def hist_window(win, session, stem: str, kind: str, tk, ttk, FigureCanvasTkAgg,
                 ylim=(-7.0 if y0 is None else y0, 1.0 if y1 is None else y1),
                 align=num("align", 0.5),
                 cmap=ctl["cmap"].get().strip() or "viridis",
-                vmax=num("vmax", None), colorbar=ctl["cbar"].get())
+                vmax=num("vmax", None), colorbar=ctl["cbar"].get(),
+                channel=which_channel("1"))
         note.config(text=info["note"])
         fig.tight_layout()
         canvas.draw_idle()
@@ -2091,8 +2446,11 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     # -- and then the whole box turns yellow with a "do not touch" line.
     stb = tk.LabelFrame(left, text="Status", font=("Arial", 9, "bold"))
     stb.pack(fill="x", pady=(0, 3))
-    ro = tk.Text(stb, width=62, height=7, font=("Courier", 9), relief="flat",
-                 state="disabled", background=root.cget("background"))
+    # A rig whose config names a second amplifier output gets one more
+    # readout line (and one more cell under the slider) for channel 2.
+    has_ch2 = bool(cfg.channels.ai_current_2)
+    ro = tk.Text(stb, width=62, height=8 if has_ch2 else 7, font=("Courier", 9),
+                 relief="flat", state="disabled", background=root.cget("background"))
     ro.pack(fill="x", padx=2, pady=(1, 0))
     status = tk.Label(stb, text="ready", font=("Arial", 10, "bold"), wraplength=px(548),
                       justify="left", anchor="nw", height=3, fg="#1b5e20")
@@ -2143,8 +2501,14 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         widget.config(state="disabled")
 
     # -- the Keithley 428: Igor's Keithley Controls -------------------------------------
+    # Not shown on a rig whose config names a second amplifier output
+    # (channels.ai_current_2): an amplifier with two outputs is not the
+    # 428, and the Current amplifier box stands here instead. The box and
+    # everything in it are still made, so nothing that talks to them has
+    # to know.
     kb = ttk.LabelFrame(left, text="Keithley 428 (GPIB)")
-    kb.pack(fill="x", pady=(0, 3))
+    if not has_ch2:
+        kb.pack(fill="x", pady=(0, 3))
     k_lbl = tk.Label(kb, text="not connected (the front panel rules)",
                      font=("Arial", 9), anchor="w")
     ttk.Button(kb, text="Connect",
@@ -2210,6 +2574,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                              else f"suppress: {k['suppress_ua']:+.4f} uA")
                             + f"   gain 1e{k['gain']} V/A")
         gain_var.set(str(k["gain"]))
+        sync_gain_boxes()          # Set here is channel 1's gain there
 
     # -- the coarse approach: Igor's Actuator Controls, or a screw by hand ------------
     ab = ttk.LabelFrame(left, text="Coarse approach")
@@ -2450,8 +2815,12 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     rof = ttk.Frame(pb)
     rof.grid(row=3, column=0, columnspan=3, sticky="ew", padx=2, pady=(3, 1))
     big: dict[str, tk.Label] = {}
-    for col, (key, title) in enumerate((("i", "I (uA)"), ("v", "V (mV)"),
-                                        ("p", "Piezo (V)"), ("s", "Sense (V)"))):
+    cells = [("i", "I (uA)"), ("v", "V (mV)"), ("p", "Piezo (V)"), ("s", "Sense (V)")]
+    if has_ch2:
+        # Channel 2 of the amplifier, in nA: red while it is railed (which
+        # is where it sits whenever the junction is closed).
+        cells.insert(1, ("i2", "I ch 2 (nA)"))
+    for col, (key, title) in enumerate(cells):
         cell = ttk.Frame(rof, relief="groove", borderwidth=1)
         cell.grid(row=0, column=col, padx=2, sticky="ew")
         rof.columnconfigure(col, weight=1)
@@ -2466,8 +2835,16 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     ttk.Checkbutton(pb, text="beep at the contact current",
                     variable=beep_var).grid(row=4, column=2, sticky="w", padx=2)
 
-    def show_big(i_ua, v_mv, piezo_v, sense_v, beep_ok: bool = False):
+    def show_big(i_ua, v_mv, piezo_v, sense_v, beep_ok: bool = False, ch2=None):
         big["i"].config(text=f"{i_ua:9.4f}" if np.isfinite(i_ua) else "--")
+        if has_ch2:
+            if not cfg.channels.two_current_channels:
+                big["i2"].config(text="off", fg="#6a6a6a")
+            elif ch2 is None:
+                big["i2"].config(text="--", fg="#202020")
+            else:
+                big["i2"].config(text=f"{ch2['amps'] * 1e9:9.3f}",
+                                 fg="#b00000" if ch2["railed"] else "#202020")
         big["v"].config(text=f"{v_mv:8.2f}" if np.isfinite(v_mv) else "--")
         big["p"].config(text=f"{piezo_v:7.4f}")
         big["s"].config(text=f"{sense_v:7.4f}" if sense_v is not None else "none")
@@ -2490,10 +2867,91 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     # Two columns of (label, entry); "smash every" lives in the Run box.
     sb = ttk.Frame(nb)
     nb.add(sb, text="Settings")
-    shown = [row for row in SETTINGS if row[0] != "ramp.smash_every"]
+
+    # The current amplifier: how many of its outputs are read, and the gain
+    # of each. On a rig with a two-output amplifier (the config names
+    # channel 2's input) the box stands in the left column in the Keithley
+    # box's place, above Coarse approach: there it is in view when the
+    # window opens, which the tabs are not on a laptop screen. On a
+    # one-channel rig it is the first box of this tab, as it was.
+    # One channel is the amplifier as it
+    # always was. Two: channel 1 (the config's ai_current) is the
+    # lower-gain output that follows the junction through contact, and
+    # contact is judged on it; channel 2 (ai_current_2) is the higher-gain
+    # output, recorded with every trace, drawn in red beside channel 1's
+    # blue, and the one the Break threshold is judged on (the junction
+    # open). The gains are typed in: they tell the arithmetic
+    # what the amplifier is set to and program nothing. They are settings
+    # like the others: checked as typed, applied on Enter or Apply.
+    amp = ttk.LabelFrame(left if has_ch2 else sb, text="Current amplifier")
+    if has_ch2:
+        amp.pack(fill="x", pady=(0, 3), before=ab)
+    else:
+        amp.grid(row=0, column=0, columnspan=4, sticky="ew", padx=4, pady=(4, 2))
+    ch_var = tk.IntVar(value=2 if cfg.channels.two_current_channels else 1)
+
+    def on_channels():
+        want = ch_var.get()
+        if not hand_move("current_channels", want):
+            ch_var.set(2 if cfg.channels.two_current_channels else 1)
+    one_rb = ttk.Radiobutton(amp, text="one channel", value=1, variable=ch_var,
+                             command=on_channels)
+    one_rb.grid(row=0, column=0, sticky="w", padx=(6, 2), pady=1)
+    two_rb = ttk.Radiobutton(amp, text="two channels", value=2, variable=ch_var,
+                             command=on_channels)
+    two_rb.grid(row=0, column=1, sticky="w", padx=(6, 2), pady=1)
+    amp_lbl = tk.Label(amp, text="", font=("Arial", 9), anchor="w", fg="#444")
+    amp_lbl.grid(row=0, column=2, columnspan=3, sticky="w", padx=6)
+    gain_entries = {}
+    for col, path in enumerate(AMPLIFIER_SETTINGS):
+        ttk.Label(amp, text=f"Gain ch {col + 1} (V/A)", font=("Arial", 9)).grid(
+            row=1, column=col * 2, sticky="w", padx=(6, 2), pady=1)
+        var = svars.setdefault(path, tk.StringVar(value=f"{_get(cfg, path):g}"))
+        ent = ttk.Entry(amp, textvariable=var, width=9)
+        ent.grid(row=1, column=col * 2 + 1, padx=2, pady=1, sticky="w")
+        ent.bind("<Return>", lambda _e: apply_settings())
+        ent.bind("<FocusOut>", lambda _e: apply_settings())
+        gain_entries[path] = ent
+    ttk.Label(amp, text="ch 1: the lower-gain output; contact is judged on it. "
+                        "ch 2: the higher-gain output; the Break threshold (junction "
+                        "open) is judged on it. Both are drawn, ch 1 blue and ch 2 "
+                        "red, nothing stitched. A gain says what the amplifier is "
+                        "set to (1e4, 1e7 ...); it programs nothing.",
+              font=("Arial", 9), foreground="#444", wraplength=px(540),
+              justify="left").grid(row=2, column=0, columnspan=5, sticky="w",
+                                   padx=6, pady=(0, 2))
+
+    def show_amplifier(p: dict):
+        """The box as the rig is: which count is selected, whether two can
+        be (the config must name channel 2's input), the inputs, and
+        channel 2's gain greyed while it is not read."""
+        ch_var.set(p["channels"])
+        two_rb.config(state="normal" if p["available"] else "disabled")
+        gain_entries[AMPLIFIER_SETTINGS[1]].config(
+            state="normal" if p["channels"] == 2 else "disabled")
+        if not p["available"]:
+            amp_lbl.config(text=f'ch 1 on {p["ch1"]}; for two, name "ai_current_2" '
+                                "in the config's channels")
+        elif p["channels"] == 2:
+            amp_lbl.config(text=f"ch 1 on {p['ch1']}, ch 2 on {p['ch2']}")
+        else:
+            amp_lbl.config(text=f"ch 1 on {p['ch1']} (ch 2 on {p['ch2']}: not read)")
+        sync_gain_boxes()
+
+    def sync_gain_boxes():
+        """The two gain entries follow the config, which the Keithley box's
+        Set changes too (it programs the 428 and is channel 1's gain)."""
+        for path in AMPLIFIER_SETTINGS:
+            value = _get(cfg, path)
+            if applied["values"].get(path) != value:
+                applied["values"][path] = value
+                svars[path].set(f"{value:g}")
+
+    shown = [row for row in SETTINGS if row[0] != "ramp.smash_every"
+             and row[0] not in AMPLIFIER_SETTINGS]
     per_col = (len(shown) + 1) // 2
     for i, (path, label, igor, unit, kind, scale_) in enumerate(shown):
-        r, c = i % per_col, (i // per_col) * 2
+        r, c = 1 + i % per_col, (i // per_col) * 2
         ttk.Label(sb, text=f"{label} ({unit})" if unit else label,
                   font=("Arial", 9)).grid(row=r, column=c, sticky="w", padx=(6, 2),
                                           pady=1)
@@ -2504,7 +2962,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         ent.bind("<Return>", lambda _e: apply_settings())
         ent.bind("<FocusOut>", lambda _e: apply_settings())
     ttk.Button(sb, text="Apply", command=lambda: apply_settings()).grid(
-        row=per_col, column=0, sticky="w", padx=6, pady=(6, 0))
+        row=per_col + 1, column=0, sticky="w", padx=6, pady=(6, 0))
     # How the two record inputs are wired, switched live: the card says
     # which modes it has (the worker asks it at start-up). RSE for a BNC
     # whose centre goes to the AI+ terminal and whose shield goes to AI GND
@@ -2512,7 +2970,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     MODE_WORDS = {"default": "card default", "rse": "RSE (single-ended)",
                   "nrse": "NRSE", "diff": "differential"}
     mode_frame = ttk.Frame(sb)
-    mode_frame.grid(row=per_col + 1, column=0, columnspan=4, sticky="w", padx=6,
+    mode_frame.grid(row=per_col + 2, column=0, columnspan=4, sticky="w", padx=6,
                     pady=(4, 0))
     ttk.Label(mode_frame, text="Input mode (how the inputs on this card are wired)").pack(
         side="left")
@@ -2537,7 +2995,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     # red with the reason when not -- and applied on Enter, Apply or
     # leaving the box.
     cb = ttk.LabelFrame(sb, text="Safety check")
-    cb.grid(row=per_col + 2, column=0, columnspan=4, sticky="ew", padx=4,
+    cb.grid(row=per_col + 3, column=0, columnspan=4, sticky="ew", padx=4,
             pady=(8, 2))
     smsg = tk.Label(cb, text="all settings as loaded", font=("Arial", 11, "bold"),
                     wraplength=px(540), justify="left", anchor="w", fg="#006000")
@@ -2609,6 +3067,12 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         for path, value in changes.items():
             _set(cfg, path, value)
             applied["values"][path] = value
+        if "cal.preamp_gain_v_per_a" in changes:
+            # Channel 1's gain is the gain the Keithley box shows as an
+            # exponent: keep the two in step (a whole decade only).
+            follow_gain(cfg)
+            worker.k_state["gain"] = cfg.keithley.gain_exponent
+            gain_var.set(str(cfg.keithley.gain_exponent))
         worker.send("newfile")                     # the config travels with the data
         if "ramp.bias_v" in changes:
             # Put the new bias on the output now, so the readout and the
@@ -3039,7 +3503,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     # the plot's own". y2 is the right-hand axis where a panel has one.
     PANELS = [  # key, label, x unit, y unit, right-y unit (None = no right axis)
         ("record", "record", "s", "junction mV", "current uA"),
-        ("trace", "trace", "nm", "log10 G/G0", "readback nm"),
+        ("trace", "trace", "nm", "log10 G/G0", "readback nm"),   # both channels share y
         ("piezo", "piezo in/out", "s", "piezo nm", None),
         ("hist", "histogram", "log10 G/G0", "counts/trace", None),
     ]
@@ -3177,16 +3641,18 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                                               else ""))
         if tr is not None and tr.get("record") is not None:
             rec = tr["record"]
+            # g0_2: the same pull on channel 2 of a two-channel amplifier
+            # (None with one channel) -- blue and red on the one axis.
             plots.plot_trace(ax["trace"], cfg, tr["g0"], tr["disp"], tr["verdict"],
                              title=f"trace {worker.attempts}",
-                             sense_v=rec.piezo_sense_v)
+                             sense_v=rec.piezo_sense_v, g0_2=tr.get("g0_2"))
         if cyc is not None and cyc.t:
             plots.plot_piezo(ax["piezo"], cfg, np.array(cyc.t), np.array(cyc.piezo_v),
                              np.array(cyc.sense_v), marks=cyc.marks,
                              title="piezo in and out, this cycle")
         if hist is not None and hist["counts"] is not None:
             plots.plot_histogram(ax["hist"], cfg, hist["centres"], hist["counts"],
-                                 hist["n"])
+                                 hist["n"], counts2=hist.get("counts2"))
         elif hist is not None:
             ax["hist"].clear()
             ax["hist"].set_title("histogram: 0 traces (new experiment)", fontsize=9)
@@ -3204,7 +3670,10 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         scfg = s.cfg
         C = scfg.cal
         g0, disp, fs = t["g0"], t["disp"], t["fs"]
-        verdict = analysis.select_trace(g0, scfg.ramp)
+        # The end of the trace on channel 2 when the day has one, as the
+        # pull judged it.
+        verdict = analysis.select_trace(
+            g0, scfg.ramp, g0_open=analysis.open_side(g0, t.get("g0_2")))
         who = f"Igor trace {t['number']} (block {t['block']})"
         if t["voltage_v"] is not None and t["current_a"] is not None:
             # Back to raw volts with this config's calibration, which the
@@ -3220,7 +3689,8 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         sense_v = None
         if t["extension_nm"] is not None:
             sense_v = t["extension_nm"] / C.sense_nm_per_volt + C.sense_zero_v
-        plots.plot_trace(ax["trace"], scfg, g0, disp, verdict, title=who, sense_v=sense_v)
+        plots.plot_trace(ax["trace"], scfg, g0, disp, verdict, title=who, sense_v=sense_v,
+                         g0_2=t.get("g0_2"))        # channel 2, from the ch2 subfolder
         tt = np.arange(g0.size) / fs
         p = t["params"]
         # Slot 3 is the piezo position after the pull, slot 0 the pull.
@@ -3232,7 +3702,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             browse["hist"] = s.hist if s.hist is not None else \
                 analysis.log_histogram(list(s.conductances()), igor_bins=True)
         plots.plot_histogram(ax["hist"], scfg, *browse["hist"], browse["n"],
-                             title=f"histogram of {s.name}")
+                             title=f"histogram of {s.name}", counts2=s.hist2)
         banner.config(text=f"BROWSING {s.name}: {who}, Igor's numbering; "
                            f"live plots paused")
         apply_limits()
@@ -3248,21 +3718,26 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         fs = float(s.scalar("sample_rate_hz")[i])
         start_v = float(s.scalar("start_piezo_v")[i])
         disp = analysis.displacement_nm(voltage.size, scfg.ramp, fs)
-        verdict = analysis.select_trace(g0, scfg.ramp)
+        verdict = analysis.select_trace(
+            g0, scfg.ramp, g0_open=s.open_side(i) if s.has_current2 else None)
         sense = s.piezo_sense(i, in_nm=False)
+        # A session taken with a two-channel amplifier: channel 2 as well.
+        g0_2 = s.conductance(i, channel=2) if s.has_current2 else None
         plots.plot_record(ax["record"], scfg, np.stack([voltage, current]), fs,
                           title=f"saved trace {i + 1}: junction V and current "
                                 f"(the file keeps the trace only)")
         plots.plot_trace(ax["trace"], scfg, g0, disp, verdict,
-                         title=f"saved trace {i + 1}", sense_v=sense)
+                         title=f"saved trace {i + 1}", sense_v=sense, g0_2=g0_2)
         t = np.arange(voltage.size) / fs
         cmd = start_v - scfg.cal.nm_to_piezo_volts(disp)
         plots.plot_piezo(ax["piezo"], scfg, t, cmd, sense,
                          title="piezo during the saved pull")
         if browse["hist"] is None:
             browse["hist"] = analysis.log_histogram(s.conductances())
+            browse["hist2"] = (analysis.log_histogram(s.conductances(channel=2))[1]
+                               if s.has_current2 else None)
         plots.plot_histogram(ax["hist"], scfg, *browse["hist"], browse["n"],
-                             title="histogram of the file")
+                             title="histogram of the file", counts2=browse.get("hist2"))
         banner.config(text=f"BROWSING {Path(browse['path']).name} trace {i + 1}; "
                            f"live plots paused")
         apply_limits()
@@ -3322,11 +3797,24 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                     f"accepted  {p['accepted']} / {p['attempts']}, {saved} saved today",
                 ]
                 lines = [f"{a:<27}{b}" for a, b in zip(left_col, right_col)]
+                if has_ch2:
+                    # Channel 2 of the amplifier: what it puts out, as a
+                    # current and as a conductance, and whether it is at
+                    # its rail (its normal state while the junction is closed).
+                    c2 = p.get("ch2")
+                    if not p.get("two_channels"):
+                        lines.append("ch 2      not read (one channel selected)")
+                    elif c2 is None:
+                        lines.append("ch 2      --")
+                    else:
+                        lines.append(f"ch 2      {c2['volts']:+8.4f} V {c2['amps'] * 1e9:10.3f} nA"
+                                     f"  G {c2['g0']:.2e} G0"
+                                     + ("  RAILED" if c2["railed"] else ""))
                 lines.append(f"file      {live.get('file') or 'none open'}")
                 lines.append(f"keithley  {keithley_line()}")
                 set_text(ro, "\n".join(lines))
                 show_big(p["current_ua"], p["junction_mv"], p["piezo_v"],
-                         p["sense_v"])
+                         p["sense_v"], ch2=p.get("ch2"))
             elif kind == "approach":
                 live["cycle"] = p["cycle"]
                 if live_moving.get():
@@ -3340,6 +3828,8 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                 show_keithley(p)
             elif kind == "ai_modes":
                 show_ai_modes(p)
+            elif kind == "amplifier":
+                show_amplifier(p)
             elif kind == "paused":
                 set_continue(bool(p["remaining"]))
             elif kind == "actuator":
@@ -3390,7 +3880,8 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                 mon_state["v"].append(v * 1e3)
                 mon_state["i"].append(i * 1e6)
                 mon_state["g"].append(float(np.log10(max(g, 1e-12))) if np.isfinite(g) else 3.0)
-                show_big(i * 1e6, v * 1e3, p["piezo_v"], p["sense_v"], beep_ok=True)
+                show_big(i * 1e6, v * 1e3, p["piezo_v"], p["sense_v"], beep_ok=True,
+                         ch2=p.get("ch2"))
         if worker.busy and worker.current not in QUIET:
             # Igor's slider and readouts followed every write. While a
             # command runs, follow the tracker and the last play's record,
@@ -3407,7 +3898,9 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             sense = rig.last_sense_v
             sense_v = (float(np.mean(sense[sense.size // 2:]))
                        if sense is not None and sense.size else None)
-            show_big(i_ua, v_mv, rig.piezo_v, sense_v)
+            ch2 = (rig.channel2_of(rec, cyc.last_current2)
+                   if rec is not None and cyc.last_current2 is not None else None)
+            show_big(i_ua, v_mv, rig.piezo_v, sense_v, ch2=ch2)
             # A heartbeat on the status line, so a two-minute approach with
             # the plots standing still does not look like a frozen window.
             if live.get("busy_since") is None:
@@ -3501,6 +3994,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
 
     worker.send("noop")                              # first readout
     worker.send("ai_modes")                          # the card's input modes
+    worker.send("amplifier")                         # one current channel or two
     root.after(150, poll)
     if readback:
         root.after(400, open_readback)
@@ -3530,6 +4024,26 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                                   svars["ramp.bias_v"].set("900")))
         root.after(6500, lambda: svars["ramp.bias_v"].set("150"))
         root.after(6700, lambda: (ai_mode_var.set(MODE_WORDS["rse"]), on_ai_mode()))
+        if has_ch2:
+            # A rig with a two-channel amplifier. Its gains must be where
+            # they are seen without looking for them: the Current amplifier
+            # box in the column, above Coarse approach, in the place of the
+            # Keithley box, which is not shown.
+            def smoke_amplifier_box():
+                assert amp.winfo_ismapped() and not kb.winfo_ismapped(), \
+                    "the Current amplifier box must stand in for the Keithley box"
+                assert stb.winfo_rooty() < amp.winfo_rooty() < ab.winfo_rooty(), \
+                    "the Current amplifier box must be between Status and Coarse approach"
+                assert all(ent.winfo_ismapped() for ent in gain_entries.values()), \
+                    "both gain boxes must be showing"
+            root.after(2000, smoke_amplifier_box)
+            # Read one channel, then both again, and change channel 2's
+            # gain the way a person would.
+            other = 1 if cfg.channels.two_current_channels else 2
+            root.after(6750, lambda: worker.send("current_channels", other))
+            root.after(6800, lambda: worker.send("current_channels", 3 - other))
+            root.after(6850, lambda: svars[AMPLIFIER_SETTINGS[1]].set("1e8"))
+            root.after(6900, lambda: apply_settings())
         # The coarse approach on the simulated actuator: Connect, then
         # Start approach (lands, backs off one step), then a piezo Approach.
         root.after(6900, lambda: (mode_var.set("actuator"), show_mode(),

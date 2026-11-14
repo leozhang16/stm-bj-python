@@ -112,6 +112,31 @@ class ChannelMap:
     # to AI- is "diff". The window can switch this live (Settings tab).
     ai_terminal: str = "default"
 
+    # A current amplifier with two outputs. Channel 1 is ``ai_current``
+    # above: the lower-gain output, the one that follows the junction
+    # through contact (1 G0 and above). *Contact* is judged on it: the
+    # engage threshold, a railed channel 1, the start of a trace and its
+    # gold plateau, exactly as with a one-output amplifier. Channel 2 is
+    # the higher-gain output for the low conductances, and with both read
+    # the *open* side is judged on it: the break threshold, in the
+    # approach's separate step and at the end of a trace, where channel 1
+    # is down in its own noise. While channel 2 is at its rail (the
+    # junction closed) the current is beyond it, and channel 1 is read
+    # there instead (``Rig.open_side_of``, ``TraceRecord.open_side_g0``).
+    # Channel 2 is read during every play as one more input of the
+    # record's own task and travels beside the record as
+    # ``Rig.last_current2_v`` (the (2, n) record is untouched), into
+    # ``TraceRecord.current2_v`` and the files.
+    #
+    # ``ai_current_2`` names its input, None on a rig without one.
+    # ``current_channels`` says how many of the two are read: 1 is channel
+    # 1 alone, 2 is both. The window's Current amplifier box switches it
+    # live.
+    # Its gain and offset are ``cal.preamp_gain_2_v_per_a`` and
+    # ``cal.current_zero_2_v``.
+    ai_current_2: str | None = None
+    current_channels: int = 1
+
     # Row indices into the (2, n) arrays that cross the DAQ boundary. ClassVar
     # so they stay out of asdict() and therefore out of the data files: they
     # describe this code's array layout, not the rig.
@@ -149,8 +174,42 @@ class ChannelMap:
             self.sense_card.lower() == self.device.lower()
 
     @property
+    def two_current_channels(self) -> bool:
+        """Are both outputs of a two-channel amplifier read?"""
+        return int(self.current_channels) == 2 and bool(self.ai_current_2)
+
+    @property
+    def current2_path(self) -> str | None:
+        """``Dev1/ai4``, or None while channel 2 is not read."""
+        if not self.two_current_channels:
+            return None
+        return self.path(self.ai_current_2)
+
+    @property
     def ai_channels(self) -> tuple[str, str]:
         return (self.path(self.ai_voltage), self.path(self.ai_current))
+
+    @property
+    def record_inputs(self) -> tuple[str, ...]:
+        """Every input of the record's task, in task order: junction
+        voltage, current channel 1, channel 2 when it is read, the sense
+        line when it is on this card. The record is always the first two.
+
+        Channel 2 is placed before the sense line on purpose. It sits at
+        its rail for as long as the junction is closed, and on a card that
+        shares one converter between its inputs (a multiplexed card) the
+        input scanned right after a railed one is the one most exposed to
+        what the multiplexer carries over. Here that is the sense line
+        (volts, from a low-impedance monitor output), never the junction
+        voltage (a few millivolts behind the series resistor), which keeps
+        the place it has on a one-channel rig. A card that samples its
+        inputs simultaneously, as the USB-6453 does, does not care."""
+        inputs = list(self.ai_channels)
+        if self.two_current_channels:
+            inputs.append(self.current2_path)
+        if self.sense_in_record:
+            inputs.append(self.piezo_sense_path)
+        return tuple(inputs)
 
     @property
     def ao_channels(self) -> tuple[str, str]:
@@ -310,6 +369,13 @@ class Calibration:
     # temperature, must be re-measured every session.
     current_zero_v: float = 0.0
 
+    # The same two numbers for channel 2 of a two-channel amplifier
+    # (``channels.ai_current_2``, the higher-gain output): its
+    # transimpedance and its resting offset. The two above are channel 1's.
+    # Calibrate zero measures both offsets in one go.
+    preamp_gain_2_v_per_a: float = 1e9
+    current_zero_2_v: float = 0.0
+
     # Displacement per volt **at the DAQ output**. Igor: K_ZPiezoScale = 62.
     # This is an end-to-end number: it already includes the gain of the piezo
     # driver box, so hv_amp_gain below is documentation, not arithmetic.
@@ -347,13 +413,24 @@ class Calibration:
     # each trace recovers its own delay from the alignment spike.
     group_delay_samples: int | None = None
 
-    def volts_to_amps(self, v: float | Any) -> Any:
-        """Preamp output volts -> junction current in amps."""
-        return (v - self.current_zero_v) / self.preamp_gain_v_per_a
+    def gain_of(self, channel: int = 1) -> float:
+        """Transimpedance of current channel 1 or 2, in V/A."""
+        return self.preamp_gain_2_v_per_a if channel == 2 \
+            else self.preamp_gain_v_per_a
 
-    def volts_to_g0(self, v: float | Any, bias_v: float | Any) -> Any:
+    def zero_of(self, channel: int = 1) -> float:
+        """Resting offset of current channel 1 or 2, in volts."""
+        return self.current_zero_2_v if channel == 2 else self.current_zero_v
+
+    def volts_to_amps(self, v: float | Any, channel: int = 1) -> Any:
+        """Preamp output volts -> junction current in amps. ``channel`` 2
+        is the second output of a two-channel amplifier."""
+        return (v - self.zero_of(channel)) / self.gain_of(channel)
+
+    def volts_to_g0(self, v: float | Any, bias_v: float | Any,
+                    channel: int = 1) -> Any:
         """Preamp output volts -> conductance in units of G0."""
-        return self.volts_to_amps(v) / (bias_v * G0_SIEMENS)
+        return self.volts_to_amps(v, channel) / (bias_v * G0_SIEMENS)
 
     def g0_to_volts(self, g0: float, bias_v: float) -> float:
         """Inverse. Used by the validator to catch clipping before acquiring."""
@@ -559,6 +636,21 @@ class XPiezoConfig:
 # --------------------------------------------------------------------------
 
 @dataclass
+class SimConfig:
+    """The simulated card (``--simulate``). No real rig reads any of it."""
+
+    # RMS noise of every input of the simulated card, volts per sample.
+    # None keeps the simulator's built-in noise (1.87 uV on the current
+    # input, four times that on the junction voltage), which is far below
+    # any real card's and puts every noise floor decades too low. With the
+    # card's own number here a simulated run shows the floors the rig
+    # will. NI lists 88 uV rms of idle-channel noise for the USB-6453 on
+    # its +/-10 V range: at 100 mV that is a floor near 1e-3 G0 on a
+    # 1e4 V/A output and near 1e-6 G0 on a 1e7 V/A one.
+    ai_noise_v_rms: float | None = None
+
+
+@dataclass
 class RigConfig:
     channels: ChannelMap = field(default_factory=ChannelMap)
     limits: SafetyLimits = field(default_factory=SafetyLimits)
@@ -576,6 +668,7 @@ class RigConfig:
     keithley: KeithleyConfig = field(default_factory=KeithleyConfig)
     echem: EChemConfig = field(default_factory=EChemConfig)
     xpiezo: XPiezoConfig = field(default_factory=XPiezoConfig)
+    sim: SimConfig = field(default_factory=SimConfig)
 
     simulate: bool = False
     notes: str = ""
@@ -609,7 +702,8 @@ class RigConfig:
                             ("push_pull", PushPullConfig), ("iv", IVConfig),
                             ("ac_hold", ACHoldConfig), ("hb_hold", HBHoldConfig),
                             ("vzero", VzeroConfig), ("keithley", KeithleyConfig),
-                            ("echem", EChemConfig), ("xpiezo", XPiezoConfig)):
+                            ("echem", EChemConfig), ("xpiezo", XPiezoConfig),
+                            ("sim", SimConfig)):
             if name in data:
                 kwargs[name] = build(klass, data[name])
         for scalar in ("simulate", "notes"):
@@ -647,13 +741,14 @@ def _log_unknown(klass_name: str, keys: set[str]) -> None:
 # refuses biases and thresholds that are perfectly usable. Set the resistance
 # to 0 for a rig without the resistor.
 
-def amplifier_volts(cfg: RigConfig, g0: float) -> float:
+def amplifier_volts(cfg: RigConfig, g0: float, channel: int = 1) -> float:
     """Amplifier output, in volts, for a junction of ``g0`` at the config's
-    bias, series resistor included (the zero not added)."""
+    bias, series resistor included (the zero not added). ``channel`` 2 is
+    the second output of a two-channel amplifier, as if it had no rail."""
     g = g0 * G0_SIEMENS
     rs = max(0.0, cfg.keithley.series_resistance_ohm)
     current = cfg.ramp.bias_v * g / (1.0 + g * rs)
-    return cfg.cal.preamp_gain_v_per_a * current
+    return cfg.cal.gain_of(channel) * current
 
 
 def junction_volts(cfg: RigConfig, g0: float) -> float:
@@ -691,6 +786,12 @@ def validate(cfg: RigConfig) -> list[str]:
     warnings: list[str] = []
 
     C, R, L, M = cfg.cal, cfg.ramp, cfg.limits, cfg.channels
+
+    # Everything below divides by the gain.
+    if not C.preamp_gain_v_per_a > 0:
+        raise ConfigError(
+            f"cal.preamp_gain_v_per_a must be positive, not "
+            f"{C.preamp_gain_v_per_a!r}")
 
     # THE range check: does 1 G0 fit in the AI range? With a series resistor
     # the current is capped at bias / R_series whatever the junction does, so
@@ -739,8 +840,14 @@ def validate(cfg: RigConfig) -> list[str]:
             f"judged on that voltage, so ai0's noise matters. Lower "
             f"engage_g0, or raise the bias.")
 
-    # Can the break threshold be told apart from the noise floor?
+    # Can the break threshold be told apart from the noise floor? On the
+    # output the open side is judged on: channel 2 of a two-channel
+    # amplifier while it is in range at the threshold, channel 1 otherwise.
     v_at_break = amplifier_volts(cfg, R.break_g0)
+    if M.two_current_channels and C.preamp_gain_2_v_per_a > 0:
+        v2_at_break = amplifier_volts(cfg, R.break_g0, channel=2)
+        if abs(v2_at_break) < min(L.preamp_saturation_v, M.ai_range_v):
+            v_at_break = v2_at_break
     if v_at_break < 5e-6:
         warnings.append(
             f"break threshold {R.break_g0:g} G0 is only {v_at_break * 1e6:.2f}"
@@ -796,9 +903,21 @@ def validate(cfg: RigConfig) -> list[str]:
     # two separate numbers that must describe the same box. Nothing else
     # connects them: keithley.set_gain() programs the 428, while every
     # conductance divides by cal.preamp_gain_v_per_a.
+    #
+    # Compared only while the calibration gain is itself a whole decade,
+    # as every gain of the 428 is. Any other value is a gain somebody
+    # measured, or the gain of an amplifier that is not the 428 (typed in
+    # the window's Current amplifier box): there is then no programmed
+    # decade to hold it against, and a remark about the Keithley would
+    # only mislead. The same goes for a config that names a second
+    # amplifier output (channels.ai_current_2): an amplifier with two
+    # outputs is not the 428, whatever its gains are.
     K = cfg.keithley
     programmed = 10.0 ** K.gain_exponent
-    if abs(programmed - C.preamp_gain_v_per_a) > 1e-6 * programmed:
+    decades = math.log10(C.preamp_gain_v_per_a)
+    whole_decade = abs(decades - round(decades)) < 1e-9
+    if whole_decade and not M.ai_current_2 \
+            and abs(programmed - C.preamp_gain_v_per_a) > 1e-6 * programmed:
         warnings.append(
             f"keithley.gain_exponent = {K.gain_exponent} programs the "
             f"amplifier for {programmed:.3g} V/A, but "
@@ -841,6 +960,39 @@ def validate(cfg: RigConfig) -> list[str]:
         raise ConfigError(
             f"channels.ai_terminal must be one of {sorted(AI_TERMINALS)}, "
             f"not {M.ai_terminal!r}")
+
+    # The second output of a two-channel amplifier.
+    if int(M.current_channels) not in (1, 2):
+        raise ConfigError(
+            f"channels.current_channels must be 1 or 2, not "
+            f"{M.current_channels!r}")
+    if int(M.current_channels) == 2 and not M.ai_current_2:
+        problems.append(
+            "channels.current_channels is 2 but channels.ai_current_2 names "
+            "no input: name the card input channel 2 of the amplifier is "
+            "wired to (\"ai4\", say), or set current_channels to 1")
+    if M.ai_current_2:
+        taken = {"ai_voltage (the junction voltage)": M.ai_voltage,
+                 "ai_current (current channel 1)": M.ai_current}
+        if M.sense_in_record:
+            taken["ai_piezo_sense (the piezo sense line)"] = M.ai_piezo_sense
+        for what, name in taken.items():
+            if str(name).lower() == str(M.ai_current_2).lower():
+                problems.append(
+                    f"channels.ai_current_2 ({M.ai_current_2}) is the same "
+                    f"input as channels.{what}; every signal needs its own")
+    if M.two_current_channels:
+        if not C.preamp_gain_2_v_per_a > 0:
+            problems.append("cal.preamp_gain_2_v_per_a must be positive")
+        elif C.preamp_gain_2_v_per_a <= C.preamp_gain_v_per_a:
+            warnings.append(
+                f"channel 2's gain ({C.preamp_gain_2_v_per_a:g} V/A) is not "
+                f"above channel 1's ({C.preamp_gain_v_per_a:g} V/A). Channel "
+                f"1 must be the lower-gain output, the one that follows the "
+                f"junction through contact, and channel 2 the higher-gain "
+                f"one, which the junction-open test is read from. If the two "
+                f"inputs are the other way round, swap channels.ai_current "
+                f"and channels.ai_current_2")
 
     # Piezo sense readback: only checked on a rig that reads it.
     if M.has_piezo_sense:

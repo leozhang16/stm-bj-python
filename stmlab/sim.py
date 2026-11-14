@@ -17,7 +17,13 @@ to handle:
 
 * a fixed AI/AO group delay, so ``find_alignment_edge`` has something to find
 * a noise floor in the current channel, so the tunnelling tail bottoms out at
-  a finite conductance instead of running to zero
+  a finite conductance instead of running to zero. The built-in noise is far
+  below a real card's; ``sim.ai_noise_v_rms`` in the config puts the card's
+  own number on every input, and the floors where the rig has them
+* the second output of a two-channel current amplifier, when the config
+  reads one (``channels.current_channels = 2``): the same junction current
+  through a higher gain, railed for as long as the junction is closed and
+  carrying on below channel 1's noise floor once it opens
 * the series resistor between the bias output and the junction
   (``keithley.series_resistance_ohm``) and the card's 1 Mohm input: in
   contact the current is capped at bias / R_series and the junction voltage
@@ -38,18 +44,40 @@ class SimulatedDaqSession:
 
     def __init__(self, cfg: RigConfig, seed: int = 0,
                  group_delay_samples: int = 37,
-                 noise_v_rms: float = 1.87e-6,
+                 noise_v_rms: float | None = None,
                  molecule_probability: float = 0.45,
                  molecule_log_g0: float = -3.5):
         self.cfg = cfg
         self.rng = np.random.default_rng(seed)
+        # Channel 2's noise has a generator of its own, so that reading the
+        # second output does not move a single sample of the first: channel
+        # 1 is the same, sample for sample, with one channel read or two.
+        self.rng2 = np.random.default_rng([int(seed), 2])
         self.granted_rate_hz = cfg.ramp.sample_rate_hz
         self.idle_behavior = "maintain"
         self.ai_terminal_set: list[str] = []      # every live switch, for tests
+        self.current_channels_set: list[int] = []
         self._retriggerable = True      # the fake card is an obliging one
 
         self.group_delay = int(group_delay_samples)
-        self.noise_v_rms = float(noise_v_rms)
+        # Input noise, volts rms per sample. Three sources, in this order:
+        # the argument; the config's ``sim.ai_noise_v_rms``, a card's own
+        # number, which every input then gets alike; the built-in 1.87 uV
+        # on the current input with four times that on the junction
+        # voltage, which is what every simulated run had before the config
+        # could say, and still has when it does not.
+        # ``voltage_noise_factor`` is the junction-voltage input's noise in
+        # units of ``noise_v_rms``.
+        card = getattr(getattr(cfg, "sim", None), "ai_noise_v_rms", None)
+        if noise_v_rms is not None:
+            self.noise_v_rms = float(noise_v_rms)
+            self.voltage_noise_factor = 4.0
+        elif card is not None:
+            self.noise_v_rms = float(card)
+            self.voltage_noise_factor = 1.0
+        else:
+            self.noise_v_rms = 1.87e-6
+            self.voltage_noise_factor = 4.0
         # The card's input impedance on ai0: with the junction open it forms
         # a divider with the series resistor, which is why a 100 mV bias
         # reads about 90 mV on the rig.
@@ -79,6 +107,14 @@ class SimulatedDaqSession:
         # (n,) volts on a two-card config, None on a one-card one.
         self.last_sense_v: np.ndarray | None = None
         self.sense_sync = "hardware" if cfg.channels.has_piezo_sense else "none"
+
+        # Channel 2 of a two-channel amplifier over the last play, like
+        # DaqSession.last_current2_v: (n,) volts, None while it is not read.
+        self.last_current2_v: np.ndarray | None = None
+        # Its noise: the thermal noise of its own feedback resistor over
+        # this bandwidth, the floor a transimpedance stage cannot get under
+        # (0.4 pA rms at 1e9 V/A; a tenfold gain lowers it by sqrt(10)).
+        self.channel2_bandwidth_hz = 1.0e4
 
     # -- interface --------------------------------------------------------
 
@@ -110,6 +146,18 @@ class SimulatedDaqSession:
 
     def ai_terminal_modes(self) -> list[str]:
         return ["default", "rse", "nrse", "diff"]
+
+    def set_current_channels(self, n: int) -> None:
+        n = int(n)
+        if n not in (1, 2):
+            raise ValueError(f"current channels: 1 or 2, not {n}")
+        if n == 2 and not self.cfg.channels.ai_current_2:
+            raise ValueError("two current channels need channels.ai_current_2 "
+                             "in the config: the input channel 2 is wired to")
+        self.cfg.channels.current_channels = n
+        self.current_channels_set.append(n)
+        if n == 1:
+            self.last_current2_v = None
 
     def play(self, waveform: np.ndarray, timeout_s: float = 10.0) -> np.ndarray:
         waveform = np.asarray(waveform, dtype=float)
@@ -154,8 +202,8 @@ class SimulatedDaqSession:
         current_v = current_a * cal.preamp_gain_v_per_a + cal.current_zero_v
 
         current_v += self.rng.normal(0.0, self.noise_v_rms, current_v.shape)
-        voltage_v = node_v + self.rng.normal(0.0, self.noise_v_rms * 4,
-                                             bias_v.shape)
+        voltage_v = node_v + self.rng.normal(
+            0.0, self.noise_v_rms * self.voltage_noise_factor, bias_v.shape)
 
         if self.cfg.channels.has_piezo_sense:
             # The driver box's monitor output follows the command: the same
@@ -171,6 +219,23 @@ class SimulatedDaqSession:
             self.last_sense_v = None
 
         limit = self.cfg.channels.ai_range_v
+
+        if self.cfg.channels.two_current_channels:
+            # The amplifier's other output: the same current through
+            # channel 2's gain, on channel 2's offset, with the thermal
+            # noise of channel 2's feedback resistor, and clipped where the
+            # card's range ends -- which is where it sits for as long as
+            # the junction is closed.
+            gain2 = cal.preamp_gain_2_v_per_a
+            k_t = 1.380649e-23 * 295.0
+            noise2_a = np.sqrt(4.0 * k_t * self.channel2_bandwidth_hz / gain2)
+            current2_v = (current_a * gain2 + cal.current_zero_2_v
+                          + self.rng2.normal(0.0, noise2_a * gain2, current_a.shape)
+                          + self.rng2.normal(0.0, self.noise_v_rms, current_a.shape))
+            self.last_current2_v = np.clip(current2_v, -limit, limit)
+        else:
+            self.last_current2_v = None
+
         return np.clip(np.stack([voltage_v, current_v]), -limit, limit)
 
     # -- physics ----------------------------------------------------------

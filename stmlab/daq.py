@@ -105,6 +105,11 @@ class DaqSession:
     clock. Either way its samples are left in :attr:`last_sense_v` rather
     than added to the record, so the (2, n) contract of :meth:`play` -- and
     every row index above this layer -- is untouched.
+
+    The second output of a two-channel current amplifier
+    (``channels.ai_current_2`` with ``channels.current_channels = 2``) is
+    handled the same way: one more input of the record's task, placed
+    right after channel 1, its samples left in :attr:`last_current2_v`.
     """
 
     def __init__(self, cfg: RigConfig):
@@ -112,7 +117,8 @@ class DaqSession:
         self._ai = None
         self._ao = None
         self._sense = None                   # piezo sense task, or None
-        self._sense_in_record = False        # sense as the record task's 3rd channel
+        self._sense_in_record = False        # sense as an input of the record task
+        self._current2_in_record = False     # amplifier channel 2, likewise
         self._n = 0
         self._ao_running = False
         self._retriggerable = True
@@ -121,6 +127,9 @@ class DaqSession:
         # Piezo sense readback from the last play, (n,) volts, or None when
         # this rig has no sense line.
         self.last_sense_v: np.ndarray | None = None
+        # Channel 2 of a two-channel current amplifier from the last play,
+        # (n,) volts, or None while it is not read.
+        self.last_current2_v: np.ndarray | None = None
         # "hardware" once the sense task triggers off ao/StartTrigger,
         # "software" if that route was refused and it is started by Python.
         self.sense_sync: str = "none"
@@ -185,9 +194,13 @@ class DaqSession:
 
     def _open_ai(self) -> None:
         """The record's input task: the two record inputs in the terminal
-        mode the config names, plus the sense line when it is on this card."""
+        mode the config names, then channel 2 of a two-channel amplifier
+        when it is read, then the sense line when it is on this card (the
+        order is ``ChannelMap.record_inputs``; why, is told there)."""
         import nidaqmx
         m = self.cfg.channels
+        self._sense_in_record = False
+        self._current2_in_record = False
         self._ai = nidaqmx.Task("stmbj_ai")
         for chan in m.ai_channels:
             self._ai.ai_channels.add_ai_voltage_chan(
@@ -195,6 +208,16 @@ class DaqSession:
                 min_val=-m.ai_range_v, max_val=m.ai_range_v)
         log.info("record inputs %s in terminal mode %s", ", ".join(m.ai_channels),
                  m.ai_terminal)
+        second = m.current2_path
+        if second is not None:
+            # The amplifier's other output: wired like channel 1, so the
+            # same terminal mode and range.
+            self._ai.ai_channels.add_ai_voltage_chan(
+                second, terminal_config=terminal_config(m.ai_terminal),
+                min_val=-m.ai_range_v, max_val=m.ai_range_v)
+            self._current2_in_record = True
+            log.info("current channel 2 on %s (%s), in the record's task",
+                     second, m.ai_terminal)
         sense_path = m.piezo_sense_path
         if sense_path is not None and m.sense_in_record:
             # One card: the sense line is a third input of the record's own
@@ -218,6 +241,12 @@ class DaqSession:
             # One card, one wiring: the sense line is switched with the
             # record inputs (on a two-card rig it keeps its own setting).
             self.cfg.channels.sense_terminal = name
+        self.cfg.channels.ai_terminal = name
+        self._rebuild_ai()
+
+    def _rebuild_ai(self) -> None:
+        """Close the input task and make it again from the config as it is
+        now; the next play times it. The outputs are not touched."""
         if self._ai is not None:
             try:
                 self._ai.stop()
@@ -228,12 +257,38 @@ class DaqSession:
             except Exception:
                 pass
             self._ai = None
-        self.cfg.channels.ai_terminal = name
         self._open_ai()
         self._n = 0                                 # configure() again next play
 
     def ai_terminal_modes(self) -> list[str]:
         return device_terminal_modes(self.cfg.channels.device)
+
+    def set_current_channels(self, n: int) -> None:
+        """Read one output of the current amplifier (1) or both (2) from
+        the next play on. The input task is rebuilt, as for a wiring mode;
+        the outputs are not touched, so the piezo stays where it is. If the
+        card refuses the new task (an input that does not exist), the old
+        one is put back and the error is raised."""
+        n = int(n)
+        m = self.cfg.channels
+        if n not in (1, 2):
+            raise DaqError(f"current channels: 1 or 2, not {n}")
+        if n == 2 and not m.ai_current_2:
+            raise DaqError("two current channels need channels.ai_current_2 "
+                           "in the config: the input channel 2 is wired to")
+        was = m.current_channels
+        m.current_channels = n
+        try:
+            self._rebuild_ai()
+        except Exception:
+            m.current_channels = was
+            try:
+                self._rebuild_ai()
+            except Exception:                         # noqa: BLE001
+                log.exception("could not put the input task back")
+            raise
+        if n == 1:
+            self.last_current2_v = None
 
     def close(self) -> None:
         for task in (self._sense, self._ai, self._ao):
@@ -391,7 +446,9 @@ class DaqSession:
         ``waveform`` is (2, n): row 0 the piezo command, row 1 the bias, both
         in volts at the DAQ. The return is (2, n): row 0 the junction voltage
         on ai0, row 1 the preamp output on ai1. On a two-card rig the piezo
-        sense readback for the same n samples is left in ``last_sense_v``.
+        sense readback for the same n samples is left in ``last_sense_v``;
+        channel 2 of a two-channel amplifier, when it is read, in
+        ``last_current2_v``.
         """
         waveform = np.asarray(waveform, dtype=float)
         if waveform.ndim != 2 or waveform.shape[0] != 2:
@@ -423,13 +480,22 @@ class DaqSession:
 
         data = np.asarray(self._ai.read(number_of_samples_per_channel=n,
                                         timeout=timeout_s), dtype=float)
+        # Rows 0 and 1 are the record. Whatever else the task reads comes
+        # after them in the order it was added: channel 2, then the sense.
+        row = 2
+        if self._current2_in_record:
+            self.last_current2_v = data[row].copy()
+            row += 1
+        else:
+            self.last_current2_v = None
         if self._sense_in_record:
-            self.last_sense_v = data[2].copy()
-            data = data[:2]
+            self.last_sense_v = data[row].copy()
         elif self._sense is not None:
             sense = self._sense.read(number_of_samples_per_channel=n,
                                      timeout=timeout_s)
             self.last_sense_v = np.asarray(sense, dtype=float).ravel()
+        if data.shape[0] > 2:
+            data = data[:2]
         # AO is left running: the outputs hold their last sample, which is how
         # the piezo keeps its position between plays.
         return data

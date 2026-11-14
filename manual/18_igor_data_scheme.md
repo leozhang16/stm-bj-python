@@ -156,7 +156,7 @@ July 2026 data.
 | 5 | `StartX − StopX` | the sense readback averaged over the first 1000 points minus the average over the last 1000; the pull length on a rig without a sense line | nm | as Igor computed it |
 | 6, 7 | thermocouples | tip and substrate thermocouple averages of the old two-card rig; 0 here | — | 0 |
 | 8 | — | unused | — | 0 |
-| 9 | `CurrentVoltConversion` | the Keithley's scale, µA per V = 10^(6 − gain exponent) | µA/V | 1 |
+| 9 | `CurrentVoltConversion` | the amplifier's scale, µA per V = 10^6 / gain (10^(6 − gain exponent) on the Keithley): the gain the conductance was computed with, `cal.preamp_gain_v_per_a` | µA/V | 1 |
 | 10 | `TipBias` | the bias set | mV | 600 |
 | 11 | — | unused | — | 0 |
 | 12 | `SeriesResistance` | the resistor in series with the junction | Ω | 1e5 |
@@ -382,6 +382,38 @@ trace (Saved): N`. The settings are remembered between launches in
 `--headless N` saves through the same path; `--no-igor` (bench tests only)
 writes the `.h5` but no Igor files. The Status box's **Saved** is the day
 counter, not a count since the last Start.
+
+## A two-channel amplifier: the `ch2` subfolder
+
+Igor's scheme knows one current. When the rig reads both outputs of a
+two-channel amplifier (chapter 22), **channel 1 is saved exactly as this
+chapter describes**: same files, same names, nothing in them says there
+is a second channel, so the macro and every script that reads a day folder
+go on working. Channel 2 goes into a subfolder of the day folder:
+
+```
+<data folder>/11_14_26Merge/PullOutConductanceBlock_1.ibw      channel 1
+                            PullOutVoltageBlock_1.ibw          (and the rest, as ever)
+<data folder>/11_14_26Merge/ch2/PullOutConductanceBlock_1.ibw  channel 2: G/G0 + the 20 slots
+                                PullOutCurrentBlock_1.ibw      channel 2's current, A (Save Current)
+                                PullOutConductanceBlockHist_1.ibw   its block histogram (Save Hist)
+```
+
+The files in `ch2` carry Igor's own names and layout, and a trace sits in
+the same block and the same column as in the day folder, under the same
+number. Three slots differ in channel 2's parameters: slot 9 is channel
+2's gain, slot 16 its zero, and slot 4 is 0 because the junction voltage
+and the piezo readback are not repeated there (they are the day
+folder's). A trace taken with one channel leaves its column NaN in `ch2`;
+a day taken with one channel has no `ch2` at all. Resuming a partial block
+reads its `ch2` columns back, so refilling it loses nothing.
+
+Because the subfolder has Igor's names, **it is a day folder of channel 2**
+for anything that reads one: point the Igor macro at
+`…/11_14_26Merge/ch2`, or `python plot.py data/11_14_26Merge/ch2 1D`.
+`plot.py` given the day folder itself finds the subfolder and draws both
+channels (chapter 22); the raw `.h5` holds both channels' volts
+(`current_v`, `current2_v`) with both gains in its config.
 
 ## Opening a Python day in Igor
 

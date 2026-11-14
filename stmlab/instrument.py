@@ -39,6 +39,15 @@ class Rig:
         # Piezo sense readback from the last play, (n,) volts, or None on a
         # rig without a sense line. Informational: nothing decides on it.
         self.last_sense_v: np.ndarray | None = None
+        # Channel 2 of a two-channel current amplifier over the last play,
+        # (n,) volts, or None while it is not read. Recorded and shown, and
+        # the junction-open test is read from it (``open_side_of``);
+        # contact stays channel 1's.
+        self.last_current2_v: np.ndarray | None = None
+        # The last probe's record and its channel-2 samples, for
+        # ``open_side``.
+        self._probe_record: np.ndarray | None = None
+        self._probe_current2: np.ndarray | None = None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -135,6 +144,14 @@ class Rig:
         fn = getattr(self._session, "ai_terminal_modes", None)
         return fn() if fn else ["default"]
 
+    def set_current_channels(self, n: int) -> None:
+        """Read one output of the current amplifier (1) or both (2), live;
+        the config follows, so the next file records it. The card's input
+        task is rebuilt; the outputs, and so the piezo, are not touched."""
+        self._session.set_current_channels(n)
+        if int(n) == 1:
+            self.last_current2_v = None
+
     def play(self, waveform: np.ndarray) -> np.ndarray:
         """Output a waveform, capture the inputs, and update the tracker.
 
@@ -154,6 +171,7 @@ class Rig:
 
         record = self._session.play(waveform)
         self.last_sense_v = getattr(self._session, "last_sense_v", None)
+        self.last_current2_v = getattr(self._session, "last_current2_v", None)
 
         self._piezo_v = float(waveform[M.ROW_PIEZO, -1])
         self._bias_v = float(self.cfg.cal.bias_output_sign
@@ -250,11 +268,72 @@ class Rig:
         junction voltage, crossing ``ramp.engage_g0``.
         """
         record = self.hold(n_samples=n_samples)
+        self._probe_record = record
+        self._probe_current2 = self.last_current2_v
         return self.conductance_of(record), self.is_saturated(record)
 
     def in_contact(self, n_samples: int | None = None) -> bool:
         g0, railed = self.probe(n_samples)
         return railed or g0 > self.cfg.ramp.engage_g0
+
+    def is_open(self, n_samples: int | None = None) -> bool:
+        """One probe: is the junction open -- not railed, and below
+        ``ramp.break_g0``? Read on the open side (``open_side_of``): channel
+        2 of a two-channel amplifier, channel 1 of a one-channel one, where
+        this is ``probe``'s own pair against the threshold."""
+        self._probe_record = None
+        g0, railed = self.probe(n_samples)
+        if self._probe_record is not None:
+            g0, railed, _ = self.open_side()
+        return not railed and g0 < self.cfg.ramp.break_g0
+
+    def open_side(self) -> tuple[float, bool, int]:
+        """``open_side_of`` the last probe: what the junction-open test
+        reads from it. (inf, True, 1) before the first probe."""
+        if self._probe_record is None:
+            return float("inf"), True, 1
+        return self.open_side_of(self._probe_record, self._probe_current2)
+
+    def open_side_of(self, record: np.ndarray,
+                     current2_v: np.ndarray | None = None
+                     ) -> tuple[float, bool, int]:
+        """What the junction-open test reads from a held record:
+        (conductance in G0, railed, the channel it is from).
+
+        With one current channel that is channel 1: ``conductance_of`` and
+        ``is_saturated``, the pair ``probe`` returns. With both outputs of
+        a two-channel amplifier read it is channel 2, the higher-gain one.
+        The break threshold is a few nanoamps: on the low-gain output that
+        is tens of microvolts, inside the card's noise and the amplifier's
+        offset drift, and on channel 2 it is a thousand times that. While
+        any of channel 2's settled samples is at its rail
+        (``limits.preamp_saturation_v``) the current is beyond its range --
+        the junction is closed, or was a moment ago -- and the reading is
+        channel 1's, which is good exactly there. ``current2_v`` is that
+        play's channel-2 samples (default: the last play's).
+
+        Read over the same settled tail as ``conductance_of``. Contact is
+        never read from here: ``in_contact`` is channel 1's.
+        """
+        first = (self.conductance_of(record), self.is_saturated(record), 1)
+        M, C, R = self.cfg.channels, self.cfg.cal, self.cfg.ramp
+        if not M.two_current_channels:
+            return first
+        if current2_v is None:
+            current2_v = self.last_current2_v
+        if current2_v is None or current2_v.size != record.shape[1]:
+            return first
+        keep = record.shape[1] - min(R.settle_discard, record.shape[1] - 1)
+        tail = np.asarray(current2_v[-keep:], dtype=float)
+        if np.any(np.abs(tail) >= self.cfg.limits.preamp_saturation_v):
+            return first
+        junction_v = C.voltage_input_sign * float(
+            np.mean(record[M.ROW_VOLTAGE, -keep:]))
+        if abs(junction_v) < 1e-9:
+            return float("inf"), False, 2
+        from .config import G0_SIEMENS
+        amps = C.volts_to_amps(float(np.mean(tail)), channel=2)
+        return abs(amps) / abs(junction_v) / G0_SIEMENS, False, 2
 
     def conductance_of(self, record: np.ndarray) -> float:
         M, C, R = self.cfg.channels, self.cfg.cal, self.cfg.ramp
@@ -269,6 +348,39 @@ class Rig:
 
         from .config import G0_SIEMENS
         return abs(C.volts_to_amps(current_v)) / abs(junction_v) / G0_SIEMENS
+
+    def channel2_of(self, record: np.ndarray,
+                    current2_v: np.ndarray | None = None) -> dict | None:
+        """What channel 2 of a two-channel amplifier read over the second
+        half of a play, the window the window's readouts average: ``volts``
+        (its output), ``amps``, ``g0`` (against the junction voltage of the
+        same ``record``) and ``railed`` (most of that window at or beyond
+        ``limits.preamp_saturation_v``). ``current2_v`` is that play's
+        channel-2 samples (default: the last play's). None while channel 2
+        is not read, or when the two do not belong to the same play.
+
+        For the readouts. Railed is channel 2's normal state while the
+        junction is closed. The junction-open test has a reading of its
+        own, ``open_side_of``, over the settled tail the decisions use.
+        """
+        if current2_v is None:
+            current2_v = self.last_current2_v
+        if current2_v is None or current2_v.size < 4 \
+                or current2_v.size != record.shape[1]:
+            return None
+        M, C = self.cfg.channels, self.cfg.cal
+        half = current2_v.size // 2
+        tail = np.asarray(current2_v[half:], dtype=float)
+        volts = float(np.mean(tail))
+        amps = float(C.volts_to_amps(volts, channel=2))
+        junction_v = C.voltage_input_sign * float(
+            np.mean(record[M.ROW_VOLTAGE, half:]))
+        from .config import G0_SIEMENS
+        g0 = (abs(amps) / abs(junction_v) / G0_SIEMENS
+              if abs(junction_v) > 1e-9 else float("inf"))
+        railed = bool(np.mean(np.abs(tail) >= self.cfg.limits.preamp_saturation_v)
+                      >= 0.5)
+        return {"volts": volts, "amps": amps, "g0": g0, "railed": railed}
 
     def read_current_ua(self, n_samples: int | None = None) -> float:
         """Junction current in microamps. Used by the coarse approach."""

@@ -50,8 +50,8 @@ def _events(worker, kind):
 
 # -- the version ---------------------------------------------------------------------
 
-def test_version_is_v65(ap):
-    assert ap.__version__ == "v65"
+def test_version_is_v68(ap):
+    assert ap.__version__ == "v68"
 
 
 # -- headless: the whole path, twice, with the simulator ---------------------------------
@@ -91,7 +91,7 @@ def test_headless_runs_write_a_day_folder_and_the_second_run_continues_the_numbe
     assert wave.data.dtype == np.float32
     assert wave.data.shape == (cfg.ramp.n_pull_samples + igor_scheme.TAIL_ROWS, 100)
     assert np.isnan(wave.data[:, 3:]).all()
-    assert wave.note.startswith("pullout v65;") and "traces 1-3" in wave.note
+    assert wave.note.startswith(f"pullout {ap.__version__};") and "traces 1-3" in wave.note
     assert igor_scheme.IgorDayWriter.scan(day) == (1, 3)
     assert ap.next_trace_number(day) == 4
 
@@ -145,7 +145,7 @@ def test_a_run_files_everything_in_the_day_folder(ap, cfg, tmp_path):
         assert not (tmp_path / "experiment_log.csv").exists()
         import h5py
         with h5py.File(h5[0]) as h:
-            assert h.attrs["program"] == "pullout v65"
+            assert h.attrs["program"] == f"pullout {ap.__version__}"
             assert h.attrs["operator"] == "Leo Z"
             assert h.attrs["setup_id"] == "_"
             assert "Igor traces 1-2 in " + day.name in h.attrs["auto_notes"]

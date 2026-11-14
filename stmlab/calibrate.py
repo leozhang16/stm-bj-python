@@ -4,6 +4,7 @@ Every one of these writes into ``cfg.cal``, and ``cfg`` is written into every
 data file, so a calibration always travels with the data it applies to.
 
     measure_zero          the preamp's resting offset -- every session
+    measure_zeros         the same for both outputs of a two-channel amplifier
     measure_group_delay   AI/AO lag in samples        -- after a rate change
     measure_gain_offset   AI transfer function        -- loopback cable
     expected_resistor_v   what a known resistor should read
@@ -34,11 +35,30 @@ def measure_zero(rig, n_samples: int = 20_000) -> float:
 
     The tip should be out of contact. Bias is set to zero for the measurement
     and restored afterwards.
+
+    Channel 1 of the amplifier; :func:`measure_zeros` gives both outputs of
+    a two-channel one from the same hold.
+    """
+    return measure_zeros(rig, n_samples)[0]
+
+
+def measure_zeros(rig, n_samples: int = 20_000) -> tuple[float, float | None]:
+    """Both outputs of the amplifier with no bias applied, from one hold:
+    ``(channel 1's zero, channel 2's zero)``, the second None while
+    channel 2 is not read (``channels.current_channels = 1``).
+
+    Channel 2's samples are taken from the zero-bias hold itself, before
+    the bias is put back: by then ``rig.last_current2_v`` belongs to
+    another play.
     """
     cfg = rig.cfg
     was = rig.bias_v
+    second = None
     try:
         record = rig.hold(bias_v=0.0, n_samples=n_samples)
+        second = getattr(rig, "last_current2_v", None)
+        if second is not None:
+            second = np.array(second, dtype=float)
     finally:
         rig.hold(bias_v=was)
 
@@ -49,9 +69,19 @@ def measure_zero(rig, n_samples: int = 20_000) -> float:
 
     log.info("preamp zero %.3f uV, noise %.3f uV rms (= %.2e G0 at %.0f mV)",
              zero * 1e6, noise * 1e6,
-             abs(cfg.cal.volts_to_amps(noise)) / (cfg.ramp.bias_v * G0_SIEMENS),
-             cfg.ramp.bias_v * 1e3)
-    return zero
+             noise / cfg.cal.preamp_gain_v_per_a
+             / (abs(cfg.ramp.bias_v) * G0_SIEMENS), cfg.ramp.bias_v * 1e3)
+
+    zero2 = None
+    if second is not None and second.size:
+        keep2 = second[second.size // 4:]
+        zero2 = float(np.mean(keep2))
+        noise2 = float(np.std(keep2))
+        log.info("channel 2 zero %.3f uV, noise %.3f uV rms (= %.2e G0 at "
+                 "%.0f mV)", zero2 * 1e6, noise2 * 1e6,
+                 noise2 / cfg.cal.preamp_gain_2_v_per_a
+                 / (abs(cfg.ramp.bias_v) * G0_SIEMENS), cfg.ramp.bias_v * 1e3)
+    return zero, zero2
 
 
 def measure_group_delay(rig, repeats: int = 20) -> tuple[float, float]:
@@ -141,8 +171,11 @@ def session_calibration(rig, do_group_delay: bool = True) -> dict:
     cfg = rig.cfg
     results: dict[str, float] = {}
 
-    cfg.cal.current_zero_v = measure_zero(rig)
+    cfg.cal.current_zero_v, zero2 = measure_zeros(rig)
     results["current_zero_v"] = cfg.cal.current_zero_v
+    if zero2 is not None:
+        cfg.cal.current_zero_2_v = zero2
+        results["current_zero_2_v"] = zero2
 
     if do_group_delay:
         try:

@@ -44,6 +44,8 @@ Igor's `SetUpHRTaskID1` (Functions_STMBJ.ipf:243).
 | `sense_device` | `None` | -- | -- | The card the sense line is on. `None`: the low-res card (the original two-card rig). The record's own device name (`"Dev1"` on a one-card rig such as a USB-6453): the sense line joins the record's task, on its clock |
 | `sense_ai_range_v` | `10.0` | V | -- | Range of the sense input |
 | `sense_terminal` | `"default"` | -- | -- | How the sense input is wired: `default` (the card's default, DIFF on an X-series card), `rse`, `nrse` or `diff`. A readback that drifts and ignores the command is the signature of a floating minus input: try `rse` for a BNC from a box |
+| `ai_current_2` | `None` | -- | -- | The card input the *second* output of a two-channel current amplifier is wired to (`"ai4"`); `None` on a rig with a one-output amplifier. `ai_current` is then channel 1, the lower-gain output that follows the junction through contact, which contact is judged on; this is channel 2, the higher-gain output for the low conductances, which the junction-open test (`ramp.break_g0`) is read from while both are read (chapter 22) |
+| `current_channels` | `1` | -- | -- | How many of the amplifier's outputs are read: `1` is `ai_current` alone, `2` reads `ai_current_2` as well, as one more input of the record's task, wired like the others (`ai_terminal`, `ai_range_v`). It needs `ai_current_2`. The window's Current amplifier box switches it live |
 
 Class constants (`ClassVar`, deliberately excluded from `asdict()` and the
 data files because they describe this code's array layout, not the rig):
@@ -51,7 +53,12 @@ data files because they describe this code's array layout, not the rig):
 `ROW_BIAS = 1` (output rows). Derived helpers: `path(ch)`, `ai_channels`,
 `ao_channels`, `ao_start_trigger` (`/<device>/ao/StartTrigger` -- the
 terminal AI triggers off, derived rather than hardcoded), `has_piezo_sense`
-and `piezo_sense_path` (`<low_res_device>/<ai_piezo_sense>`, or `None`).
+and `piezo_sense_path` (`<low_res_device>/<ai_piezo_sense>`, or `None`),
+`two_current_channels` and `current2_path` (channel 2 of the amplifier, or
+`None` while it is not read), and `record_inputs`: every input of the
+record's task in the order the card scans them -- junction voltage,
+current channel 1, channel 2, the sense line. The (2, n) record itself is
+always the first two.
 
 ## SafetyLimits (`cfg.limits`)
 
@@ -83,7 +90,7 @@ Trajectory and sampling; Igor's `Declare_STMBJ_Variables` defaults.
 | `pull_rate_nm_per_s` | `20.0` | nm/s | `G_PullOutRate` | Retraction speed; also the rate at which every mode length is converted to samples |
 | `bias_v` | `0.100` | V | `G_TipBias` (100 mV) | DC junction bias baseline |
 | `engage_g0` | `0.5` | G0 | `G_ConductanceThreshold` (Igor: 5) | Contact threshold. Deliberately lowered: 5 G0 at Rf = 1e6 V/A and 100 mV needs 38.7 V at the ADC, unreachable on a +/-10 V input; 0.5 G0 needs 3.87 V. Saturation additionally counts as contact |
-| `break_g0` | `5e-4` | G0 | `G_EndOfTraceNoiseThreshold` | Below this the junction counts as broken |
+| `break_g0` | `5e-4` | G0 | `G_EndOfTraceNoiseThreshold` | Below this the junction counts as broken. Read on channel 2 while both outputs of a two-channel amplifier are read (chapter 22) |
 | `approach_step_nm` | `0.5` | nm | `G_MakeContactApproachStepSize` | Fine-approach step size |
 | `retract_step_nm` | `5.0` | nm | -- | Separation step magnitude (applied negative) |
 | `settle_samples` | `1000` | samples | `G_WriteBufferSize` | Samples played/captured per DC move (Igor wrote 1000 per `WriteToHighRes`) |
@@ -112,6 +119,8 @@ Measured constants; produced by `calibrate.py`, saved per session.
 |---|---|---|---|---|
 | `preamp_gain_v_per_a` | `1e6` | V/A | `G_CurrentVoltGain` (stored as the exponent 6) | Transimpedance of the current preamp |
 | `current_zero_v` | `0.0` | V | -- | Preamp resting offset; hundreds of microvolts, drifts with temperature, re-measure every session (`validate` warns while it is 0) |
+| `preamp_gain_2_v_per_a` | `1e9` | V/A | -- | Transimpedance of channel 2 of a two-channel amplifier (`channels.ai_current_2`); `preamp_gain_v_per_a` is channel 1's. `validate` warns when it is not above channel 1's (the two inputs are probably swapped) |
+| `current_zero_2_v` | `0.0` | V | -- | Channel 2's resting offset. Calibrate zero measures it in the same hold as channel 1's |
 | `piezo_nm_per_volt` | `62.0` | nm/V | `K_ZPiezoScale` | Displacement per volt at the DAQ output, end to end including the driver box |
 | `hv_amp_gain` | `None` | -- | -- | Driver-box gain if ever measured separately; documentation only, nothing multiplies by it |
 | `sense_nm_per_volt` | `314.0` | nm/V | `K_SenseScale` | Displacement per volt on the piezo *sense* line (`channels.ai_piezo_sense`): nm = (sense_v − `sense_zero_v`) × this. Converts the readback to nm for SenseInDisplay and `Session.piezo_sense()`; the displacement axis of every trace stays the commanded one. Measured by `rigtests/01_piezo_sweep.py`, which prints both numbers as config lines |
@@ -125,7 +134,9 @@ Measured constants; produced by `calibrate.py`, saved per session.
 
 Conversion methods: `volts_to_amps`, `volts_to_g0`, `g0_to_volts` (used by
 the validator to catch clipping before acquiring), `nm_to_piezo_volts`,
-`piezo_volts_to_nm`.
+`piezo_volts_to_nm`. `volts_to_amps` and `volts_to_g0` take `channel=2` for
+the amplifier's second output (`gain_of(channel)`, `zero_of(channel)` give
+the two numbers they use).
 
 ## ActuatorConfig (`cfg.actuator`)
 
@@ -259,11 +270,19 @@ Lateral X piezo on the low-res card, for monolayer experiments. Igor:
 | `min_v` | `0.0` | V | -- | Output floor; moves outside the range are refused (Igor did not check) |
 | `max_v` | `10.0` | V | -- | Output ceiling |
 
+## SimConfig (`cfg.sim`)
+
+The simulated card (`--simulate`). No real rig reads it.
+
+| Field | Default | Unit | Igor origin | Meaning |
+|---|---|---|---|---|
+| `ai_noise_v_rms` | `None` | V rms | -- | Noise of every input of the simulated card, per sample. `None` keeps the simulator's built-in noise (1.87 uV on the current input, four times that on the junction voltage), far below a real card's. With the card's own number a simulated run shows the noise floors the rig will have: NI lists 88 uV for the USB-6453 on its +/-10 V range, which at 100 mV is a floor near 1e-3 G0 at 1e4 V/A and near 1e-6 G0 at 1e7 V/A (`configs/newrig_2ch.json` sets it) |
+
 ## RigConfig (top level)
 
 | Field | Default | Meaning |
 |---|---|---|
-| `channels` .. `xpiezo` | the thirteen dataclasses above | See each table |
+| `channels` .. `sim` | the fourteen dataclasses above | See each table |
 | `simulate` | `False` | Run against `sim.SimulatedDaqSession` and the simulated instruments instead of hardware |
 | `notes` | `""` | Free text, travels in every data file |
 

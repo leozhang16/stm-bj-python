@@ -50,6 +50,7 @@ one, so nothing is left in memory.
 |---|---|---|
 | `voltage_v` | (n, samples) float64 | raw ADC volts, junction-voltage channel, one row per accepted trace |
 | `current_v` | (n, samples) float64 | raw ADC volts, preamp output |
+| `current2_v` | (n, samples) float64 | only in a `pullout.py` session taken with a two-channel amplifier (chapter 22): raw ADC volts of the amplifier's second output; `current_v` is then channel 1. Gain and zero: `cal.preamp_gain_2_v_per_a`, `cal.current_zero_2_v` in `config_json` |
 | `delay_samples` | (n,) int32 | the AI/AO lag recovered from the alignment spike |
 | `start_piezo_v` | (n,) float64 | the piezo voltage at which the pull started (the contact point) |
 | `bias_v` | (n,) float64 | the applied DC bias, in volts, **including V0** when V0 check was ON |

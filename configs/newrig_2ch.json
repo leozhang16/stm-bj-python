@@ -1,0 +1,153 @@
+{
+  "channels": {
+    "device": "Dev1",
+    "ao_piezo": "ao2",
+    "ao_bias": "ao1",
+    "ai_voltage": "ai1",
+    "ai_current": "ai2",
+    "ai_current_2": "ai4",
+    "current_channels": 2,
+    "ai_range_v": 10.0,
+    "bias_ao_range_v": 2.5,
+    "expected_product_type": "USB-6453",
+    "low_res_device": null,
+    "low_res_expected_product_type": null,
+    "ai_piezo_sense": "ai3",
+    "sense_device": "Dev1",
+    "sense_ai_range_v": 10.0,
+    "sense_terminal": "rse",
+    "ai_terminal": "rse"
+  },
+  "limits": {
+    "piezo_ao_min_v": 0.0,
+    "piezo_ao_max_v": 10.0,
+    "bias_max_v": 0.5,
+    "preamp_saturation_v": 9.5,
+    "max_coarse_steps": 2000,
+    "coarse_step_max_piezo_v": 0.1
+  },
+  "ramp": {
+    "sample_rate_hz": 40000.0,
+    "pull_length_nm": 5.0,
+    "pull_rate_nm_per_s": 20.0,
+    "bias_v": 0.1,
+    "engage_g0": 5.0,
+    "break_g0": 0.0005,
+    "approach_step_nm": 0.5,
+    "retract_step_nm": 5.0,
+    "settle_samples": 1000,
+    "settle_discard": 800,
+    "pre_pad_samples": 400,
+    "post_pad_samples": 400,
+    "spike_front_ms": 7.5,
+    "spike_back_ms": 2.5,
+    "smash_every": 50,
+    "smash_in_nm": 30.0,
+    "smash_out_nm": -40.0,
+    "traces_target": 1000,
+    "max_attempts": 100000,
+    "piezo_park_v": 0.0,
+    "piezo_headroom_v": 0.02
+  },
+  "cal": {
+    "preamp_gain_v_per_a": 10000.0,
+    "current_zero_v": 0.0,
+    "preamp_gain_2_v_per_a": 10000000.0,
+    "current_zero_2_v": 0.0,
+    "piezo_nm_per_volt": 600.0,
+    "hv_amp_gain": null,
+    "sense_nm_per_volt": 600.0,
+    "sense_zero_v": 0.0,
+    "bias_output_sign": -1.0,
+    "voltage_input_sign": -1.0,
+    "ai_gain_error": 1.0,
+    "ai_offset_v": 0.0,
+    "granted_sample_rate_hz": null,
+    "group_delay_samples": null
+  },
+  "actuator": {
+    "kind": "none",
+    "port": "COM4",
+    "approach_piezo_v": 1.0,
+    "band_lo_v": 3.0,
+    "band_hi_v": 7.0,
+    "scan_step_nm": 5.0,
+    "max_approach_rounds": 12,
+    "max_backoff_steps": 40,
+    "baud": 19200,
+    "step_size": 5,
+    "settle_s": 0.1,
+    "axis": 1,
+    "step_amplitude": 23,
+    "channel": 0,
+    "closer_sign": 1,
+    "visa_resource": "",
+    "visa_backend": "",
+    "stop_current_ua": 0.1
+  },
+  "push_pull": {
+    "initial_pull_nm": 1.0,
+    "push_pull_nm": 1.5,
+    "hold_nm": 1.0,
+    "final_pull_nm": 4.0,
+    "cycles": 2
+  },
+  "iv": {
+    "init_pull_nm": 3.0,
+    "final_pull_nm": 4.0,
+    "cap_nm": 0.5,
+    "ramp_nm": 2.0,
+    "max_bias_v": 1.0,
+    "positive_first": false
+  },
+  "ac_hold": {
+    "init_pull_nm": 3.0,
+    "final_pull_nm": 4.0,
+    "hold_nm": 3.0,
+    "cap_nm": 0.5,
+    "amp_v": 0.8,
+    "freq_khz": 10.0
+  },
+  "hb_hold": {
+    "init_pull_nm": 3.0,
+    "final_pull_nm": 4.0,
+    "hold_nm": 3.0,
+    "cap_in_nm": 0.1,
+    "cap_fin_nm": 0.1,
+    "hold_bias_v": 0.8
+  },
+  "vzero": {
+    "interval_mv": 5.0,
+    "n_points": 5,
+    "every_n_traces": 50,
+    "settle_s": 0.05
+  },
+  "keithley": {
+    "resource": "GPIB0::22::INSTR",
+    "visa_backend": "",
+    "gain_exponent": 4,
+    "suppress_const": 0.0,
+    "series_resistance_ohm": 106130.0,
+    "enabled": false
+  },
+  "echem": {
+    "counter_electrode_channel": "ao1",
+    "gate_mv": 0.0,
+    "cv_rate_hz": 1000.0,
+    "scan_rate_mv_per_s": 100.0,
+    "peak_one_v": -1.0,
+    "peak_two_v": 1.0,
+    "cycles": 1
+  },
+  "xpiezo": {
+    "channel": "ao0",
+    "nm_per_volt": 522.0,
+    "min_v": 0.0,
+    "max_v": 10.0
+  },
+  "sim": {
+    "ai_noise_v_rms": 8.8e-05
+  },
+  "simulate": false,
+  "notes": "new rig: NI USB-6453 (one card), coarse approach by screws (actuator none), piezo driver in STANDARD mode, current amplifier with TWO outputs. Wiring: piezo command ao2, bias ao1, junction voltage ai1, current channel 1 ai2, current channel 2 ai4, piezo sense ai3; all inputs RSE (BNC centre to the AI+ terminal, shield to AI GND or nowhere). Channel 1 (ai_current) must be the LOWER-gain output, the one that follows the junction through contact: contact is judged on it. Channel 2 (ai_current_2) is the higher-gain output: the junction-open test (the Break threshold) is judged on it, and it is recorded and drawn beside channel 1. PLACEHOLDERS to replace with this rig's own numbers: ai_current_2 (which input channel 2 is on), cal.preamp_gain_v_per_a and cal.preamp_gain_2_v_per_a (the two gains, V/A; 1e4 and 1e7 here), cal.piezo_nm_per_volt (standard mode: the stage's range in nm divided by 10 V) and cal.sense_nm_per_volt (the same number in standard mode; refit with rigtests/01_piezo_sweep.py), keithley.series_resistance_ohm (the resistor between the bias output and the junction; 0 if there is none). sim.ai_noise_v_rms is for --simulate only: 88 uV rms is NI's idle-channel noise for the USB-6453 on its +/-10 V range, so a simulated run shows the noise floors the card will give."
+}

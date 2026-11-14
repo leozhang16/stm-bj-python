@@ -154,7 +154,10 @@ def test_igor_parameters_fill_the_20_slots_as_igor_did():
     # no readback: slot 5 is the pull length; bias off: slot 4 is 0
     q = igor_scheme.igor_parameters(cfg, 4.0, WHEN, bias_save=False)
     assert q[5] == 5.0 and q[4] == 0.0
+    # slot 9 is the gain the conductance is computed with (v66): the window's
+    # gain control sets the Keithley's exponent and the calibration together
     cfg.keithley.gain_exponent = 8
+    cfg.cal.preamp_gain_v_per_a = 1e8
     assert igor_scheme.igor_parameters(cfg, 4.0, WHEN)[9] == pytest.approx(1e-2)
 
 

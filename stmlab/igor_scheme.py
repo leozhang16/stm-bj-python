@@ -46,10 +46,25 @@ numbering from the folder and refills that partial block in place;
 version, experiment, operator and trace range (Igor left it empty and
 ``LoadWave`` ignores notes).
 
+**Two current channels.** Igor's scheme knows one current. With a
+two-channel amplifier, channel 1 -- the output that follows the junction
+through contact -- is saved exactly as above, so nothing that reads a day
+folder has to know there is a second one. Channel 2 goes into the subfolder ``ch2`` of
+the day folder (:data:`CH2_FOLDER`) under Igor's own file names:
+``ch2/PullOutConductanceBlock_k.ibw`` (channel 2's G/G0, the same 22-row
+tail, slot 9 holding channel 2's gain), ``ch2/PullOutCurrentBlock_k.ibw``
+and ``ch2/PullOutConductanceBlockHist_k.ibw`` as the Current and Hist boxes
+say. Same block, same column, same trace number as channel 1; a trace
+taken with one channel leaves its column NaN there. So the subfolder *is*
+a day folder of channel 2: Igor's macro, ``plot.py`` and the window's
+browser open it like any other. The junction voltage and the piezo
+readback are not repeated in it.
+
 Reading from this file
 ----------------------
 :func:`read_block`, :func:`read_day_folder`, :func:`list_blocks`,
-:func:`read_hist_wave`, :func:`read_wave`, :func:`split_block`.
+:func:`read_hist_wave`, :func:`read_wave`, :func:`split_block`,
+:func:`read_block_channel2`.
 
 Writing from this file
 ----------------------
@@ -103,7 +118,7 @@ PARAM_NAMES = (
     "tip thermocouple average (0 on this rig)",            # 6
     "substrate thermocouple average (0 on this rig)",      # 7
     "unused (0)",                                          # 8
-    "CurrentVoltConversion, uA per V = 10^(6 - gain)",     # 9
+    "CurrentVoltConversion, uA per V = 1e6 / gain (V/A)",  # 9
     "TipBias, mV",                                         # 10
     "unused (0)",                                          # 11
     "SeriesResistance, ohm",                               # 12
@@ -115,6 +130,10 @@ PARAM_NAMES = (
     "gate voltage, mV",                                    # 18
     "CurrentSuppress, uA = const * 10^(3 - gain)",         # 19
 )
+
+# Where channel 2 of a two-channel current amplifier is filed: this
+# subfolder of the day folder, with Igor's own file names inside it.
+CH2_FOLDER = "ch2"
 
 # File name of each kind of block file; ``{k}`` is the block number.
 FILE_PATTERNS = {
@@ -183,15 +202,26 @@ class SaveFlags:
     sense: bool = True         # G_SenseSaveCheck: PullOutExtensionBlock_k (if the rig has a sense line)
     hist: bool = True          # G_HistSaveCheck: PullOutConductanceBlockHist_k
     piezo_wave: bool = False   # G_PiezoWaveSaveCheck: PullOutPiezoBiasWave_k
+    # Not one of Igor's boxes: the single-trace files Igor wrote for a
+    # block's last trace when Bias or Sense was off (PullOutVoltage_<n>,
+    # PullOutCurrent_<n>, PullOutExtension_<n>). On, as Igor did; off for
+    # the ch2 subfolder, which leaves the voltage and the sense to the
+    # day folder itself.
+    last_trace_files: bool = True
 
 
 def igor_parameters(cfg: RigConfig, start_piezo_v: float, timestamp: float, *,
                     extension_nm: np.ndarray | None = None,
                     vzero_mv: float = 0.0, izero: float = 0.0,
-                    bias_save: bool = True) -> np.ndarray:
+                    bias_save: bool = True, channel: int = 1) -> np.ndarray:
     """The 20 ``ParameterWave`` slots of one trace (float64; stored as
     float32). Slot by slot in :data:`PARAM_NAMES`; unused slots are 0, as
     Igor's were.
+
+    Slot 9, Igor's CurrentVoltConversion in uA per V, is the gain the
+    conductance was computed with: ``1e6 / cal.preamp_gain_v_per_a`` (1 at
+    1e6 V/A, Igor's ``10^(6 - gain)``), or with ``channel=2`` the gain of
+    the second output of a two-channel amplifier.
 
     ``start_piezo_v`` is the piezo voltage at contact, where the pull began;
     Igor recorded ``PiezoOffset_nm`` *after* the pull had moved the piezo by
@@ -215,7 +245,7 @@ def igor_parameters(cfg: RigConfig, start_piezo_v: float, timestamp: float, *,
         p[5] = float(np.nanmean(ext[:1000]) - np.nanmean(ext[-1000:]))
     else:
         p[5] = R.pull_length_nm
-    p[9] = 10.0 ** (6 - K.gain_exponent)
+    p[9] = 1e6 / C.gain_of(channel)
     p[10] = R.bias_v * 1e3
     p[12] = K.series_resistance_ohm
     p[13] = R.engage_g0
@@ -238,6 +268,12 @@ class IgorTrace:
     in volts, starting at 0 and going negative over the pull (Igor's
     ``PiezoBiasWave``), and ``params`` the 20 slots of
     :func:`igor_parameters`. Build one with :meth:`from_record`.
+
+    A trace taken with both outputs of a two-channel amplifier also
+    carries channel 2: ``g0_2`` (its conductance, G/G0), ``current2_a``
+    (its current, amps) and ``params2`` (its 20 slots: channel 2's gain in
+    slot 9 and its zero in slot 16, slot 4 at 0 because the ch2 subfolder
+    holds no Voltage block). All three are None for a one-channel trace.
     """
     g0: np.ndarray
     voltage_v: np.ndarray
@@ -245,14 +281,20 @@ class IgorTrace:
     extension_nm: np.ndarray | None
     piezo_wave_v: np.ndarray | None
     params: np.ndarray
+    g0_2: np.ndarray | None = None
+    current2_a: np.ndarray | None = None
+    params2: np.ndarray | None = None
 
     @classmethod
     def from_record(cls, tr, cfg: RigConfig, *, vzero_mv: float = 0.0,
-                    izero: float = 0.0, bias_save: bool = True) -> "IgorTrace":
+                    izero: float = 0.0, bias_save: bool = True,
+                    izero2: float = 0.0) -> "IgorTrace":
         """From a ``trace.TraceRecord`` (raw volts) with the rig's
         calibration: conductance from the *measured* junction voltage, as
         Igor computed it; ``vzero_mv``/``izero`` are the last Find-Offset
-        results for slots 15 and 16; ``bias_save`` is slot 4."""
+        results for slots 15 and 16; ``bias_save`` is slot 4. When the
+        record carries channel 2 (``tr.current2_v``), its conductance,
+        current and parameters come along, ``izero2`` being its slot 16."""
         cal = cfg.cal
         g0 = np.asarray(tr.conductance_g0(cfg), dtype=float)
         voltage_v = cal.voltage_input_sign * np.asarray(tr.voltage_v, dtype=float)
@@ -265,7 +307,17 @@ class IgorTrace:
         params = igor_parameters(cfg, tr.start_piezo_v, tr.timestamp,
                                  extension_nm=extension_nm, vzero_mv=vzero_mv,
                                  izero=izero, bias_save=bias_save)
-        return cls(g0, voltage_v, current_a, extension_nm, piezo_wave_v, params)
+        g0_2 = current2_a = params2 = None
+        if getattr(tr, "current2_v", None) is not None:
+            g0_2 = np.asarray(tr.conductance_g0(cfg, channel=2), dtype=float)
+            current2_a = np.asarray(cal.volts_to_amps(
+                np.asarray(tr.current2_v, dtype=float), channel=2))
+            params2 = igor_parameters(cfg, tr.start_piezo_v, tr.timestamp,
+                                      extension_nm=extension_nm,
+                                      vzero_mv=vzero_mv, izero=izero2,
+                                      bias_save=False, channel=2)
+        return cls(g0, voltage_v, current_a, extension_nm, piezo_wave_v, params,
+                   g0_2, current2_a, params2)
 
     @property
     def n(self) -> int:
@@ -304,6 +356,13 @@ def write_block_files(folder: str | Path, k: int, traces, cfg: RigConfig,
     last trace when a flag was *off* (``PullOutExtension_<k*100>``,
     ``PullOutVoltage_<k*100>``, ``PullOutCurrent_<k*100>``; float64) are
     written too.
+
+    Traces that carry channel 2 of a two-channel amplifier (``g0_2``) get a
+    second set of files in ``folder/ch2``, written by this same function
+    from those traces alone: the ConductanceBlock of channel 2, its
+    CurrentBlock and its Hist as ``flags`` say, under Igor's names, each
+    trace in the column it has in ``folder``. Columns of traces without a
+    channel 2 are NaN there.
     """
     folder = Path(folder)
     traces = list(traces)
@@ -366,13 +425,16 @@ def write_block_files(folder: str | Path, k: int, traces, cfg: RigConfig,
 
     complete = len(filled) == BLOCK
     if flags.hist:
+        # A trace that has a channel 2 is gated by channel 2's floor, in
+        # this histogram and in the ch2 folder's alike.
         hist = block_histogram([traces[c].g0 for c in filled], cfg,
-                               BLOCK if complete else len(filled))
+                               BLOCK if complete else len(filled),
+                               gate_columns=[traces[c].g0_2 for c in filled])
         p = _write(folder, "hist", k, hist.astype(np.float32), dx=HIST_DX, x0=HIST_X0)
         if p is not None:
             written.append(p)
 
-    if complete:
+    if complete and flags.last_trace_files:
         last = traces[BLOCK - 1]
         number = k * BLOCK
         if not flags.sense and last.extension_nm is not None:
@@ -387,10 +449,27 @@ def write_block_files(folder: str | Path, k: int, traces, cfg: RigConfig,
                     written.append(write_ibw(folder / f"{name}.ibw", name,
                                              np.asarray(values, dtype=np.float64),
                                              dx=dx, x0=0.0))
+
+    # Channel 2 of a two-channel amplifier: the same block once more, in
+    # the ch2 subfolder, from the traces that have one.
+    second: list[IgorTrace | None] = [
+        None if t is None or t.g0_2 is None else IgorTrace(
+            g0=t.g0_2, voltage_v=t.voltage_v, current_a=t.current2_a,
+            extension_nm=None, piezo_wave_v=None,
+            params=t.params2 if t.params2 is not None else t.params)
+        for t in traces]
+    if any(t is not None for t in second):
+        flags2 = SaveFlags(bias=False, current=flags.current, sense=False,
+                           hist=flags.hist, piezo_wave=False,
+                           last_trace_files=False)
+        written += write_block_files(
+            folder / CH2_FOLDER, k, second, cfg, flags2,
+            note=(note + "; " if note else "") + "current channel 2")
     return [p for p in written if p is not None]
 
 
-def block_histogram(g0_columns, cfg: RigConfig, n_divide: int) -> np.ndarray:
+def block_histogram(g0_columns, cfg: RigConfig, n_divide: int,
+                    gate_columns=None) -> np.ndarray:
     """Igor's ``LogHistWave`` for one block: the 1000-point histogram of
     log10(G/G0) with Igor's bins (bin i starts at -8 + i*10/999), summed
     over the given conductance columns and divided by ``n_divide`` (100 for
@@ -407,13 +486,23 @@ def block_histogram(g0_columns, cfg: RigConfig, n_divide: int) -> np.ndarray:
     only matters below 418 points), and plot.py takes the same path for
     Igor-block data, so the two agree bin for bin. (Constant-bias pulls
     only: the hold/push deletions of Igor's ramp modes are not reproduced.)
+
+    ``gate_columns`` holds, per column, the trace that floor test is read
+    from when it is not the column itself (None: the column itself): for
+    channel 1 of a two-channel amplifier, the same trace's channel 2. The
+    floor that is subtracted stays the column's own
+    (``analysis.log_histogram(gate_by=...)``).
     """
     total = np.zeros(HIST_POINTS, dtype=float)
-    for g0 in g0_columns:
+    g0_columns = list(g0_columns)
+    gates = list(gate_columns) if gate_columns is not None \
+        else [None] * len(g0_columns)
+    for g0, gate in zip(g0_columns, gates):
         _, counts = analysis.log_histogram(
             [np.asarray(g0, dtype=float)], lo=HIST_X0, hi=HIST_X1, n_bins=HIST_POINTS,
             keep_fraction=0.95, smooth_width=11, zero_cutoff=cfg.ramp.break_g0,
-            subtract_floor=True, igor_bins=True, tail_rows=TAIL_ROWS)
+            subtract_floor=True, igor_bins=True, tail_rows=TAIL_ROWS,
+            gate_by=None if gate is None else [np.asarray(gate, dtype=float)])
         total += counts                    # one trace: counts/1 or all zeros
     return total / n_divide if n_divide else total
 
@@ -519,9 +608,32 @@ class IgorDayWriter:
         def column(arr, j):
             return np.full(n, np.nan) if arr is None else np.asarray(arr[:, j], dtype=float)
 
+        # Channel 2 of the same block, when the day folder has one: its
+        # columns go back into the traces they belong to, or the refilled
+        # block would lose them. A ch2 block that cannot be read, or that
+        # holds traces of another length, loses only itself.
+        b2 = None
+        try:
+            b2 = read_block_channel2(self.folder, k, companions=True)
+            if b2 is not None and b2.g0.shape[0] != n:
+                raise ValueError(f"{b2.g0.shape[0]} points a trace, the block has {n}")
+        except Exception as exc:                      # noqa: BLE001
+            log.warning("channel 2 of block %d cannot be reloaded (%s: %s); the "
+                        "refilled block keeps channel 1 only for the traces "
+                        "already in it", k, type(exc).__name__, exc)
+            b2 = None
+
         for j, c in enumerate(b.columns):
             if c >= filled:
                 continue
+            g0_2 = current2_a = params2 = None
+            if b2 is not None:
+                hit = np.flatnonzero(b2.columns == c)
+                if hit.size:
+                    j2 = int(hit[0])
+                    g0_2 = np.asarray(b2.g0[:, j2], dtype=float)
+                    current2_a = column(b2.current_a, j2)
+                    params2 = np.asarray(b2.params[j2], dtype=float)
             pending[c] = IgorTrace(
                 g0=np.asarray(b.g0[:, j], dtype=float),
                 voltage_v=column(b.voltage_v, j),
@@ -529,7 +641,8 @@ class IgorDayWriter:
                 extension_nm=None if b.extension_nm is None
                 else np.asarray(b.extension_nm[:, j], dtype=float),
                 piezo_wave_v=piezo_wave,
-                params=np.asarray(b.params[j], dtype=float))
+                params=np.asarray(b.params[j], dtype=float),
+                g0_2=g0_2, current2_a=current2_a, params2=params2)
         return pending
 
     # -- state ---------------------------------------------------------------
@@ -834,6 +947,26 @@ def read_block(folder: str | Path, k: int, companions: bool = True) -> IgorBlock
                 log.warning("%s cannot be read (%s: %s); skipped",
                             hist_path.name, type(exc).__name__, exc)
     return block
+
+
+def channel2_folder(folder: str | Path) -> Path:
+    """Where channel 2 of a two-channel amplifier is filed for a day
+    folder: its ``ch2`` subfolder (whether or not it exists)."""
+    return Path(folder) / CH2_FOLDER
+
+
+def read_block_channel2(folder: str | Path, k: int,
+                        companions: bool = False) -> IgorBlock | None:
+    """Block ``k`` of channel 2 of a day folder -- ``folder/ch2`` -- or
+    None when the day folder has no channel 2 for that block (a day, or a
+    block, taken with one current channel). Its ``columns`` and ``numbers``
+    are the ones the traces have in ``folder``; its ``current_a`` is
+    channel 2's current when the Current block was saved. Needs ``igor2``.
+    """
+    sub = channel2_folder(folder)
+    if not block_file(sub, "conductance", k).exists():
+        return None
+    return read_block(sub, k, companions=companions)
 
 
 def read_day_folder(folder: str | Path, blocks=None, traces=None,

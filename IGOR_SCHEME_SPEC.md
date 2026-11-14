@@ -64,7 +64,7 @@ ParameterWave (float32; unused slots are **0**, not NaN; values seen in the July
 | 5 | `StartX - StopX`: sense readback (nm) at the start minus at the end of the record [1015 / 4.5] | from `piezo_sense_v` when the rig has a sense line: `mean(sense_nm[0:1000]) - mean(sense_nm[-1000:])` (Igor averaged 1000 points at each end); else `pull_length_nm` |
 | 6, 7 | thermocouple averages (top-level variant), 0 in setup-1 | 0 |
 | 8 | 0 | 0 |
-| 9 | `CurrentVoltConversion` uA per V = `10^(6 - gain)` [1] | `10 ** (6 - cfg.keithley.gain_exponent)` |
+| 9 | `CurrentVoltConversion` uA per V = `10^(6 - gain)` [1] | `1e6 / cfg.cal.preamp_gain_v_per_a` (v66: the gain the conductance is computed with; equal to `10 ** (6 - cfg.keithley.gain_exponent)` whenever the two agree, which the window keeps them doing) |
 | 10 | `TipBias` mV [600] | `cfg.ramp.bias_v * 1e3` |
 | 11 | 0 | 0 |
 | 12 | `SeriesResistance` ohm [1e5] | `cfg.keithley.series_resistance_ohm` |
@@ -242,6 +242,23 @@ reused as is. `storage.save_igor_block` stays for the old tests but is marked le
   passing; add a headless-simulate run that writes a day folder and checks the files and the resume.
 - An Igor round trip on the Mac is run by the orchestrator afterwards (Igor's own `LoadCond` on a
   Python-written folder); not part of pytest.
+
+## 9a. Two current channels (pullout v66)
+
+A two-channel amplifier is saved without touching anything above. Channel 1 (the output that follows
+the junction through contact, `channels.ai_current`) is the day folder exactly as specified. Channel 2 (`channels.ai_current_2`)
+goes to `<day folder>/ch2/` under Igor's own names, same `k`, same columns, same trace numbers:
+`PullOutConductanceBlock_k` (N+22 rows; slot 9 = `1e6 / cal.preamp_gain_2_v_per_a`, slot 16 =
+channel 2's zero in uA, slot 4 = 0), `PullOutCurrentBlock_k` (flag Current) and
+`PullOutConductanceBlockHist_k` (flag Hist). No Voltage, Extension, PiezoBias or per-trace files
+there. Columns of traces without a channel 2 are NaN; `IgorDayWriter` reloads `ch2` with a partial
+block. API: `CH2_FOLDER`, `channel2_folder`, `read_block_channel2`, `IgorTrace.g0_2 / current2_a /
+params2`, `SaveFlags.last_trace_files`. Tests: `tests/test_two_channel.py`.
+
+Since v67 the floor gate of the Hist files (section on `LogHistFromBlocks`: a column whose floor is
+not below `ramp.break_g0` is left out) is read on channel 2's floor for a column that has a channel
+2, in the day folder's Hist and in `ch2`'s alike (`block_histogram(gate_columns=...)`); the floor
+that is subtracted stays the column's own. A one-channel column is gated by itself, as before.
 
 ## 10. Documentation
 

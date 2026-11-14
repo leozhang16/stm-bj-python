@@ -70,8 +70,30 @@ Knobs, all optional (the defaults are Igor's):
     2D   --xbins 200  --ybins 300  --xlim -0.5 2  --ylim -7 1  --align 0.5
          --cmap viridis  --vmax 50  --no-colorbar
     any  --save  --out <folder>  --dpi 110  --blocks 1-5,9  --traces 1-500
+         --channel both|1|2   (two-channel data only)
 
 The options may come before or after the inputs and the 1D/2D/-N word.
+
+Two current channels. Data taken with a two-channel amplifier holds every
+trace twice: a .h5 session has channel 2's raw volts beside channel 1's,
+and a day folder has channel 2 in its ``ch2`` subfolder (same blocks,
+same trace numbers). Such data is recognised by itself:
+
+    python plot.py <session>.h5 1D          both channels on one plot, ch 1
+                                            blue and ch 2 red, each its own
+                                            histogram -- two noise floors
+    python plot.py data/11_14_26Merge 1D    the same from a day folder
+    python plot.py <session>.h5 -3          trace 3, both channels
+    python plot.py <session>.h5 1D --channel 1     only channel 1 (or 2)
+    python plot.py <session>.h5 2D --channel 2     the 2D histogram of
+                                            channel 2, each trace's 0 nm
+                                            taken from channel 1 (default:
+                                            channel 1's 2D histogram)
+    python plot.py data/11_14_26Merge/ch2 1D       the ch2 subfolder alone,
+                                            read as the day folder it is
+
+Nothing is stitched: each channel is drawn as it was measured, with its
+own gain, and channel 2 is shown railed where it was railed.
 
 The window (pullout.py) draws its histogram windows with the functions in
 this file, so a picture is the same from the command line and from the
@@ -147,6 +169,12 @@ class Data:
     column has beyond the trace (``igor_scheme.TAIL_ROWS`` = 22 for traces
     read from Igor's blocks, 0 for a .h5 or .txt), which the 1D histogram's
     95 % cut counts as Igor's did.
+
+    ``traces2`` is the same traces as channel 2 of a two-channel current
+    amplifier read them: empty for one-channel data, else one entry per
+    trace, in step with ``traces`` (None where a trace has no channel 2,
+    as in a day folder taken partly with one channel). ``traces`` is then
+    channel 1.
     """
     traces: list                   # conductance (G/G0) along each pull
     disp_nm: np.ndarray            # displacement along a pull, in nm (the first trace's)
@@ -159,16 +187,32 @@ class Data:
     hist_waves: list = field(default_factory=list)
     report: dict = field(default_factory=dict)
     tail_rows: int = 0             # 22 for Igor block columns (the 95 % cut counts them)
+    traces2: list = field(default_factory=list)   # channel 2, in step with traces
 
     def __post_init__(self):
         if not self.disps:
             self.disps = [self.disp_nm] * len(self.traces)
         if not self.numbers:
             self.numbers = list(range(1, len(self.traces) + 1))
+        if self.traces2 and len(self.traces2) != len(self.traces):
+            raise ValueError(f"{self.name}: {len(self.traces2)} channel-2 traces "
+                             f"for {len(self.traces)} traces")
+        if self.traces2 and all(t is None for t in self.traces2):
+            self.traces2 = []
 
     @property
     def n(self) -> int:
         return len(self.traces)
+
+    @property
+    def two_channels(self) -> bool:
+        """Does this data hold the second current channel as well?"""
+        return bool(self.traces2)
+
+    @property
+    def n2(self) -> int:
+        """Traces that have a channel 2."""
+        return sum(t is not None for t in self.traces2)
 
 
 def from_session(session, name: str | None = None) -> Data:
@@ -179,8 +223,11 @@ def from_session(session, name: str | None = None) -> Data:
     fs = (float(session.scalar("sample_rate_hz")[0]) if len(session)
           else cfg.ramp.sample_rate_hz)
     disp = analysis.displacement_nm(n_samples, cfg.ramp, fs)
+    # A session recorded with a two-channel amplifier: channel 2 as well.
+    traces2 = (list(session.conductances(channel=2))
+               if getattr(session, "has_current2", False) else [])
     return Data(traces, disp, cfg, name or Path(session.path).stem,
-                paths=[Path(session.path)])
+                paths=[Path(session.path)], traces2=traces2)
 
 
 # -- Igor's files ----------------------------------------------------------
@@ -222,6 +269,8 @@ def cfg_from_igor_parameters(p: np.ndarray, n_points: int = 0) -> RigConfig:
         cfg.ramp.bias_v = float(p[10]) * 1e-3
     if p.size > 13 and np.isfinite(p[13]) and p[13] > 0:
         cfg.ramp.engage_g0 = float(p[13])
+    if p.size > 9 and np.isfinite(p[9]) and p[9] > 0:
+        cfg.cal.preamp_gain_v_per_a = 1e6 / float(p[9])   # slot 9: uA per V
     if n_points > 1:
         cfg.ramp.sample_rate_hz = (n_points * cfg.ramp.pull_rate_nm_per_s
                                    / cfg.ramp.pull_length_nm)
@@ -252,11 +301,17 @@ class _BlockTraces:
 
     def __init__(self):
         self.traces, self.disps, self.numbers = [], [], []
+        self.traces2 = []                  # channel 2, in step (None: none)
+        self.gain2 = None                  # channel 2's gain, from its slot 9
         self.cfg = None
 
-    def add(self, b: igor_scheme.IgorBlock, keep: np.ndarray | None = None) -> int:
+    def add(self, b: igor_scheme.IgorBlock, keep: np.ndarray | None = None,
+            b2: igor_scheme.IgorBlock | None = None) -> int:
         """The columns of ``b`` where ``keep`` (a boolean mask over its
-        filled columns; None: all) is True. Returns how many were added."""
+        filled columns; None: all) is True. Returns how many were added.
+        ``b2`` is the same block of channel 2 (the day folder's ``ch2``
+        subfolder), when there is one: each trace added takes its channel 2
+        from the column with the same day number."""
         g0, params, numbers = b.g0, b.params, b.numbers
         if keep is not None:
             keep = np.asarray(keep, dtype=bool)
@@ -269,6 +324,16 @@ class _BlockTraces:
         self.numbers.extend(int(x) for x in numbers)
         if self.cfg is None:
             self.cfg = cfg_from_igor_parameters(params[0], b.n_points)
+        if b2 is not None and b2.n_traces and b2.n_points == b.n_points:
+            second = np.asarray(b2.g0, dtype=np.float32, order="F")
+            where = {int(num): j for j, num in enumerate(b2.numbers)}
+            self.traces2.extend(second[:, where[int(x)]] if int(x) in where else None
+                                for x in numbers)
+            slot9 = float(b2.params[0][9]) if b2.params.size else float("nan")
+            if self.gain2 is None and np.isfinite(slot9) and slot9 > 0:
+                self.gain2 = 1e6 / slot9
+        else:
+            self.traces2.extend([None] * int(numbers.size))
         return int(numbers.size)
 
     def data(self, name: str, paths: list) -> Data:
@@ -276,16 +341,33 @@ class _BlockTraces:
         config of the first row, and the block column's 22 tail rows for
         the 1D histogram's 95 % cut."""
         disp = self.disps[0] if self.disps else np.zeros(0)
-        return Data(self.traces, disp, self.cfg or RigConfig(), name, paths=list(paths),
-                    disps=self.disps, numbers=self.numbers, tail_rows=igor_scheme.TAIL_ROWS)
+        cfg = self.cfg or RigConfig()
+        if self.gain2 is not None:
+            cfg.cal.preamp_gain_2_v_per_a = self.gain2
+        return Data(self.traces, disp, cfg, name, paths=list(paths),
+                    disps=self.disps, numbers=self.numbers, tail_rows=igor_scheme.TAIL_ROWS,
+                    traces2=self.traces2)
 
 
-def _data_from_blocks(blocks: list, name: str, paths: list) -> Data:
+def _channel2_block(folder, k: int) -> igor_scheme.IgorBlock | None:
+    """Block ``k`` of channel 2 of a day folder (its ``ch2`` subfolder), or
+    None when there is none. One that cannot be read is reported and left
+    out: channel 1 is still drawn."""
+    try:
+        return igor_scheme.read_block_channel2(folder, k, companions=False)
+    except Exception as exc:                              # noqa: BLE001
+        print(f"{Path(folder).name}/{igor_scheme.CH2_FOLDER}: block {k} of channel 2 "
+              f"cannot be read ({type(exc).__name__}: {exc}); drawing channel 1 only")
+        return None
+
+
+def _data_from_blocks(blocks: list, name: str, paths: list, blocks2=None) -> Data:
     """One Data from a list of ``igor_scheme.IgorBlock`` already in memory
-    (one block, in practice): see :class:`_BlockTraces`."""
+    (one block, in practice): see :class:`_BlockTraces`. ``blocks2`` are
+    the same blocks of channel 2, None where there is none."""
     acc = _BlockTraces()
-    for b in blocks:
-        acc.add(b)
+    for i, b in enumerate(blocks):
+        acc.add(b, b2=blocks2[i] if blocks2 else None)
     return acc.data(name, paths)
 
 
@@ -342,7 +424,10 @@ def from_igor(path) -> Data:
         numbers = (k - 1) * igor_scheme.BLOCK + idx + 1 if k else idx + 1
         block = igor_scheme.IgorBlock(k or 0, path.parent, g0_all[:, idx],
                                       params_all[idx], idx, numbers)
-        return _data_from_blocks([block], path.stem, [path])
+        # A block of a day folder taken with a two-channel amplifier:
+        # channel 2 of the same block, from the ch2 subfolder beside it.
+        b2 = _channel2_block(path.parent, k) if kind is not None and k else None
+        return _data_from_blocks([block], path.stem, [path], [b2])
 
     # No parameter tail: a bare trace, or a block cut by hand. Taken whole.
     traces = [np.asarray(col, dtype=np.float32) for col in data.T]
@@ -362,7 +447,9 @@ def from_folder(folder, blocks=None, traces=None) -> Data:
     Each block is read once and converted to single-precision traces
     before the next is read, so a whole day (300 blocks of 100 traces x
     10000 points, 1.2 GB as float32) is never held as float64 blocks. A
-    trace in several of the ranges is loaded once."""
+    trace in several of the ranges is loaded once. A day taken with a
+    two-channel amplifier has channel 2 in its ``ch2`` subfolder: it is
+    loaded alongside, trace for trace (``Data.traces2``)."""
     folder = Path(folder)
     ks = igor_scheme.list_blocks(folder)
     if not ks:
@@ -386,7 +473,9 @@ def from_folder(folder, blocks=None, traces=None) -> Data:
             keep = np.zeros(b.n_traces, dtype=bool)
             for a, z in ranges:
                 keep |= (b.numbers >= a) & (b.numbers <= z)
-        acc.add(b, keep)
+        # Channel 2 of the same block, when the day was taken with a
+        # two-channel amplifier (the ch2 subfolder).
+        acc.add(b, keep, _channel2_block(folder, k))
         del b
     name = folder.name
     if blocks is not None:
@@ -470,20 +559,48 @@ def load(paths, blocks=None, traces=None) -> Data:
     name = first.name if len(parts) == 1 else f"{len(parts)} files, {lead.name} ..."
     tails = {part.tail_rows for part in parts if part.n}
     tail_rows = tails.pop() if len(tails) == 1 else 0
+    # Channel 2, where any input has one: in step with the traces, None for
+    # the traces of an input that was taken with one channel.
+    traces2 = []
+    if any(part.two_channels for part in parts):
+        for part in parts:
+            traces2 += list(part.traces2) if part.two_channels else [None] * part.n
+        lead2 = next(part for part in parts if part.two_channels)
+        cfg.cal.preamp_gain_2_v_per_a = lead2.cfg.cal.preamp_gain_2_v_per_a
     return Data(traces_, disp, cfg, name, paths=paths, disps=disps,
-                numbers=numbers, hist_waves=waves, tail_rows=tail_rows)
+                numbers=numbers, hist_waves=waves, tail_rows=tail_rows,
+                traces2=traces2)
 
 
 # --------------------------------------------------------------------------
 # The two histograms, each drawn on an axes you hand over
 # --------------------------------------------------------------------------
 
+def _which_channels(data: Data, channel) -> tuple[bool, bool]:
+    """(draw channel 1, draw channel 2) for a ``channel`` of "both", 1 or
+    2. Data with one channel always draws that one."""
+    want = str(channel).strip().lower()
+    if not data.two_channels:
+        return True, False
+    return want in ("both", "1"), want in ("both", "2")
+
+
 def hist_1d(ax, data: Data, bins: int = 1000, smooth: int = 11,
-            xlim=(-7.0, 1.0), lw: float = 1.2, color: str = "k",
+            xlim=None, lw: float = 1.2, color: str = "k",
             logy: bool = False, fill: bool = False,
             title: str | None = None, igor_bins: bool = True,
-            floor_gate: bool = True) -> dict:
+            floor_gate: bool = True, channel="both") -> dict:
     """Igor's LogHistFromBlocks: counts per trace against log10(G/G0).
+
+    Data of a two-channel amplifier (``data.two_channels``) is drawn as
+    two histograms on the one axis, channel 1 in blue and channel 2 in
+    red, each made from its own channel's traces by the recipe below and
+    divided by its own trace count. Nothing is merged: the picture has two
+    noise floors, and channel 2's counts while it was railed are in it.
+    ``channel`` 1 or 2 draws one of them alone (``--channel``); ``color``
+    then colours it, as it colours channel 1 when it is not the default.
+    ``xlim`` None is -7 to 1, or -8 to 1 when channel 2 is drawn: its floor
+    lies lower, and the bins end at -8.
 
     The recipe is the block histogram's (``igor_scheme.block_histogram``,
     the ``PullOutConductanceBlockHist_k`` files), per trace: keep the first
@@ -499,7 +616,10 @@ def hist_1d(ax, data: Data, bins: int = 1000, smooth: int = 11,
     The threshold is ``data.cfg``'s: the session's own for a .h5, the
     config default for Igor data (Igor's panel value is not among the 20
     parameters). The sum over the traces is divided by the traces that
-    passed the gate; Igor divided a block's by 100, passed or not.
+    passed the gate; Igor divided a block's by 100, passed or not. For a
+    trace that has a channel 2 the gate is read on channel 2's floor, for
+    both curves (the trace is in both or in neither); the floor each curve
+    subtracts stays its own channel's.
 
     ``igor_bins`` (the default) bins as Igor's ``Histogram/A`` into a
     1000-point wave scaled -8 to 2 did: bin i starts at -8 + i*10/999.
@@ -519,24 +639,57 @@ def hist_1d(ax, data: Data, bins: int = 1000, smooth: int = 11,
     note = ""
     peak = float("nan")
     centres = counts = np.zeros(0)
-    if data.n:
-        if key not in data.cache:
-            data.cache[key] = analysis.log_histogram(data.traces, lo=-8.0, hi=2.0,
-                                                     n_bins=bins, smooth_width=smooth,
-                                                     zero_cutoff=cutoff,
-                                                     igor_bins=igor_bins,
-                                                     tail_rows=int(data.tail_rows))
-        centres, counts = data.cache[key]
+    counts2 = None
+    show1, show2 = _which_channels(data, channel)
+    name1, name2 = plots.channel_labels(data.cfg)
+
+    def histogram(traces, cache_key, gate_by=None):
+        if cache_key not in data.cache:
+            data.cache[cache_key] = analysis.log_histogram(
+                traces, lo=-8.0, hi=2.0, n_bins=bins, smooth_width=smooth,
+                zero_cutoff=cutoff, igor_bins=igor_bins,
+                tail_rows=int(data.tail_rows), gate_by=gate_by)
+        return data.cache[cache_key]
+
+    def curve(x, y, colour, label, alpha=1.0):
+        """One histogram line; a colour name matplotlib does not know is
+        drawn black and said so."""
         try:
-            ax.plot(centres, counts, color=color, lw=lw, label="recomputed" if data.hist_waves else None)
+            ax.plot(x, y, color=colour, lw=lw, label=label, alpha=alpha)
             if fill:
-                ax.fill_between(centres, 0, counts, color=color, alpha=0.25)
+                ax.fill_between(x, 0, y, color=colour, alpha=0.25)
+            return ""
         except ValueError:
-            ax.plot(centres, counts, color="k", lw=lw)
-            note = f"'{color}' is not a colour name; drew black. "
-        peak = analysis.peak_position(centres, counts, around=0.0, window=0.4)
-        note += (f"1 G0 peak at {peak:+.4f} decades; {bins} "
-                 f"{'Igor' if igor_bins else 'even'} bins, smooth {smooth} points, "
+            ax.plot(x, y, color="k", lw=lw, label=label)
+            return f"'{colour}' is not a colour name; drew black. "
+
+    if data.n:
+        if show1:
+            # A trace with a channel 2 is gated by channel 2's floor, so it
+            # is in both curves or in neither.
+            centres, counts = histogram(data.traces, key,
+                                        gate_by=data.traces2 or None)
+            colour1 = plots.C_CH1 if (show2 and color == "k") else color
+            note += curve(centres, counts, colour1,
+                          name1 if data.two_channels
+                          else ("recomputed" if data.hist_waves else None))
+            peak = analysis.peak_position(centres, counts, around=0.0, window=0.4)
+            note += f"1 G0 peak at {peak:+.4f} decades; "
+        if show2:
+            centres2, counts2 = histogram(data.traces2, key + ("ch2",))
+            colour2 = plots.C_CH2 if (show1 or color == "k") else color
+            # over channel 1 and slightly see-through, so the blue shows
+            # where the two histograms lie on top of each other
+            note += curve(centres2, counts2, colour2, name2,
+                          alpha=plots.A_CH2 if show1 else 1.0)
+            if not show1:
+                centres, counts = centres2, counts2
+            note += (f"two channels, nothing stitched: {name1} blue, {name2} red, "
+                     f"{data.n2} of {data.n} traces have channel 2; " if show1
+                     else f"channel 2 alone ({name2}), {data.n2} traces; ")
+        elif data.two_channels:
+            note += f"channel 1 alone ({name1}); "
+        note += (f"{bins} {'Igor' if igor_bins else 'even'} bins, smooth {smooth} points, "
                  + (f"floor gate {cutoff:g} G0" if cutoff is not None else "no floor gate"))
     else:
         note += "no traces"
@@ -562,7 +715,7 @@ def hist_1d(ax, data: Data, bins: int = 1000, smooth: int = 11,
         if any(w.per_trace for w in data.hist_waves):
             note += (", and is per column of its block where the recomputed one is "
                      "per trace that passed the floor gate")
-    if data.hist_waves:
+    if data.hist_waves or (data.two_channels and data.n):
         handles, labels = ax.get_legend_handles_labels()
         if ax_sum is not None:
             h2, l2 = ax_sum.get_legend_handles_labels()
@@ -571,18 +724,24 @@ def hist_1d(ax, data: Data, bins: int = 1000, smooth: int = 11,
 
     if logy:
         ax.set_yscale("log")
+    if xlim is None:
+        xlim = (-8.0, 1.0) if (show2 and data.n) else (-7.0, 1.0)
     ax.set_xlim(*xlim)
     ax.set_xlabel("log10 (G / G0)")
     ax.set_ylabel("counts per trace")
     if title is None:
         title = (f"{data.name}: {data.n} traces" if data.n
                  else f"{data.name}: saved histogram")
+        if data.two_channels and data.n:
+            title += (", two channels" if show1 and show2
+                      else ", channel 2" if show2 else ", channel 1")
     ax.set_title(title, fontsize=10)
     for g in GOLD_LINES:
         ax.axvline(g, color="#999", lw=0.5, ls=":")
     ax.grid(True, alpha=0.3)
     info = {"peak": peak, "note": note, "centres": centres, "counts": counts,
-            "wave_peaks": wave_peaks}
+            "wave_peaks": wave_peaks,
+            "counts2": counts2 if (show1 and show2) else None}
     data.report["1d"] = info
     return info
 
@@ -590,10 +749,17 @@ def hist_1d(ax, data: Data, bins: int = 1000, smooth: int = 11,
 def hist_2d(ax, data: Data, xbins: int = 200, ybins: int = 300,
             xlim=(-0.5, 2.0), ylim=(-7.0, 1.0), align: float | None = 0.5,
             cmap: str = "viridis", vmax: float | None = None,
-            colorbar: bool = True, title: str | None = None) -> dict:
+            colorbar: bool = True, title: str | None = None,
+            channel="both") -> dict:
     """The 2D histogram: log10(G/G0) against displacement, counts per trace,
     every trace's 0 nm put where its conductance first drops below
     ``align`` G0 (None: where the pull started).
+
+    One channel at a time: a colour map cannot carry two. For data of a
+    two-channel amplifier it is channel 1's unless ``channel`` is 2; then
+    it is channel 2's conductance, with each trace's 0 nm still taken from
+    channel 1 -- channel 2 is railed while the gold contact breaks and
+    cannot say where that was.
 
     Returns {"max": the largest bin, "note": a line for a status bar,
     "counts", "x_edges", "y_edges"}.
@@ -602,13 +768,25 @@ def hist_2d(ax, data: Data, xbins: int = 200, ybins: int = 300,
         raise ValueError(f"{data.name}: no traces for a 2D histogram "
                          "(a saved histogram wave holds none)")
     xbins, ybins = max(10, int(xbins)), max(10, int(ybins))
+    second = data.two_channels and str(channel).strip() == "2"
     key = ("2d", xbins, ybins, tuple(xlim), tuple(ylim), align)
+    if second:
+        key += ("ch2",)
     if key not in data.cache:
-        data.cache[key] = analysis.histogram_2d(
-            data.traces, data.disps, align_at_g0=align, x_range=tuple(xlim),
-            n_x=xbins, y_range=tuple(ylim), n_y=ybins)
+        if second:
+            data.cache[key] = analysis.histogram_2d(
+                data.traces2, data.disps, align_at_g0=align, x_range=tuple(xlim),
+                n_x=xbins, y_range=tuple(ylim), n_y=ybins, align_by=data.traces)
+        else:
+            data.cache[key] = analysis.histogram_2d(
+                data.traces, data.disps, align_at_g0=align, x_range=tuple(xlim),
+                n_x=xbins, y_range=tuple(ylim), n_y=ybins)
     counts, xe, ye = data.cache[key]
     note = ""
+    if data.two_channels:
+        name1, name2 = plots.channel_labels(data.cfg)
+        note = (f"{name2}, each trace's 0 nm from channel 1. " if second
+                else f"{name1}; channel 2 has its own 2D histogram. ")
     try:
         im = ax.pcolormesh(xe, ye, counts.T, cmap=cmap, vmin=0, vmax=vmax,
                            shading="flat")
@@ -621,7 +799,11 @@ def hist_2d(ax, data: Data, xbins: int = 200, ybins: int = 300,
     ax.set_xlabel("displacement (nm)"
                   + ("" if align is None else f", 0 where G first < {align:g} G0"))
     ax.set_ylabel("log10 (G / G0)")
-    ax.set_title(title or f"{data.name}: {data.n} traces", fontsize=10)
+    if title is None:
+        title = f"{data.name}: {data.n} traces"
+        if data.two_channels:
+            title += ", channel 2" if second else ", channel 1"
+    ax.set_title(title, fontsize=10)
     top = float(counts.max()) if counts.size else 0.0
     note += (f"{xbins} x {ybins} bins; colour max {top:.3g} counts per trace"
              + (f" (shown up to {vmax:g})" if vmax else ""))
@@ -728,7 +910,21 @@ def igor_trace_figure(path, number: int, fig=None):
     g0 = np.asarray(b.g0[:, j], dtype=float)
     disp = _igor_axes(b.params[j:j + 1], b.n_points)[0]
     cfg = cfg_from_igor_parameters(b.params[j], b.n_points)
-    verdict = analysis.select_trace(g0, cfg.ramp)
+    # The same trace as channel 2 of a two-channel amplifier read it, when
+    # the day folder has a ch2 subfolder holding this block.
+    b2 = _channel2_block(folder, k)
+    g0_2 = None
+    if b2 is not None and b2.n_points == b.n_points:
+        hit = np.flatnonzero(b2.numbers == number)
+        if hit.size:
+            g0_2 = np.asarray(b2.g0[:, int(hit[0])], dtype=float)
+            slot9 = float(b2.params[int(hit[0])][9])
+            if np.isfinite(slot9) and slot9 > 0:
+                cfg.cal.preamp_gain_2_v_per_a = 1e6 / slot9
+    # The end of the trace is judged on channel 2 when there is one, as
+    # the pull judged it.
+    verdict = analysis.select_trace(g0, cfg.ramp,
+                                    g0_open=analysis.open_side(g0, g0_2))
 
     panels = []
     if b.voltage_v is not None:
@@ -746,7 +942,8 @@ def igor_trace_figure(path, number: int, fig=None):
                           height_ratios=[2.2] + [1] * len(panels))
     ax0 = fig.add_subplot(gs[0, 0])
     plots.plot_trace(ax0, cfg, g0, disp, verdict,
-                     title=f"{folder.name}: trace {number} (block {k}, column {j + 1})")
+                     title=f"{folder.name}: trace {number} (block {k}, column {j + 1})",
+                     g0_2=g0_2)
     prev = ax0
     for r, (label, values, colour) in enumerate(panels, start=1):
         ax = fig.add_subplot(gs[r, 0], sharex=ax0)
@@ -759,7 +956,7 @@ def igor_trace_figure(path, number: int, fig=None):
         prev = ax
     prev.set_xlabel("displacement (nm)", fontsize=8)
 
-    block_data = _data_from_blocks([b], f"{folder.name} block {k}", [conductance])
+    block_data = _data_from_blocks([b], f"{folder.name} block {k}", [conductance], [b2])
     hist_path = igor_scheme.block_file(folder, "hist", k)
     if b.hist is not None and hist_path.exists():
         x = igor_scheme.HIST_X0 + np.arange(b.hist.size) * igor_scheme.HIST_DX
@@ -875,6 +1072,10 @@ def parse(argv) -> argparse.Namespace:
     p.add_argument("--xlim", type=float, nargs=2, default=None, metavar=("LO", "HI"),
                    help="x range: log G for 1D (default -7 1), nm for 2D "
                         "(default -0.5 2)")
+    p.add_argument("--channel", choices=("both", "1", "2"), default="both",
+                   help="data of a two-channel amplifier: which channel. 1D: "
+                        "both on one plot (default), or one alone. 2D: channel "
+                        "1 (default) or 2, channel 2 aligned by channel 1")
     p.add_argument("--save", action="store_true", help="write a PNG, no window")
     p.add_argument("--out", type=Path, default=None,
                    help="folder for the PNG (default: beside the file, or inside "
@@ -957,9 +1158,14 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, FileNotFoundError) as exc:
             return _fail(exc)
         print(f"{data.name}: {data.n} traces"
+              + (f", two current channels ({data.n2} traces have channel 2)"
+                 if data.two_channels else "")
               + (f", {len(data.hist_waves)} saved histogram wave(s)" if data.hist_waves else ""))
+        if args.channel == "2" and not data.two_channels:
+            print("--channel 2: this data has one current channel; drawing it")
         knobs = dict(bins=args.bins, smooth=args.smooth, logy=args.logy,
                      fill=args.fill, color=args.color, lw=args.lw,
+                     channel=args.channel,
                      igor_bins=not args.even_bins, floor_gate=not args.no_floor_gate,
                      xbins=args.xbins, ybins=args.ybins, ylim=tuple(args.ylim),
                      align=None if args.align < 0 else args.align,

@@ -45,7 +45,7 @@ exists only in this folder and is not in that PDF.
 
 | Chapter | Covers |
 |---|---|
-| [18. The data: Igor's saving scheme](18_igor_data_scheme.md) | What `pullout.py` (v65) writes and `plot.py` reads: the `MM_DD_YYMerge` day folder, blocks of 100, every `PullOut*` file with its units and shape, the 20 parameter slots, the numbering and the resume, plotting the old Igor data (`--blocks`, `--traces`, `-N`, a `Loghist` file), the three differences from Igor |
+| [18. The data: Igor's saving scheme](18_igor_data_scheme.md) | What `pullout.py` (v65 on) writes and `plot.py` reads: the `MM_DD_YYMerge` day folder, blocks of 100, every `PullOut*` file with its units and shape, the 20 parameter slots, the numbering and the resume, plotting the old Igor data (`--blocks`, `--traces`, `-N`, a `Loghist` file), the three differences from Igor |
 
 ## Support systems
 
@@ -53,6 +53,7 @@ exists only in this folder and is not in that PDF.
 |---|---|
 | [20. Keithley 428](20_keithley.md) | Gain, suppress, zero check, Keithley-sourced bias |
 | [21. Vzero](21_vzero.md) | The zero-current offset workflow |
+| [22. A two-channel current amplifier](22_two_channel_amplifier.md) | An amplifier with two outputs (pullout v66 to v68): which output is which and what is judged on each, the config, the Current amplifier box, what is drawn and what is saved, the simulated card's noise, bringing it up on the bench |
 | [30. Quick reference](30_quick_reference.md) | Every command, every number, where to look |
 
 ## The GUI (this folder only)

@@ -47,6 +47,8 @@ class SessionWriter:
         self._n_samples: int | None = None
         self._with_sense = False
         self._warned_sense = False
+        self._with_current2 = False
+        self._warned_current2 = False
 
     # -- lifecycle --------------------------------------------------------
 
@@ -65,6 +67,9 @@ class SessionWriter:
             "voltage_v and current_v are raw volts at the ADC. "
             "piezo_sense_v, when present, is the piezo sense readback in raw "
             "volts (nm = volts * cal.sense_nm_per_volt). "
+            "current2_v, when present, is channel 2 of a two-channel current "
+            "amplifier in raw volts (gain cal.preamp_gain_2_v_per_a, zero "
+            "cal.current_zero_2_v); current_v is then channel 1. "
             "Conductance is derived, not stored.")
         log.info("writing to %s", self.path)
         return self
@@ -87,16 +92,23 @@ class SessionWriter:
 
     # -- writing ----------------------------------------------------------
 
-    def _create(self, n_samples: int, with_sense: bool) -> None:
+    def _create(self, n_samples: int, with_sense: bool,
+                with_current2: bool = False) -> None:
         h5 = self._h5
         self._n_samples = n_samples
         self._with_sense = with_sense
+        self._with_current2 = with_current2
         chunks = (self.chunk_traces, n_samples)
         names = ["voltage_v", "current_v"]
         if with_sense:
             # Piezo sense readback, raw volts from the low-res card. Only
             # present in files from a two-card rig; readers must not assume it.
             names.append("piezo_sense_v")
+        if with_current2:
+            # Channel 2 of a two-channel current amplifier, raw volts. Only
+            # in files recorded with both outputs read; readers must not
+            # assume it either.
+            names.append("current2_v")
         for name in names:
             h5.create_dataset(
                 name, shape=(0, n_samples), maxshape=(None, n_samples),
@@ -120,8 +132,10 @@ class SessionWriter:
 
         n_samples = trace.voltage_v.size
         sense = getattr(trace, "piezo_sense_v", None)
+        second = getattr(trace, "current2_v", None)
         if self._n_samples is None:
-            self._create(n_samples, with_sense=sense is not None)
+            self._create(n_samples, with_sense=sense is not None,
+                         with_current2=second is not None)
         elif n_samples != self._n_samples:
             raise ValueError(
                 f"trace has {n_samples} samples but this file holds "
@@ -141,6 +155,17 @@ class SessionWriter:
                         "file has no piezo_sense_v dataset; later readbacks "
                         "are not stored")
             self._warned_sense = True
+        if self._with_current2:
+            if second is None:
+                # Channel 2 went missing mid-session: keep the file
+                # rectangular and make the gap visible.
+                second = np.full(n_samples, np.nan)
+            rows.append(("current2_v", second))
+        elif second is not None and not self._warned_current2:
+            log.warning("first trace had no second current channel, so this "
+                        "file has no current2_v dataset; channel 2 of the "
+                        "later traces is not stored here")
+            self._warned_current2 = True
         for name, value in rows:
             ds = h5[name]
             ds.resize(i + 1, axis=0)
@@ -229,25 +254,65 @@ class Session:
         v = self._h5["piezo_sense_v"][i]
         return self.cfg.cal.sense_volts_to_nm(v) if in_nm else v
 
+    @property
+    def has_current2(self) -> bool:
+        """Was this session recorded with both outputs of a two-channel
+        current amplifier?"""
+        return "current2_v" in self._h5
+
+    def raw2(self, i: int) -> np.ndarray | None:
+        """Channel 2 of trace ``i``, raw volts, or None for a file recorded
+        with one current channel."""
+        if not self.has_current2:
+            return None
+        return self._h5["current2_v"][i]
+
     def conductance(self, i: int, cal=None,
-                    use_measured_voltage: bool = True) -> np.ndarray:
+                    use_measured_voltage: bool = True,
+                    channel: int = 1) -> np.ndarray:
         """Conductance in G0, using a calibration you may override.
 
         Passing a corrected ``cal`` is the whole reason raw volts are stored:
         a preamp gain re-measured next month reprocesses this file rather than
-        invalidating it.
+        invalidating it. ``channel=2`` is the amplifier's second output, with
+        its own gain and zero (ValueError for a one-channel file).
         """
         from . import analysis
         cal = cal or self.cfg.cal
         voltage, current = self.raw(i)
+        if channel == 2:
+            current = self.raw2(i)
+            if current is None:
+                raise ValueError(f"{self.path.name} has no second current channel")
         if use_measured_voltage:
-            return analysis.to_conductance(current, cal, voltage_v=voltage)
+            return analysis.to_conductance(current, cal, voltage_v=voltage,
+                                           channel=channel)
         return analysis.to_conductance(current, cal,
-                                       bias_v=float(self._h5["bias_v"][i]))
+                                       bias_v=float(self._h5["bias_v"][i]),
+                                       channel=channel)
 
-    def conductances(self, cal=None, use_measured_voltage: bool = True):
+    def conductances(self, cal=None, use_measured_voltage: bool = True,
+                     channel: int = 1):
         for i in range(len(self)):
-            yield self.conductance(i, cal, use_measured_voltage)
+            yield self.conductance(i, cal, use_measured_voltage, channel)
+
+    def open_side(self, i: int, cal=None,
+                  use_measured_voltage: bool = True) -> np.ndarray:
+        """The conductance the open side of trace ``i`` is judged on
+        (``analysis.open_side``): channel 2 wherever its raw volts are
+        below ``limits.preamp_saturation_v`` and channel 1 elsewhere; the
+        trace's own conductance in a one-channel file. It is what the
+        pull's verdict read at the end of the trace, so
+        ``analysis.select_trace(g0, ramp, g0_open=...)`` repeats it."""
+        from . import analysis
+        g0 = self.conductance(i, cal, use_measured_voltage)
+        second = self.raw2(i)
+        if second is None:
+            return g0
+        g0_2 = self.conductance(i, cal, use_measured_voltage, channel=2)
+        railed = np.abs(np.asarray(second, dtype=float)) \
+            >= self.cfg.limits.preamp_saturation_v
+        return analysis.open_side(g0, g0_2, railed)
 
     def scalar(self, name: str) -> np.ndarray:
         return self._h5[name][:]
@@ -558,7 +623,7 @@ def save_igor_block(path: str | Path, cfg: RigConfig, traces_g0,
 
 def save_txt_block(path: str | Path, cfg: RigConfig, traces_g0,
                    start_piezo_v=None, timestamps=None,
-                   header_lines=()) -> tuple[Path, Path]:
+                   header_lines=(), channel: int = 1) -> tuple[Path, Path]:
     """Write conductance traces as a plain-text table for Python or MATLAB.
 
     First column the displacement in nm, then one column per trace in
@@ -568,6 +633,10 @@ def save_txt_block(path: str | Path, cfg: RigConfig, traces_g0,
     voltage at contact, the timestamp. Reads back with ``numpy.loadtxt``
     (comments are skipped by default) or MATLAB's
     ``readmatrix(file, 'CommentStyle', '#')``.
+
+    ``channel`` says which output of the current amplifier the traces come
+    from, for the gain in the header: 1, or 2 for the table of the second
+    output of a two-channel amplifier.
 
     Returns (data path, info path).
     """
@@ -590,8 +659,9 @@ def save_txt_block(path: str | Path, cfg: RigConfig, traces_g0,
         f"bias_v={R.bias_v:g} pull_rate_nm_per_s={R.pull_rate_nm_per_s:g} "
         f"pull_length_nm={R.pull_length_nm:g} sample_rate_hz={fs:g} "
         f"piezo_nm_per_volt={C.piezo_nm_per_volt:g} "
-        f"preamp_gain_v_per_a={C.preamp_gain_v_per_a:g} "
-        f"series_resistance_ohm={K.series_resistance_ohm:g}",
+        f"preamp_gain_v_per_a={C.gain_of(channel):g} "
+        f"series_resistance_ohm={K.series_resistance_ohm:g}"
+        + (" current_channel=2" if channel == 2 else ""),
         "columns: displacement_nm, then trace_1 ... trace_N in G/G0 "
         "(0 nm = where the pull began, at contact)",
         "read: numpy.loadtxt(file) | MATLAB readmatrix(file, 'CommentStyle', '#')",

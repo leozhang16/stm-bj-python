@@ -42,7 +42,12 @@ def _check_stop(rig, stop_flag, what: str) -> None:
 
 
 def separate(rig, stop_flag=None) -> None:
-    """Retract until the junction is open. Igor's first loop."""
+    """Retract until the junction is open. Igor's first loop.
+
+    Open is ``Rig.is_open``: not railed and below ``ramp.break_g0``, read
+    on channel 1, or on channel 2 when both outputs of a two-channel
+    amplifier are read (``Rig.open_side_of``).
+    """
     cfg: RigConfig = rig.cfg
     R, L = cfg.ramp, cfg.limits
 
@@ -57,8 +62,7 @@ def separate(rig, stop_flag=None) -> None:
                 f"floor and the junction is still closed. Back the coarse "
                 f"actuator off.")
         rig.piezo_step_nm(-R.retract_step_nm)
-        g0, railed = rig.probe()
-        if not railed and g0 < R.break_g0:
+        if rig.is_open():
             return
 
 

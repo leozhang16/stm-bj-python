@@ -802,7 +802,12 @@ class RigController:
                 bias_mv = cfg.cal.voltage_input_sign * record.voltage_v * 1e3
 
                 if mode == "constant":
-                    verdict = analysis.select_trace(g0, cfg.ramp)
+                    # The end of the trace on the open side: channel 2 of
+                    # a two-channel amplifier, the trace itself otherwise.
+                    verdict = analysis.select_trace(
+                        g0, cfg.ramp,
+                        g0_open=(record.open_side_g0(cfg)
+                                 if record.current2_v is not None else None))
                     ok = verdict.accepted
                 else:
                     verdict = None

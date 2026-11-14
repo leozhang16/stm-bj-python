@@ -60,14 +60,45 @@ class TraceRecord:
     # card; None on a one-card rig. Igor's POExtension. Informational: the
     # displacement axis is still the commanded one (``displacement_nm``).
     piezo_sense_v: np.ndarray | None = None
+    # Channel 2 of a two-channel current amplifier over the same samples,
+    # raw volts; None when it was not read. ``current_v`` is channel 1.
+    current2_v: np.ndarray | None = None
 
     def conductance_g0(self, cfg: RigConfig,
-                       use_measured_voltage: bool = True) -> np.ndarray:
+                       use_measured_voltage: bool = True,
+                       channel: int = 1) -> np.ndarray:
+        """The conductance along the pull, in G0, from current channel 1
+        or, with ``channel=2``, from the amplifier's second output
+        (ValueError when this trace has none). Each channel with its own
+        gain and zero; nothing is merged."""
+        if channel == 2:
+            if self.current2_v is None:
+                raise ValueError("this trace has no second current channel")
+            current_v = self.current2_v
+        else:
+            current_v = self.current_v
         if use_measured_voltage:
-            return analysis.to_conductance(self.current_v, cfg.cal,
-                                           voltage_v=self.voltage_v)
-        return analysis.to_conductance(self.current_v, cfg.cal,
-                                       bias_v=self.bias_v)
+            return analysis.to_conductance(current_v, cfg.cal,
+                                           voltage_v=self.voltage_v,
+                                           channel=channel)
+        return analysis.to_conductance(current_v, cfg.cal,
+                                       bias_v=self.bias_v, channel=channel)
+
+    def open_side_g0(self, cfg: RigConfig,
+                     use_measured_voltage: bool = True) -> np.ndarray:
+        """The conductance the open side of this pull is judged on
+        (``analysis.open_side``): channel 1's on a one-channel trace; with
+        channel 2 recorded, channel 2's wherever its output is below
+        ``limits.preamp_saturation_v`` and channel 1's wherever it is at
+        its rail. For ``analysis.select_trace(..., g0_open=...)``. What is
+        saved and drawn stays ``conductance_g0`` of each channel."""
+        g0 = self.conductance_g0(cfg, use_measured_voltage)
+        if self.current2_v is None:
+            return g0
+        g0_2 = self.conductance_g0(cfg, use_measured_voltage, channel=2)
+        railed = np.abs(np.asarray(self.current2_v, dtype=float)) \
+            >= cfg.limits.preamp_saturation_v
+        return analysis.open_side(g0, g0_2, railed)
 
     def displacement_nm(self, cfg: RigConfig) -> np.ndarray:
         return analysis.displacement_nm(self.voltage_v.size, cfg.ramp,
@@ -216,6 +247,17 @@ def capture(rig, ramp, index: int = 0,
             log.warning("piezo sense readback has %d samples, record needs "
                         "%d; dropping it for this trace", sense.size, stop)
 
+    # Channel 2 of a two-channel amplifier, when it is read: the same task,
+    # the same clock, the same cut.
+    second = getattr(rig, "last_current2_v", None)
+    second_cut = None
+    if second is not None:
+        if second.size >= stop:
+            second_cut = np.asarray(second[start:stop], dtype=float).copy()
+        else:
+            log.warning("current channel 2 has %d samples, record needs %d; "
+                        "dropping it for this trace", second.size, stop)
+
     M = cfg.channels
     return TraceRecord(
         index=index,
@@ -226,7 +268,8 @@ def capture(rig, ramp, index: int = 0,
         bias_v=cfg.ramp.bias_v if bias_v is None else bias_v,
         sample_rate_hz=rig.sample_rate_hz,
         attempt=rig.attempts,
-        piezo_sense_v=sense_cut)
+        piezo_sense_v=sense_cut,
+        current2_v=second_cut)
 
 
 def _measure_delay(cfg: RigConfig, record: np.ndarray, ramp: Ramp,
@@ -304,9 +347,13 @@ def trace_loop(rig, n: int | None = None, on_trace=None, stop_flag=None,
             rejections["alignment"] = rejections.get("alignment", 0) + 1
             continue
 
+        # The end of the trace is judged on the open side: channel 2 of a
+        # two-channel amplifier, the trace itself otherwise.
         verdict = analysis.select_trace(
             trace.conductance_g0(cfg), cfg.ramp,
-            require_engaged=require_engaged)
+            require_engaged=require_engaged,
+            g0_open=(trace.open_side_g0(cfg)
+                     if trace.current2_v is not None else None))
 
         if not verdict.accepted:
             key = verdict.reason.split(":")[0].split("(")[0].strip()

@@ -118,6 +118,15 @@ def step_devices(cfg: RigConfig) -> int:
     except Exception as exc:                                  # noqa: BLE001
         r.add(CHECK, "input wiring mode", f"could not ask the card: {exc}")
 
+    # The second output of a two-channel current amplifier, when the config
+    # names one: its input must exist on this card, read or not.
+    if cfg.channels.ai_current_2:
+        second = cfg.channels.path(cfg.channels.ai_current_2)
+        reading = ("read" if cfg.channels.two_current_channels
+                   else "named, not read: current_channels is 1")
+        r.add(PASS if second in ai_names else FAIL,
+              f"preamp output, channel 2 ({reading})", second)
+
     # The piezo sense line on the record's own card, when configured so.
     if cfg.channels.sense_in_record:
         sense_path = cfg.channels.piezo_sense_path

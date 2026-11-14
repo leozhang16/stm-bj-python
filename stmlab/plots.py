@@ -14,6 +14,11 @@ Igor's windows, for orientation: ``HighRes`` is :func:`plot_record`,
 of the same pull drawn over it in grey when the rig has one),
 ``AuAuConductanceLevel`` is :func:`plot_gold_level`, ``SenseInDisplay`` is
 :func:`plot_piezo`, ``LogHistOfBlock`` is :func:`plot_histogram`.
+
+With a two-channel current amplifier, :func:`plot_trace` and
+:func:`plot_histogram` take the second channel as well and draw the two
+on the same axes, channel 1 in blue and channel 2 in red, each exactly as
+it was measured: nothing is stitched, cut or scaled to make them meet.
 """
 
 from __future__ import annotations
@@ -31,6 +36,20 @@ C_CMD, C_SENSE = "#1f77b4", "#d62728"       # piezo command, piezo readback
 C_V, C_I = "#ff7f0e", "#2ca02c"             # junction voltage, current
 C_G, C_REJ = "#000000", "#b08cc8"           # conductance, rejected trace (lilac)
 C_READ = "#8c8c8c"                          # the readback drawn over a trace (grey)
+C_CH1, C_CH2 = "#1f77b4", "#d62728"         # current channel 1 (blue), channel 2 (red)
+C_REF = "#555555"                           # reference lines beside two coloured channels
+# Channel 2 is drawn over channel 1 and slightly see-through: where the two
+# agree (between channel 2's rail and channel 1's floor) they lie on top of
+# each other, and the blue underneath then still shows.
+A_CH2 = 0.8
+
+
+def channel_labels(cfg: RigConfig) -> tuple[str, str]:
+    """Legend words for the two outputs of a two-channel amplifier, each
+    with the gain its conductance was computed with."""
+    C = cfg.cal
+    return (f"ch 1 ({C.preamp_gain_v_per_a:.3g} V/A)",
+            f"ch 2 ({C.preamp_gain_2_v_per_a:.3g} V/A)")
 
 
 # --------------------------------------------------------------------------
@@ -105,11 +124,18 @@ def plot_record(ax, cfg: RigConfig, record: np.ndarray, fs: float,
 
 def plot_trace(ax, cfg: RigConfig, g0: np.ndarray, disp_nm: np.ndarray,
                verdict=None, title: str = "trace",
-               sense_v: np.ndarray | None = None, smooth: int = 101) -> None:
+               sense_v: np.ndarray | None = None, smooth: int = 101,
+               g0_2: np.ndarray | None = None) -> None:
     """log10(G/G0) against displacement, Igor's PullOutLowG.
 
     Horizontal lines at 1 G0 and at the break threshold; the title carries
     the selection verdict when one is given.
+
+    With ``g0_2`` -- the same pull as channel 2 of a two-channel amplifier
+    read it -- both are drawn on the one axis, channel 1 (``g0``) in blue
+    and channel 2 in red, sample for sample as measured: nothing is
+    stitched, and where channel 2 is railed (while the junction is closed)
+    it is drawn railed. The verdict is channel 1's.
 
     With ``sense_v`` (the piezo readback over the same samples, raw volts)
     a right-hand axis carries, in grey, how far the readback says the piezo
@@ -126,12 +152,29 @@ def plot_trace(ax, cfg: RigConfig, g0: np.ndarray, disp_nm: np.ndarray,
     ok = verdict is None or getattr(verdict, "accepted", True)
     with np.errstate(divide="ignore", invalid="ignore"):
         y = np.log10(np.clip(g0, 1e-12, None))
-    ax.plot(disp_nm, y, color=C_G if ok else C_REJ, lw=0.8)
-    ax.axhline(0.0, color=C_CMD, lw=0.6, ls="--", alpha=0.7)
-    ax.axhline(np.log10(R.break_g0), color=C_SENSE, lw=0.6, ls=":", alpha=0.7)
+    if g0_2 is None:
+        ax.plot(disp_nm, y, color=C_G if ok else C_REJ, lw=0.8)
+        ax.axhline(0.0, color=C_CMD, lw=0.6, ls="--", alpha=0.7)
+        ax.axhline(np.log10(R.break_g0), color=C_SENSE, lw=0.6, ls=":", alpha=0.7)
+    else:
+        # Two channels: blue under, red over, so that channel 2 stays
+        # visible where it carries on below channel 1's noise. A rejected
+        # trace is drawn paler. The reference lines turn grey here, since
+        # blue and red now mean the channels.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            y2 = np.log10(np.clip(np.asarray(g0_2, dtype=float), 1e-12, None))
+        name1, name2 = channel_labels(cfg)
+        alpha = 1.0 if ok else 0.45
+        ax.plot(disp_nm, y, color=C_CH1, lw=0.8, alpha=alpha, label=name1)
+        ax.plot(np.asarray(disp_nm)[:y2.size], y2, color=C_CH2, lw=0.8,
+                alpha=alpha * A_CH2, label=name2)
+        ax.axhline(0.0, color=C_REF, lw=0.6, ls="--", alpha=0.7)
+        ax.axhline(np.log10(R.break_g0), color=C_REF, lw=0.6, ls=":", alpha=0.7)
+        ax.legend(fontsize=7, loc="lower left", frameon=False)
     x0, x1 = float(disp_nm[0]), float(disp_nm[-1])
     ax.set_xlim(x0, x1)
-    ax.set_ylim(-7.5, 1.0)
+    # One more decade with channel 2 on the plot: its floor lies lower.
+    ax.set_ylim(-7.5 if g0_2 is None else -8.5, 1.0)
     ax.set_xlabel("displacement (nm)", fontsize=8)
     ax.set_ylabel("log10 (G / G0)", fontsize=8)
     ax.tick_params(labelsize=8)
@@ -299,17 +342,39 @@ def plot_approach(ax, cfg: RigConfig, piezo_v: np.ndarray, g0: np.ndarray,
 # --------------------------------------------------------------------------
 
 def plot_histogram(ax, cfg: RigConfig, centres: np.ndarray, counts: np.ndarray,
-                   n_traces: int, title: str = "histogram") -> None:
-    """Counts per trace against log10(G/G0), Igor's LogHistOfBlock."""
+                   n_traces: int, title: str = "histogram",
+                   counts2: np.ndarray | None = None) -> None:
+    """Counts per trace against log10(G/G0), Igor's LogHistOfBlock.
+
+    With ``counts2`` -- the histogram of the same traces as channel 2 of a
+    two-channel amplifier read them, on the same bins -- the two are drawn
+    together, channel 1 in blue and channel 2 in red. Each is its own
+    channel's histogram, made by the one recipe, so the picture has two
+    noise floors: channel 1's where its gain runs out and channel 2's
+    further down.
+    """
     ax.clear()
-    ax.plot(centres, counts, color=C_G, lw=0.8)
-    ax.axvline(0.0, color=C_CMD, lw=0.6, ls="--", alpha=0.7)
-    ax.set_xlim(-7.0, 1.0)
-    ax.set_ylim(0, max(1e-9, float(np.max(counts)) * 1.1) if counts.size else 1)
+    top = float(np.max(counts)) if counts.size else 0.0
+    if counts2 is None:
+        ax.plot(centres, counts, color=C_G, lw=0.8)
+        ax.axvline(0.0, color=C_CMD, lw=0.6, ls="--", alpha=0.7)
+    else:
+        counts2 = np.asarray(counts2, dtype=float)
+        name1, name2 = channel_labels(cfg)
+        ax.plot(centres, counts, color=C_CH1, lw=0.8, label=name1)
+        ax.plot(centres[:counts2.size], counts2, color=C_CH2, lw=0.8,
+                alpha=A_CH2, label=name2)
+        ax.axvline(0.0, color=C_REF, lw=0.6, ls="--", alpha=0.7)
+        ax.legend(fontsize=7, loc="upper right", frameon=False)
+        if counts2.size:
+            top = max(top, float(np.max(counts2)))
+    ax.set_xlim(-7.0 if counts2 is None else -8.0, 1.0)
+    ax.set_ylim(0, max(1e-9, top * 1.1) if counts.size else 1)
     ax.set_xlabel("log10 (G / G0)", fontsize=8)
     ax.set_ylabel("counts / trace", fontsize=8)
     ax.tick_params(labelsize=8)
-    ax.set_title(f"{title}: {n_traces} traces", fontsize=9)
+    ax.set_title(f"{title}: {n_traces} traces"
+                 + (", two channels" if counts2 is not None else ""), fontsize=9)
     ax.grid(True, alpha=0.3)
 
 
@@ -379,7 +444,16 @@ def figure_for_session(path: str | Path, trace_index: int = 0, fig=None):
         disp = analysis.displacement_nm(voltage.size, cfg.ramp, fs)
         sense = session.piezo_sense(i, in_nm=False)
         centres, counts = analysis.log_histogram(session.conductances())
-        verdict = analysis.select_trace(g0, cfg.ramp)
+        # The end of the trace as the pull judged it: on the open side.
+        verdict = analysis.select_trace(
+            g0, cfg.ramp,
+            g0_open=session.open_side(i) if session.has_current2 else None)
+        # A session recorded with both outputs of a two-channel amplifier:
+        # channel 2 of this trace, and its histogram over the file.
+        g0_2 = counts2 = None
+        if session.has_current2:
+            g0_2 = session.conductance(i, channel=2)
+            counts2 = analysis.log_histogram(session.conductances(channel=2))[1]
 
     if fig is None:
         fig = Figure(figsize=(13, 7.5), dpi=100)
@@ -388,12 +462,12 @@ def figure_for_session(path: str | Path, trace_index: int = 0, fig=None):
     record = np.stack([voltage, current])
     plot_record(axes[0, 0], cfg, record, fs, title=f"trace {i + 1} of {n}: record")
     plot_trace(axes[0, 1], cfg, g0, disp, verdict, title=f"trace {i + 1}",
-               sense_v=sense)
+               sense_v=sense, g0_2=g0_2)
     plot_gold_level(axes[0, 2], cfg, g0, disp, voltage_v=voltage)
     t = np.arange(voltage.size) / fs
     cmd = start_v - cfg.cal.nm_to_piezo_volts(disp)
     plot_piezo(axes[1, 0], cfg, t, cmd, sense, title="piezo during the pull")
-    plot_histogram(axes[1, 1], cfg, centres, counts, n)
+    plot_histogram(axes[1, 1], cfg, centres, counts, n, counts2=counts2)
     plot_iv(axes[1, 2], cfg, voltage, current)
     fig.suptitle(str(Path(path).name), fontsize=10)
     fig.tight_layout(w_pad=3.0)
