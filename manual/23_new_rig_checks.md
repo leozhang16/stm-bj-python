@@ -3,14 +3,18 @@
 *Python: `stmlab/config.py` (`Calibration.current_sign`, `current_sign_2`,
 `sign_of`, `volts_to_amps`, `amps_to_volts`; `SimConfig.amplifier_output_sign`),
 `stmlab/analysis.py` (`reads_negative`), `stmlab/plots.py` (`plot_record_series(log=)`,
-`plot_trace(linear=)`), `stmlab/ratecheck.py`, `stmlab/daq.py`
-(`DaqSession.last_play_seconds`), `pullout.py` v69 (`Worker.cmd_current_sign`,
-`cmd_ratecheck`, `SIGN_STOP`; the "flip the sign" boxes, the two plot check
-boxes, the Sample-rate check box of the Monitor window).
+`plot_trace(linear=)`, `plot_piezo(frame=)`), `stmlab/ratecheck.py` (`measure`,
+`save_csv`, `lines`), `stmlab/daq.py` (`DaqSession.last_play_seconds`),
+`pullout.py` v69 and v70 (`Worker.cmd_current_sign`, `cmd_ratecheck`, `SIGN_STOP`;
+`cycle_frame`; the "flip the sign" boxes, the two plot check boxes, the
+Sample-rate check box of the Monitor window).
 Tests: `tests/test_v69_rig_checks.py`.*
 
 Three things that were added in v69 while the new rig, with its two-channel
-amplifier, was being brought up. Each one stands on its own.
+amplifier, was being brought up. Each one stands on its own. v70 changed the
+third after its first evening on the real card (the big line is now the rate
+as counted, and the last second is kept as a file), and gave plot 1 and
+plot 3 one time axis.
 
 ## 1. The current comes out negative
 
@@ -136,6 +140,14 @@ Next to "redraw while moving":
 | **plot 2: linear G** | The trace panel shows G/G0 itself instead of log10(G/G0): the conductance as it was computed, against distance, sign and all. There is a line at 0, at 1 G0 and at the break threshold. The y range fits the data (the wildest half per cent left out) and always shows 0 to 1.2 G0 |
 
 Both redraw what is on the screen at once, also while browsing saved data.
+
+Plot 1 (junction voltage and current) and plot 3 (the piezo) both run
+against the time of the cycle, and since v70 they share one time axis, so a
+feature in one can be found in the other straight below it: 0 to 1.2 s. A
+cycle that lasted longer (a long approach) stretches both to its end, so
+that the pull, which comes last, is never cut off. Before v70 plot 1 showed
+only the pull. To look at the pull alone, type its times into the Axis
+limits window.
 The Axis limits window still overrides the ranges; clear its numbers for a
 panel when you switch that panel between log and linear, because a range
 typed for one makes no sense for the other.
@@ -151,42 +163,74 @@ second:
    during a pull.
 2. The numbers the card returned are written to a scratch file. The file is
    read back, the numbers of each input are counted, and the file is deleted.
-3. The time the card took is read off the PC's clock.
+3. The same second is **kept for you to look at**: `sampling_rate_test.csv`
+   in the data folder (the folder of the Saving tab). Every check writes it
+   afresh, so it always holds the last one.
+4. The time the card took is read off the PC's clock, as a rough cross-check.
 
-The big line shows what was measured and flashes yellow each time a new
-one is in: the count that came back, and the rate by the PC's clock.
+The big line is the sample rate **as counted**, and it flashes yellow each
+time a new one is in:
 
-    40000 samples x 4 inputs: 39998 samples/s
-
-(On the simulated card, which has no clock: `40000 samples x 4 inputs in 1 s`.)
+    40000 samples/s: 40000 samples in 1 s on each of 4 inputs
 
 Under it, one line per input in use (which card input, what is wired to
 it, how many samples), the outputs, the scratch file (how many numbers, how
-big, read back identical, deleted), the rate by the PC's clock next to the
-rate the card itself reports, and how long after the outputs finished the
-inputs were all read.
+big, read back identical, deleted), where the kept file is, the PC's
+stopwatch, and how long after the outputs finished the inputs were all read.
 
-Green means: every input delivered what was asked for, the file read back
-identical and is gone, the PC's rate agrees with the card's within 2 %, and
-the inputs were not late. Red means one of those failed, and the lines say
+Green means: every input delivered what was asked for, the scratch file
+read back identical and is gone, the stopwatch does not disagree, and the
+inputs were not late. Red means one of those failed, and the lines say
 which. If the card refuses the check altogether the box says `CHECK FAILED`
 with the driver's message and unticks itself, so that it does not ask a
 failing card again every second.
 
+### Look at the samples yourself: sampling_rate_test.csv
+
+Untick the box first, so that the file is not being rewritten, then open
+`sampling_rate_test.csv` from the data folder in Excel. The Monitor line
+"kept for Excel" gives the full path.
+
+| Column | What it is |
+|---|---|
+| `sample` | 1, 2, 3 ... 40000 |
+| `time_s` | the time of that sample: its number, less one, over the card's rate. The first is at 0, the last at 0.999975 |
+| one per input | the volts that input read, as the card returned them. The header names the card input and what is wired to it, e.g. `Dev1/ai2 junction voltage (V)` |
+
+One header row and 40000 rows, so Excel's last row number is 40001. The
+values are raw volts at the card, before any gain or sign: the current
+column is the amplifier's output voltage.
+
+While the file is open in Excel, Windows does not let the program replace
+it. The check still runs; the line then says `NOT kept for Excel` and why.
+
 ### What each number can tell you
 
-- **The count** shows which inputs are being read and that each delivered a
-  full second. A record of a fixed length either comes back whole or the
-  driver gives up with a time-out, so the count does not quietly come out
-  short: it is right, or the box says `CHECK FAILED` and why.
-- **The time** is the independent part. The card has its own clock and the
-  PC has another. A card that really sampled at 20000 a second would need
-  two seconds for 40000 samples, and the box would show 20000 samples/s in red.
+- **The count is the sample rate.** The card's sample clock is a crystal,
+  and the driver reports the rate it really runs at (the line "asked for
+  40000 per input: 1 s at the card's 40000.000 samples/s"). One second on
+  that clock is 40000 samples on every input. A record of a fixed length
+  either comes back whole or the driver gives up with a time-out, so the
+  count does not quietly come out short: it is right, or the box says
+  `CHECK FAILED` and why.
+- **The stopwatch is only a rough cross-check.** The PC says "go", waits
+  for the card to say "done", and looks at its own clock. Starting and
+  stopping a card over USB costs 10 to 20 ms, and a long record costs a few
+  ms more than a short one. So the stopwatch cannot tell 40000 from 39700,
+  and it is never shown as a rate. What it can catch is a card that is
+  grossly off: one that really sampled at 20000 a second would need two
+  seconds for 40000 samples, and the big line would turn red and say
+  `40000 samples, but they took 2.00 s, not 1 s`.
 
-Starting and stopping the card costs a few milliseconds, and those are not
-sampling time. So a 10 ms hold is played just before the long one, and the
-rate is the *extra* samples of the long hold divided by the *extra* time it
-took. The start-and-stop time is in both and drops out.
+The stopwatch line reads like this (the numbers are the new rig's):
+
+    PC stopwatch (rough, a cross-check only): 1.0176 s from go to done for 1.0000 s of samples
+        the 17.6 ms on top are the PC starting and stopping the card (10.1 ms on the 400-sample record before it)
+
+v69 turned those same numbers into "39698 samples/s" in the big line: it
+took the short record's 10.1 ms off the long record's time and called all
+the rest sampling time. The card was at 40000 all along; the 7.5 ms were
+the long record's extra start-and-stop time. v70 shows the count.
 
 The stopwatch runs while the *outputs* play their second. The inputs start
 on the same trigger and should finish at the same moment, so the check
@@ -194,15 +238,10 @@ looks at the stopwatch once more when it has all their numbers. A few
 milliseconds later is normal. Inputs that sampled slower than the outputs
 would keep it waiting, and the line then says `FAR TOO LATE` in a red box.
 
-How close to 40000 the PC's number comes on the real card has not been
-tried yet: the tests run on a simulated card and on a fake driver. A PC's
-timing is good to a few milliseconds, so a few tens of samples/s either way
-would be the PC, not the card. Only red (more than 2 % off) is a finding.
-
 On the simulated card a play takes no real time. There is a count but no
-time, and the box says so.
+stopwatch, and the box says so.
 
 While the box is ticked the readouts and the strip charts of the Monitor
 window keep updating (from the end of each one-second record), and a button
-you press waits at most one second for the check in progress to finish.
-The check does not run during a run.
+you press waits a little over one second at most for the check in progress
+to finish. The check does not run during a run.

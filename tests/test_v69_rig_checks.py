@@ -513,11 +513,17 @@ def test_the_check_on_the_simulated_rig_counts_every_input_in_use(tmp_path):
         assert got["inputs"][0]["channel"] == "Dev1/ai0"
         assert got["numbers"] == 4 * int(fs) and got["identical"] and got["deleted"]
         assert got["record"].shape == (2, int(fs))
-        # the simulated card takes no real time: a count, no rate
-        assert got["simulated"] and got["play_seconds"] is None and got["pc_rate_hz"] is None
+        # the simulated card takes no real time: a count, no stopwatch
+        assert got["simulated"] and got["play_seconds"] is None
+        assert got["stopwatch_ok"] is None and got["extra_seconds"] is None
+        assert got["count_rate_hz"] == fs and got["record_seconds"] == 1.0
         assert got["ok"]
+        # nothing was kept either: no folder was named for the csv
+        assert got["csv"] is None and got["csv_error"] is None
         head, text = ratecheck.lines(got)
-        assert head == f"{int(fs)} samples x 4 inputs in 1 s"
+        # the headline is the rate as counted
+        assert head == f"{int(fs)} samples/s: {int(fs)} samples in 1 s on each of 4 inputs"
+        assert not any("Excel" in line for line in text)
         assert any("read back identical, deleted" in line for line in text)
         assert any("simulated card" in line for line in text)
         # one channel, no sense line: two inputs
@@ -557,14 +563,19 @@ def test_the_rate_by_the_pc_clock_and_a_card_at_half_the_rate(tmp_path):
     rig.open()
     try:
         got = ratecheck.measure(rig, 1.0, folder=tmp_path)
-        # the extra samples over the extra time: starting and stopping drops out
+        # go to done, less the samples' own time, is the starting and stopping
         assert got["play_seconds"] == pytest.approx(1.0031, abs=1e-9)
         assert got["ref_samples"] == 400 and got["ref_seconds"] == pytest.approx(0.0131, abs=1e-9)
-        assert got["pc_rate_hz"] == pytest.approx(40000.0, rel=1e-9) and got["ok"]
-        assert got["overhead_seconds"] == pytest.approx(0.0031, abs=1e-9)
+        assert got["extra_seconds"] == pytest.approx(0.0031, abs=1e-9)
+        assert got["ref_extra_seconds"] == pytest.approx(0.0031, abs=1e-9)
+        assert got["stopwatch_ok"] and got["ok"]
         head, text = ratecheck.lines(got)
-        assert head == "40000 samples x 2 inputs: 40000 samples/s"   # what was measured
-        assert any("40000 samples/s by the PC's clock" in line for line in text)
+        # the headline is the rate as counted, never the stopwatch
+        assert head == "40000 samples/s: 40000 samples in 1 s on each of 2 inputs"
+        assert any("PC stopwatch" in line and "1.0031 s from go to done" in line
+                   for line in text)
+        assert any("the 3.1 ms on top are the PC starting and stopping the card" in line
+                   for line in text)
         assert got["input_lag_seconds"] == pytest.approx(0.004, abs=1e-9)
         assert not got["inputs_late"]
         assert any("read 4 ms after the outputs finished" in line for line in text)
@@ -572,19 +583,96 @@ def test_the_rate_by_the_pc_clock_and_a_card_at_half_the_rate(tmp_path):
         rig._session.true_rate = 20000.0             # a card that samples at half the rate
         got = ratecheck.measure(rig, 1.0, folder=tmp_path)
         assert [i["samples"] for i in got["inputs"]] == [40000, 40000]   # the count is right
-        assert got["pc_rate_hz"] == pytest.approx(20000.0, rel=1e-9)     # the time is not
-        assert got["overhead_seconds"] == pytest.approx(0.0031, abs=1e-9)
-        assert not got["ok"]
-        assert ratecheck.lines(got)[0] == "40000 samples x 2 inputs: 20000 samples/s"
+        assert got["extra_seconds"] == pytest.approx(1.0031, abs=1e-9)   # the time is not
+        assert got["stopwatch_ok"] is False and not got["ok"]
+        head, text = ratecheck.lines(got)
+        assert head == "40000 samples, but they took 2.00 s, not 1 s"
+        assert any("FAR TOO MUCH OFF" in line for line in text)
 
         # outputs at the right rate, but the inputs come in a second late:
         # they sample slower than the outputs
         rig._session.true_rate = 40000.0
         rig._session.read_lag = 1.0
         got = ratecheck.measure(rig, 1.0, folder=tmp_path)
-        assert got["pc_rate_hz"] == pytest.approx(40000.0, rel=1e-9)
+        assert got["stopwatch_ok"]
         assert got["inputs_late"] and not got["ok"]
         assert any("FAR TOO LATE" in line for line in ratecheck.lines(got)[1])
+    finally:
+        rig.close()
+
+
+class _LikeTheRig(_Clocked):
+    """What the USB card on the new rig did on 2026-11-17: exact at 40000,
+    10.1 ms of starting and stopping on the 10 ms record, 17.6 ms on the
+    one-second record (a long record has more to send to the card)."""
+
+    def play(self, waveform, timeout_s: float = 10.0):
+        self.overhead = 0.0176 if np.asarray(waveform).shape[1] > 8000 else 0.0101
+        return super().play(waveform, timeout_s)
+
+
+def test_the_real_rigs_numbers_read_40000_and_never_39698(tmp_path):
+    """v69 showed "39698 samples/s" for these very numbers: it took the
+    short record's start-and-stop time off the long one's and called the
+    rest sampling time. The card was at 40000 all along."""
+    cfg = _sim(two=True)
+    cfg.channels.sense_device, cfg.channels.ai_piezo_sense = cfg.channels.device, "ai3"
+    rig = Rig(cfg, session=_LikeTheRig(cfg, seed=1))
+    rig.open()
+    try:
+        got = ratecheck.measure(rig, 1.0, folder=tmp_path)
+        assert got["play_seconds"] == pytest.approx(1.0176, abs=1e-9)
+        assert got["count_rate_hz"] == 40000.0
+        assert got["stopwatch_ok"] and got["ok"]
+        head, text = ratecheck.lines(got)
+        assert head == "40000 samples/s: 40000 samples in 1 s on each of 4 inputs"
+        assert any("the 17.6 ms on top are the PC starting and stopping the card "
+                   "(10.1 ms on the 400-sample record before it)" in line for line in text)
+        assert "39698" not in head and not any("39698" in line for line in text)
+        assert "pc_rate_hz" not in got
+    finally:
+        rig.close()
+
+
+def test_the_last_second_is_kept_as_a_csv_for_excel(tmp_path):
+    cfg = _sim(two=True)
+    cfg.channels.sense_device, cfg.channels.ai_piezo_sense = cfg.channels.device, "ai3"
+    rig = Rig(cfg, session=SimulatedDaqSession(cfg, seed=1))
+    rig.open()
+    try:
+        data = tmp_path / "data"                      # not there yet: it is made
+        got = ratecheck.measure(rig, 1.0, folder=tmp_path, keep=data)
+        kept = data / "sampling_rate_test.csv"
+        assert got["csv"] == str(kept) and got["csv_rows"] == 40000 and got["ok"]
+        assert sorted(p.name for p in data.iterdir()) == ["sampling_rate_test.csv"]
+        rows = kept.read_text().splitlines()
+        assert len(rows) == 40001                     # one header row, 40000 samples
+        assert rows[0] == ("sample,time_s,Dev1/ai0 junction voltage (V),"
+                           "Dev1/ai1 current ch 1 (V),Dev1/ai4 current ch 2 (V),"
+                           "Dev1/ai3 piezo sense (V)")
+        assert rows[1].startswith("1,0.0000000,") and rows[-1].startswith("40000,0.9999750,")
+        table = np.loadtxt(kept, delimiter=",", skiprows=1)
+        assert table.shape == (40000, 6)
+        M = cfg.channels
+        assert np.allclose(table[:, 2], got["record"][M.ROW_VOLTAGE], atol=1e-7)
+        assert np.allclose(table[:, 3], got["record"][M.ROW_CURRENT], atol=1e-7)
+        assert np.allclose(table[:, 4], rig.last_current2_v, atol=1e-7)
+        assert np.allclose(table[:, 5], rig.last_sense_v, atol=1e-7)
+        head, text = ratecheck.lines(got)
+        assert any(line == f"kept for Excel: {kept}" for line in text)
+        assert any("40000 rows under the header" in line for line in text)
+
+        # the next check writes the file afresh: still one file, the new numbers
+        again = ratecheck.measure(rig, 0.25, folder=tmp_path, keep=data)
+        assert again["csv_rows"] == 10000
+        assert len(kept.read_text().splitlines()) == 10001
+        assert sorted(p.name for p in data.iterdir()) == ["sampling_rate_test.csv"]
+
+        # a folder that cannot be made does not fail the check; the lines say so
+        (tmp_path / "a_file").write_text("x")
+        bad = ratecheck.measure(rig, 0.25, folder=tmp_path, keep=tmp_path / "a_file" / "data")
+        assert bad["ok"] and bad["csv"] is None and "sampling_rate_test.csv" in bad["csv_error"]
+        assert any(line.startswith("NOT kept for Excel:") for line in ratecheck.lines(bad)[1])
     finally:
         rig.close()
 
@@ -645,7 +733,8 @@ def test_the_real_driver_times_every_play(monkeypatch):
         got = ratecheck.measure(rig, 0.5)
         assert got["asked"] == 20000 and not got["simulated"]
         assert got["play_seconds"] >= 0.5
-        assert got["pc_rate_hz"] == pytest.approx(40000.0, rel=0.02) and got["ok"]
+        assert got["count_rate_hz"] == 40000.0
+        assert 0.0 <= got["extra_seconds"] < 0.03 and got["stopwatch_ok"] and got["ok"]
         assert got["input_lag_seconds"] < 0.05 and not got["inputs_late"]
 
 
@@ -659,6 +748,10 @@ def test_the_worker_runs_the_check_quietly_and_feeds_the_readouts(ap, tmp_path):
         got = _events(worker, "ratecheck")[-1]
         assert got["ok"] and "record" not in got
         assert [i["samples"] for i in got["inputs"]] == [10000, 10000, 10000]
+        # the record of the check stays in the data folder, for Excel
+        kept = tmp_path / "sampling_rate_test.csv"
+        assert got["csv"] == str(kept) and got["csv_rows"] == 10000
+        assert len(kept.read_text().splitlines()) == 10001
         # kept out of the cycle log, like the idle sampling
         assert len(worker.mon.snapshot().t) == cycle_points and not worker.mon.quiet
         # and its last samples are a monitor sample for the readouts

@@ -166,7 +166,7 @@ log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v69"
+__version__ = "v70"
 
 # What the Saving tab holds when nothing is remembered yet. ``folder`` is
 # the data folder (the day folder is made under it); ``setup_id`` is Igor's
@@ -726,12 +726,16 @@ class Worker(threading.Thread):
         Nothing moves: the piezo and the bias are held where they are for
         ``seconds`` while every input in use records, as in a pull. The
         numbers the card returned go into a scratch file, the file is read
-        back and counted, and the file is deleted; the time the card took
-        comes from this PC's clock. The end of the record also feeds the
-        readouts, as a monitor sample would."""
+        back and counted, and the file is deleted. The same record is kept
+        in the data folder as ``sampling_rate_test.csv``, one row per
+        sample, written afresh by every check, to be opened in Excel. The
+        time the card took comes from this PC's clock, as a rough
+        cross-check. The end of the record also feeds the readouts, as a
+        monitor sample would."""
         self.mon.quiet = True
         try:
-            result = ratecheck.measure(self.rig, seconds)
+            result = ratecheck.measure(
+                self.rig, seconds, keep=self.saving.get("folder") or self.out_dir)
         except Exception as exc:                   # noqa: BLE001
             log.exception("sample-rate check failed")
             self.post("ratecheck", error=f"{type(exc).__name__}: "
@@ -3610,15 +3614,18 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         # input in use? While the box is ticked and the rig is idle the
         # worker holds the outputs where they are for one second, records,
         # counts the numbers through a scratch file (written, read back,
-        # deleted) and times the card against this PC's clock; the result
-        # is shown here, and the line flashes, once a second.
+        # deleted), keeps that second as sampling_rate_test.csv in the
+        # data folder and times the card against this PC's clock (a rough
+        # cross-check); the result is shown here, and the line flashes,
+        # once a second. The big line is the rate as counted.
         rate_box = ttk.LabelFrame(win, text="Sample-rate check")
         rate_box.pack(fill="x", padx=8, pady=(6, 0))
         mon_state["rate_on"] = tk.BooleanVar(value=False)
         ttk.Checkbutton(rate_box,
                         text="check the sample rate: record 1 s on every input in "
-                             "use, count it through a scratch file, again and "
-                             "again (nothing moves)",
+                             "use, again and again (nothing moves).\nThe last "
+                             "second stays in the data folder as "
+                             "sampling_rate_test.csv, to open in Excel",
                         variable=mon_state["rate_on"]).pack(anchor="w", padx=6,
                                                             pady=(2, 0))
         rate_big = tk.Label(rate_box, text="not checked yet: tick the box",
@@ -3875,27 +3882,27 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             except Exception:                   # noqa: BLE001
                 log.debug("tight_layout failed", exc_info=True)
 
-    def pull_frame(cyc):
-        """The default x range of the record panel: the pull, with a little
-        of the hold before it, or None for the whole cycle when no pull has
-        happened yet. The data behind the panel are always the whole cycle,
-        so the Axis limits window can widen the view."""
-        if "pull" in cyc.marks and "end" in cyc.marks:
-            t0, t1 = cyc.marks["pull"], cyc.marks["end"]
-            pad = 0.1 * max(t1 - t0, 1e-3)
-            return (t0 - pad, t1 + pad)
-        return None
+    def cycle_frame(cyc, least: float = 1.2):
+        """The default x range of the two panels that run against time, the
+        record (plot 1) and the piezo (plot 3): the SAME for both, so the
+        two line up. It is 0 to 1.2 s, and reaches to the end of the cycle
+        when the cycle lasted longer, so that the pull, which comes last,
+        is never cut off. The Axis limits window still overrides it."""
+        last = 0.0
+        for series in (cyc.t, cyc.rec_t, list(cyc.marks.values())):
+            arr = np.asarray(series, dtype=float)
+            if arr.size and np.isfinite(arr).any():
+                last = max(last, float(np.nanmax(arr)))
+        return (0.0, least if last <= least else 1.02 * last)
 
     def draw_live():
         cyc, tr, hist = live["cycle"], live["trace"], live["hist"]
         if cyc is not None and cyc.rec_t:
-            frame = pull_frame(cyc)
             plots.plot_record_series(ax["record"], cfg, np.array(cyc.rec_t),
                                      np.array(cyc.rec_v), np.array(cyc.rec_i),
-                                     marks=cyc.marks, frame=frame,
-                                     title="this cycle: junction V and current"
-                                           + (" (framed on the pull)" if frame
-                                              else ""), log=log_iv.get())
+                                     marks=cyc.marks, frame=cycle_frame(cyc),
+                                     title="this cycle: junction V and current",
+                                     log=log_iv.get())
         if tr is not None and tr.get("record") is not None:
             rec = tr["record"]
             # g0_2: the same pull on channel 2 of a two-channel amplifier
@@ -3907,7 +3914,8 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         if cyc is not None and cyc.t:
             plots.plot_piezo(ax["piezo"], cfg, np.array(cyc.t), np.array(cyc.piezo_v),
                              np.array(cyc.sense_v), marks=cyc.marks,
-                             title="piezo in and out, this cycle")
+                             title="piezo in and out, this cycle",
+                             frame=cycle_frame(cyc))
         if hist is not None and hist["counts"] is not None:
             plots.plot_histogram(ax["hist"], cfg, hist["centres"], hist["counts"],
                                  hist["n"], counts2=hist.get("counts2"))
@@ -4207,12 +4215,13 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                     plots.plot_piezo(ax["piezo"], cfg, np.array(cyc.t),
                                      np.array(cyc.piezo_v), np.array(cyc.sense_v),
                                      marks=cyc.marks,
-                                     title="piezo in and out, this cycle (live)")
+                                     title="piezo in and out, this cycle (live)",
+                                     frame=cycle_frame(cyc))
                     if cyc.rec_t:
                         plots.plot_record_series(
                             ax["record"], cfg, np.array(cyc.rec_t),
                             np.array(cyc.rec_v), np.array(cyc.rec_i),
-                            marks=cyc.marks,
+                            marks=cyc.marks, frame=cycle_frame(cyc),
                             title="this cycle: junction V and current (live)",
                             log=log_iv.get())
                     apply_limits()

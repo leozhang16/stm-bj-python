@@ -336,10 +336,13 @@ def plot_gold_level(ax, cfg: RigConfig, g0: np.ndarray, disp_nm: np.ndarray,
 
 def plot_piezo(ax, cfg: RigConfig, t_s: np.ndarray, cmd_v: np.ndarray,
                sense_v: np.ndarray | None = None, marks: dict | None = None,
-               title: str = "piezo") -> None:
+               title: str = "piezo",
+               frame: tuple[float, float] | None = None) -> None:
     """Commanded piezo position (nm) against time, with the readback on top
     when there is one. ``marks`` is {label: time_s} for the phases of a
-    cycle (approach start, contact, pull start, pull end)."""
+    cycle (approach start, contact, pull start, pull end). ``frame`` is an
+    x range to show by default: the window gives this panel and the record
+    panel the same one, so the two line up."""
     C = cfg.cal
     ax.clear()
     ax.plot(t_s, C.piezo_volts_to_nm(cmd_v), color=C_CMD, lw=1.0,
@@ -351,6 +354,8 @@ def plot_piezo(ax, cfg: RigConfig, t_s: np.ndarray, cmd_v: np.ndarray,
         ax.axvline(when, color="k", lw=0.5, ls=":", alpha=0.6)
         ax.text(when, ax.get_ylim()[1] if ax.lines else 0, label, fontsize=7,
                 rotation=90, va="top", ha="right", alpha=0.7)
+    if frame is not None:
+        ax.set_xlim(*frame)
     ax.set_xlabel("time (s)", fontsize=8)
     ax.set_ylabel("piezo (nm)", fontsize=8)
     ax.tick_params(labelsize=8)
