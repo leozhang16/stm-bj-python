@@ -50,8 +50,8 @@ def _events(worker, kind):
 
 # -- the version ---------------------------------------------------------------------
 
-def test_version_is_v70(ap):
-    assert ap.__version__ == "v70"
+def test_version_is_v71(ap):
+    assert ap.__version__ == "v71"
 
 
 # -- headless: the whole path, twice, with the simulator ---------------------------------

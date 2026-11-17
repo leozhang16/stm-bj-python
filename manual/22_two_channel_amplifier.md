@@ -262,7 +262,19 @@ Saving tab have a `channel` box for the same choices.
    checks that every input the config names exists, channel 2's included.
 3. `python rigcheck.py` reads any input live. Put a known current through
    the amplifier and check each output against its gain before trusting the
-   numbers in the config.
+   numbers in the config. For a sweep instead of one current, use its
+   **Ramp an output** box (v71): pick the output the bias is on, type the
+   start and the end voltage and how many volts a second, press Ramp.
+   Through a known resistor that is a current ramp. Tick the amplifier's
+   inputs and press Start first: the scope and the table then follow each
+   amplifier output as the ramp runs. The second plot, under the scope,
+   shows the command: the outputs' volts against time, the whole ramp
+   drawn thin, the part played so far thick, and a dot at now (it is what
+   the card was told, not a measurement). The output stays at the end voltage
+   when the ramp is done; "Hold here" stops it on the way; "and back to the
+   start" returns it. Start the window with `--config` and the rig's json:
+   it then knows which output is the piezo and refuses anything outside
+   the piezo's range on it. Below 0 V needs "allow negative volts" ticked.
 4. Take one pull. If the status line starts with `CH 1 CURRENT IS NEGATIVE`
    and the trace panel says so in red, the amplifier's output is the other
    way round from the Keithley's: tick "flip the sign of ch 1" in the

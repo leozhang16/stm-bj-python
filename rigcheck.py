@@ -15,7 +15,24 @@ Card      every DAQ device the driver sees, with Details (channels, rates,
           output channels, give each a DC value or a sine or square wave,
           Apply; "All outputs 0 V" is one button and also what closing the
           window does. A limit box refuses anything beyond +/- that many
-          volts, so a slip of the finger cannot put 10 V on a cable.
+          volts, so a slip of the finger cannot put 10 V on a cable, and
+          nothing goes below 0 V unless "allow negative volts" is ticked.
+          Started with --config, the window knows which output is the
+          PIEZO and keeps it inside the config's piezo range, whatever is
+          ticked: a unipolar piezo must never see a negative voltage.
+          Ramp an output: pick the output, type the start and the end
+          voltage and how many volts a second, Ramp. The output goes
+          straight to the start, runs to the end at that rate (and back,
+          if ticked) and stays there; "Hold here" stops it where it is.
+          The other ticked outputs hold their DC value meanwhile, and the
+          inputs keep reading, so the scope shows what the ramp does.
+          Under the scope a second plot shows the COMMAND: what the
+          outputs were told to do, in volts against time. For a ramp the
+          whole plan is drawn thin, the part played so far thick, and a
+          dot marks now; for a DC level or a wave it is one second of the
+          output, which repeats. It is what this window sent to the card,
+          on this PC's clock, not a measurement: loop an output back to an
+          input and the scope above shows the measurement.
 Keithley  Connect over GPIB (the amplifier is left as it is), zero check
           on/off, zero correct, suppress on/off, the gain.
 Actuator  Find ports, connect to the Agilis (or a NanoPZ), read its
@@ -24,9 +41,11 @@ Actuator  Find ports, connect to the Agilis (or a NanoPZ), read its
           then it asks you whether you heard it, and says what to do next
           either way.
 
-Wiring the loop tests on this window: output a 1 V sine on the bias output,
-tick the voltage input, and the scope shows the sine; move the wire and the
-piezo output shows the same. That is bring-up steps 2 and 3 by eye; the
+Wiring the loop tests on this window: output a 1 V sine on the bias output
+(with "allow negative volts" ticked, or with an offset of 1 V), tick the
+voltage input, and the scope shows the sine; move the wire and the piezo
+output shows the same (offset 1 V there: the piezo output stays above 0 V).
+That is bring-up steps 2 and 3 by eye; the
 program's own pass/fail version is python -m stmlab.main bringup.
 """
 from __future__ import annotations
@@ -49,7 +68,8 @@ if str(_ROOT) not in sys.path:
 from stmlab.config import RigConfig                                  # noqa: E402
 from stmlab.tklook import _light_window, windows_look                # noqa: E402
 
-__version__ = "v2"
+# Since v71 the bench window carries the repository's version (pullout's).
+__version__ = "v71"
 log = logging.getLogger("rigcheck")
 
 TERMINALS = ("card default", "differential", "RSE", "NRSE")
@@ -84,8 +104,78 @@ def waveform(mode: str, volts: float, amp: float, freq: float, offset: float,
     return offset + amp * np.where(np.sin(2 * np.pi * f * t) >= 0, 1.0, -1.0)
 
 
+# A ramp is played at a sample rate that keeps its samples at most 0.1 mV
+# apart: below one step of a 16-bit +/-10 V output (0.3 mV), so the ramp is
+# as smooth as the card can make it. Never slower than 100 S/s, never faster
+# than the rate box; a ramp of more samples than RAMP_MAX_SAMPLES is refused.
+RAMP_STEP_V = 1e-4
+RAMP_MIN_RATE = 100.0
+RAMP_MAX_SAMPLES = 4_000_000
+
+
+def ramp_rate(v_per_s: float, card_rate: float) -> float:
+    """The sample rate a ramp of ``v_per_s`` volts a second is played at."""
+    return float(min(card_rate, max(RAMP_MIN_RATE, abs(v_per_s) / RAMP_STEP_V)))
+
+
+def ramp_wave(start: float, end: float, v_per_s: float, rate: float,
+              back: bool = False) -> np.ndarray:
+    """A straight ramp from ``start`` to ``end`` volts at ``v_per_s`` volts
+    a second, sampled at ``rate``; with ``back`` it then returns to
+    ``start`` the same way. The first sample is ``start``, and the last
+    is where the output stays."""
+    if not v_per_s > 0:
+        raise ValueError("the ramp's V/s must be a positive number")
+    if start == end:
+        raise ValueError("the ramp's start and end are the same voltage")
+    seconds = abs(end - start) / v_per_s
+    n = max(2, int(round(seconds * rate)) + 1)
+    if n * (2 if back else 1) > RAMP_MAX_SAMPLES:
+        raise ValueError(f"that ramp takes {seconds * (2 if back else 1):,.0f} s: too "
+                         "long to play in one piece; use more V/s or a shorter way")
+    up = np.linspace(float(start), float(end), n)
+    return np.concatenate([up, up[-2::-1]]) if back else up
+
+
+def played_once(wave: np.ndarray, rate: float, seconds: float) -> tuple[float, float]:
+    """(seconds, volts): where a buffer that is played ONCE at ``rate`` has
+    got to ``seconds`` after its start. It stays on its last sample."""
+    k = min(len(wave) - 1, max(0, int(seconds * rate)))
+    return k / rate, float(wave[k])
+
+
+def output_refusal(channel: str, low: float, high: float, limit: float,
+                   allow_negative: bool, piezo: str | None,
+                   piezo_range: tuple[float, float]) -> str | None:
+    """Why an output that goes between ``low`` and ``high`` volts on
+    ``channel`` is refused, or None when it may go out. Three rules:
+
+    * the PIEZO output (``piezo``, known when the window was started with
+      --config; None otherwise) never leaves ``piezo_range``, whatever is
+      ticked: a unipolar piezo must never see a negative voltage;
+    * nothing goes beyond +/- ``limit`` (the limit box);
+    * nothing goes below 0 V unless ``allow_negative`` (its tick box).
+    """
+    name = channel.split("/")[-1]
+    span = f"{low:g} V" if low == high else f"{low:g} to {high:g} V"
+    if piezo is not None and channel.lower() == piezo.lower():
+        lo, hi = piezo_range
+        if low < lo or high > hi:
+            return (f"{name} is the PIEZO output: {span} is outside its "
+                    f"{lo:g} to {hi:g} V. Refused")
+    peak = max(abs(low), abs(high))
+    if peak > limit:
+        return (f"{name}: {peak:g} V would exceed the limit of "
+                f"+/-{limit:g} V; raise the limit if you mean it")
+    if low < 0 and not allow_negative:
+        return (f"{name}: {span} goes below 0 V; tick \"allow negative volts\" "
+                "if you mean it")
+    return None
+
+
 class RealDaq:
-    """NI-DAQmx: discovery, a finite input burst, a continuous output."""
+    """NI-DAQmx: discovery, a finite input burst, a continuous output, and
+    an output played once (a ramp)."""
 
     def __init__(self):
         self._ao = None
@@ -194,6 +284,41 @@ class RealDaq:
         return (f"driving {', '.join(c.split('/')[-1] for c in chans)} at "
                 f"{granted:,.0f} S/s")
 
+    def play_once(self, device: str, buffers: dict[str, np.ndarray],
+                  rate: float) -> float:
+        """Play ``buffers`` ({channel: samples}, all of one length) ONCE
+        and leave every output at its last sample: a ramp. The task is
+        left open, as pullout leaves its own between plays: that is what
+        holds the outputs until the next drive, play, zero or stop.
+        Returns the sample rate the card granted."""
+        import nidaqmx
+        from nidaqmx.constants import AcquisitionType
+        self.stop_output()
+        chans = list(buffers)
+        task = nidaqmx.Task("rigcheck_ao")
+        try:
+            for ch in chans:
+                task.ao_channels.add_ao_voltage_chan(ch, min_val=-10.0, max_val=10.0)
+            try:                                   # hold the last value when done
+                from nidaqmx.constants import AOIdleOutputBehavior
+                for chan in task.ao_channels:
+                    chan.ao_idle_output_behavior = \
+                        AOIdleOutputBehavior.MAINTAIN_EXISTING_VALUE
+            except Exception:                      # noqa: BLE001
+                pass                               # no such setting on this card
+            n = len(next(iter(buffers.values())))
+            task.timing.cfg_samp_clk_timing(rate, sample_mode=AcquisitionType.FINITE,
+                                            samps_per_chan=n)
+            data = np.vstack([buffers[ch] for ch in chans])
+            task.write(data[0] if len(chans) == 1 else data, auto_start=False,
+                       timeout=30.0)
+            task.start()
+        except Exception:
+            task.close()
+            raise
+        self._ao, self._ao_device, self._ao_channels = task, device, chans
+        return float(task.timing.samp_clk_rate)
+
     def stop_output(self) -> None:
         if self._ao is not None:
             try:
@@ -228,6 +353,7 @@ class SimDaq:
         self.buffers: dict[str, np.ndarray] = {}
         self.rate = 50_000.0
         self.t0 = time.monotonic()
+        self.once_t0: float | None = None       # when a play_once began
         self.rng = np.random.default_rng(1)
 
     def devices(self) -> list[dict]:
@@ -249,7 +375,12 @@ class SimDaq:
         for k, ch in enumerate(channels):
             src = ch.replace("/ai", "/ao")
             buf = self.buffers.get(src)
-            if buf is not None:
+            if buf is not None and self.once_t0 is not None:
+                # played once: the output stays at its last sample
+                since = (time.monotonic() - self.once_t0) + np.arange(n) / rate
+                idx = np.clip(np.round(since * self.rate).astype(int), 0, buf.size - 1)
+                out[k] = buf[idx]
+            elif buf is not None:
                 idx = (np.round(t * self.rate).astype(int)) % buf.size
                 out[k] = buf[idx]
             out[k] += self.rng.normal(0.0, 0.0008, n)
@@ -259,14 +390,22 @@ class SimDaq:
     def drive(self, device, buffers, rate) -> str:
         self.buffers = dict(buffers)
         self.rate = rate
+        self.once_t0 = None
         return ("outputs stopped" if not buffers else
                 f"driving {', '.join(c.split('/')[-1] for c in buffers)} (simulated)")
+
+    def play_once(self, device, buffers, rate) -> float:
+        self.buffers = dict(buffers)
+        self.rate = rate
+        self.once_t0 = time.monotonic()
+        return float(rate)
 
     def stop_output(self) -> None:
         pass
 
     def zero(self, device, channels) -> str:
         self.buffers = {}
+        self.once_t0 = None
         return "all outputs at 0 V (simulated)"
 
 
@@ -275,7 +414,10 @@ class SimDaq:
 # --------------------------------------------------------------------------
 
 def run(cfg: RigConfig, simulate: bool, autoclose: float | None = None,
-        zoom: float | None = None) -> int:
+        zoom: float | None = None, piezo: str | None = None) -> int:
+    """The window. ``piezo`` is the piezo's output channel ("Dev1/ao1") when
+    a config named it (``main`` passes it with --config): that output is
+    then kept inside the config's piezo range by every Apply and Ramp."""
     import tkinter as tk
     from tkinter import messagebox, ttk
 
@@ -433,6 +575,44 @@ def run(cfg: RigConfig, simulate: bool, autoclose: float | None = None,
                          bg="#c62828", fg="white", activebackground="#8e0000",
                          activeforeground="white", font=("Arial", 10, "bold"))
     zero_btn.grid(row=2, column=2, columnspan=3, padx=4, pady=3, sticky="ew")
+    neg_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(ob, text="allow negative volts", variable=neg_var).grid(
+        row=3, column=0, columnspan=3, sticky="w", padx=4)
+    piezo_range = (cfg.limits.piezo_ao_min_v, cfg.limits.piezo_ao_max_v)
+    tk.Label(ob, anchor="w", justify="left", font=("Arial", 9),
+             fg="#b00000" if piezo else "#606060",
+             text=(f"{piezo.split('/')[-1]} is the PIEZO output (from the config): "
+                   f"kept within {piezo_range[0]:g} to {piezo_range[1]:g} V"
+                   if piezo else
+                   "no --config: this window does not know which output\n"
+                   "is the piezo. Never put a negative voltage on it")).grid(
+        row=4, column=0, columnspan=6, sticky="w", padx=4, pady=(0, 3))
+
+    # -- a ramp on one output -----------------------------------------------------
+    pb = ttk.LabelFrame(left, text="Ramp an output: start, end, how fast")
+    pb.pack(fill="x", pady=(0, 6))
+    ramp_ch = tk.StringVar()
+    ramp_from, ramp_to = tk.StringVar(value="0"), tk.StringVar(value="1")
+    ramp_vps = tk.StringVar(value="0.1")
+    ramp_back = tk.BooleanVar(value=False)
+    ramp_box = ttk.Combobox(pb, textvariable=ramp_ch, width=5, state="readonly")
+    ramp_box.grid(row=0, column=0, padx=(4, 2), pady=3)
+    ttk.Label(pb, text="from").grid(row=0, column=1, padx=1)
+    ttk.Entry(pb, textvariable=ramp_from, width=6).grid(row=0, column=2)
+    ttk.Label(pb, text="V  to").grid(row=0, column=3, padx=1)
+    ttk.Entry(pb, textvariable=ramp_to, width=6).grid(row=0, column=4)
+    ttk.Label(pb, text="V  at").grid(row=0, column=5, padx=1)
+    ttk.Entry(pb, textvariable=ramp_vps, width=6).grid(row=0, column=6)
+    ttk.Label(pb, text="V/s").grid(row=0, column=7, sticky="w", padx=(1, 4))
+    ttk.Checkbutton(pb, text="and back to the start", variable=ramp_back).grid(
+        row=1, column=0, columnspan=4, sticky="w", padx=4)
+    ttk.Button(pb, text="Ramp", command=lambda: start_ramp()).grid(
+        row=1, column=4, columnspan=2, padx=2, pady=3, sticky="ew")
+    ttk.Button(pb, text="Hold here", command=lambda: hold_ramp()).grid(
+        row=1, column=6, columnspan=2, padx=2, pady=3, sticky="ew")
+    ramp_lbl = tk.Label(pb, text="pick the output, then Ramp", anchor="w",
+                        font=("Courier", 9), justify="left")
+    ramp_lbl.grid(row=2, column=0, columnspan=8, sticky="w", padx=4, pady=(0, 3))
 
     def on_device(_e=None):
         """Rebuild the channel tick boxes for the device chosen."""
@@ -443,6 +623,8 @@ def run(cfg: RigConfig, simulate: bool, autoclose: float | None = None,
         ai_vars.clear()
         ao_rows.clear()
         d = found.get(current_device())
+        ramp_ch.set("")
+        ramp_box.config(values=[ch.split("/")[-1] for ch in d["ao"]] if d else [])
         if not d:
             return
         for i, ch in enumerate(d["ai"]):
@@ -485,8 +667,11 @@ def run(cfg: RigConfig, simulate: bool, autoclose: float | None = None,
     ttk.Label(yb, text="V   (blank: auto)").pack(side="left", padx=(2, 8))
     ttk.Button(yb, text="Auto", command=lambda: (ylo_var.set(""), yhi_var.set(""),
                                                  redraw_scope())).pack(side="left")
-    fig = Figure(figsize=(7.2, 4.2), dpi=100)
-    ax = fig.add_subplot(111)
+    # Two plots: the scope (what the ticked inputs read in the last burst)
+    # and, under it, the command (what the outputs were told to do).
+    fig = Figure(figsize=(7.2, 5.2), dpi=100)
+    ax, ax_cmd = fig.subplots(2, 1, gridspec_kw={"height_ratios": [3, 2]})
+    fig.subplots_adjust(left=0.10, right=0.97, top=0.95, bottom=0.10, hspace=0.55)
     canvas = FigureCanvasTkAgg(fig, master=right)
     canvas.get_tk_widget().pack(fill="both", expand=True, pady=(4, 0))
     last = {"burst": None}
@@ -583,6 +768,61 @@ def run(cfg: RigConfig, simulate: bool, autoclose: float | None = None,
             ax.set_ylim(*lim)
         canvas.draw_idle()
 
+    # -- the second plot: the command -------------------------------------------
+    # What the outputs were TOLD to do, volts against time: the buffers
+    # this window handed to the card, on this PC's clock. "repeat" is a
+    # continuous output (Apply): one second of it, which the card repeats.
+    # "once" is a ramp: the whole plan thin, the part played so far thick,
+    # a dot at now; ``stop`` freezes now where "Hold here" stopped it.
+    cmd = {"kind": None, "t0": 0.0, "rate": 1.0, "waves": {}, "stop": None, "note": ""}
+    cmd_points = 2000                           # drawn per line, at most
+
+    def ao_colour(ch: str) -> str:
+        """One colour per output, the same in every picture: ao0 the
+        first colour of the cycle, ao1 the second, and so on."""
+        names = list(ao_rows)
+        return f"C{names.index(ch) % 10 if ch in names else 0}"
+
+    def set_command(kind, waves=None, rate: float = 1.0, note: str = "") -> None:
+        cmd.update(kind=kind if waves else None, t0=time.monotonic(), rate=float(rate),
+                   waves=dict(waves or {}), stop=None, note=note)
+        draw_command()
+
+    def draw_command() -> None:
+        ax_cmd.clear()
+        ax_cmd.set_xlabel("s")
+        ax_cmd.set_ylabel("V")
+        ax_cmd.grid(True, alpha=0.3)
+        waves = cmd["waves"]
+        if cmd["kind"] is None or not waves:
+            ax_cmd.set_title("outputs, the command: nothing is driven", fontsize=9)
+            canvas.draw_idle()
+            return
+        rate = cmd["rate"]
+        n = len(next(iter(waves.values())))
+        step = max(1, n // cmd_points)
+        t = np.arange(n)[::step] / rate
+        if cmd["kind"] == "once":
+            gone = (time.monotonic() - cmd["t0"]) if cmd["stop"] is None else cmd["stop"]
+            for ch, wave in waves.items():
+                now_s, now_v = played_once(wave, rate, gone)
+                v = wave[::step]
+                ax_cmd.plot(t, v, lw=0.8, color=ao_colour(ch), alpha=0.35)   # the plan
+                done = t <= now_s
+                ax_cmd.plot(t[done], v[done], lw=1.8, color=ao_colour(ch),
+                            label=ch.split("/")[-1])                         # played so far
+                ax_cmd.plot([now_s], [now_v], "o", ms=5, color=ao_colour(ch))   # now
+            ax_cmd.axvline(min(gone, (n - 1) / rate), color="k", lw=0.5, ls=":")
+            ax_cmd.set_xlim(0, max((n - 1) / rate, 1e-3))
+        else:
+            for ch, wave in waves.items():
+                ax_cmd.plot(t, wave[::step], lw=1.0, color=ao_colour(ch),
+                            label=ch.split("/")[-1])
+            ax_cmd.set_xlim(0, n / rate)
+        ax_cmd.legend(loc="best", fontsize=8)
+        ax_cmd.set_title(cmd["note"] or "outputs, the command", fontsize=9)
+        canvas.draw_idle()
+
     def apply_outputs():
         try:
             limit = abs(float(limit_var.get()))
@@ -606,22 +846,166 @@ def run(cfg: RigConfig, simulate: bool, autoclose: float | None = None,
                 say(f"{ch}: V, Hz and offset must be numbers", "bad")
                 return
             mode = r["mode"].get()
-            peak = abs(volts) if mode == "DC" else abs(offset) + abs(volts)
-            if peak > limit:
-                say(f"{ch.split('/')[-1]}: {peak:g} V would exceed the limit of "
-                    f"+/-{limit:g} V; raise the limit if you mean it", "bad")
+            low, high = ((volts, volts) if mode == "DC"
+                         else (offset - abs(volts), offset + abs(volts)))
+            why = output_refusal(ch, low, high, limit, neg_var.get(), piezo,
+                                 piezo_range)
+            if why:
+                say(why, "bad")
                 return
             buffers[ch] = waveform(mode, volts, volts, freq, offset, rate, n)
         try:
             say(daq.drive(current_device(), buffers, rate), "ok")
         except Exception as exc:                                  # noqa: BLE001
             say(f"output failed: {exc}", "bad")
+            return
+        ramp_over("no ramp running")                # Apply took the outputs over
+        set_command("repeat", buffers, rate,
+                    note="outputs, the command: one second of it (it repeats)")
 
     def zero_outputs():
         try:
             say(daq.zero(current_device(), list(ao_rows)), "ok")
         except Exception as exc:                                  # noqa: BLE001
             say(f"could not zero the outputs: {exc}", "bad")
+            return
+        ramp_over("no ramp running")
+        set_command(None)
+
+    # -- the ramp ---------------------------------------------------------------
+    # One output goes from a start to an end voltage at so many volts a
+    # second, played once by the card's own clock, and stays at the end.
+    # The other ticked outputs hold their DC value meanwhile (one task
+    # drives them all). ``ramp["id"]`` counts the ramps: the ticker of an
+    # old one stops when it sees a newer number.
+    ramp = {"id": 0, "t0": 0.0, "rate": 1.0, "wave": None, "ch": None, "others": {}}
+
+    def ramp_over(text: str) -> None:
+        ramp["id"] += 1
+        ramp["wave"] = None
+        ramp_lbl.config(text=text, fg="#202020")
+
+    def ramp_now():
+        """(volts now, seconds gone, seconds in all), by this PC's clock."""
+        wave, rate = ramp["wave"], ramp["rate"]
+        total = wave.size / rate
+        gone = time.monotonic() - ramp["t0"]
+        return played_once(wave, rate, gone)[1], min(gone, total), total
+
+    def ramp_tick(my_id: int) -> None:
+        if my_id != ramp["id"] or ramp["wave"] is None:
+            return                              # another ramp, Apply, Hold or zero
+        volts, gone, total = ramp_now()
+        name = ramp["ch"].split("/")[-1]
+        if gone >= total:
+            ramp_lbl.config(text=f"ramp done: {name} holds {volts:g} V", fg="#1b5e20")
+            say(f"ramp done: {name} holds {volts:g} V (All outputs 0 V puts it "
+                "back to zero)", "ok")
+            cmd["note"] = (f"outputs, the command: the ramp is done, {name} "
+                           f"holds {volts:g} V")
+            draw_command()
+            return
+        ramp_lbl.config(text=f"ramping {name}: {volts:8.4f} V   "
+                             f"{gone:6.1f} s of {total:.1f} s", fg="#b06000")
+        draw_command()                              # the dot moves along the plan
+        root.after(100, lambda: ramp_tick(my_id))
+
+    def start_ramp():
+        d = found.get(current_device())
+        names = {c.split("/")[-1]: c for c in (d["ao"] if d else [])}
+        ch = names.get(ramp_ch.get())
+        if ch is None:
+            say("pick the output to ramp (the box left of \"from\")", "warn")
+            return
+        try:
+            start, end = float(ramp_from.get()), float(ramp_to.get())
+            vps = float(ramp_vps.get())
+            limit = abs(float(limit_var.get()))
+            card_rate = float(ao_rate_var.get())
+        except ValueError:
+            say("the ramp's start, end and V/s, the limit and the rate must be "
+                "numbers", "bad")
+            return
+        if card_rate <= 0:
+            say("the output rate must be positive", "bad")
+            return
+        try:
+            why = output_refusal(ch, min(start, end), max(start, end), limit,
+                                 neg_var.get(), piezo, piezo_range)
+            if why:
+                raise ValueError(why)
+            others = {}
+            for och, r in ao_rows.items():        # the other ticked outputs hold DC
+                if och == ch or not r["on"].get():
+                    continue
+                if r["mode"].get() != "DC":
+                    raise ValueError(
+                        f"{och.split('/')[-1]} is ticked as a {r['mode'].get()}: for a "
+                        "ramp, set the other ticked outputs to DC or untick them")
+                try:
+                    volts = float(r["volts"].get())
+                except ValueError:
+                    raise ValueError(f"{och.split('/')[-1]}: its V must be a "
+                                     "number") from None
+                why = output_refusal(och, volts, volts, limit, neg_var.get(), piezo,
+                                     piezo_range)
+                if why:
+                    raise ValueError(why)
+                others[och] = volts
+            rate = ramp_rate(vps, card_rate)
+            wave = ramp_wave(start, end, vps, rate, back=ramp_back.get())
+        except ValueError as exc:
+            say(str(exc), "bad")
+            return
+        buffers = {ch: wave}
+        for och, volts in others.items():
+            buffers[och] = np.full(wave.size, volts)
+        try:
+            granted = daq.play_once(current_device(), buffers, rate)
+        except Exception as exc:                                  # noqa: BLE001
+            say(f"ramp failed: {exc}", "bad")
+            return
+        ramp["id"] += 1
+        ramp.update(t0=time.monotonic(), rate=granted, wave=wave, ch=ch, others=others)
+        set_command("once", buffers, granted,
+                    note="outputs, the command: the ramp (thick: played so far, "
+                         "dot: now)")
+        say(f"ramping {ch.split('/')[-1]} from {start:g} V to {end:g} V at {vps:g} V/s"
+            + (" and back" if ramp_back.get() else "")
+            + f": {wave.size / granted:.1f} s"
+            + ("".join(f", {o.split('/')[-1]} held at {v:g} V" for o, v in others.items())),
+            "ok")
+        ramp_tick(ramp["id"])
+
+    def hold_ramp():
+        """Stop a running ramp where it is: the output is driven at the
+        voltage the ramp had reached by this PC's clock, so it lands
+        within a few millivolts of where the card really was."""
+        if ramp["wave"] is None:
+            say("no ramp is running", "warn")
+            return
+        volts, gone, total = ramp_now()
+        ch, others = ramp["ch"], dict(ramp["others"])
+        name = ch.split("/")[-1]
+        if gone >= total:
+            say(f"the ramp has finished: {name} holds {volts:g} V", "ok")
+            return
+        try:
+            rate = float(ao_rate_var.get())
+            n = int(round(rate))
+            buffers = {ch: np.full(n, volts)}
+            for och, v in others.items():
+                buffers[och] = np.full(n, v)
+            daq.drive(current_device(), buffers, rate)
+        except Exception as exc:                                  # noqa: BLE001
+            say(f"could not hold the ramp: {exc}", "bad")
+            return
+        ramp_over(f"held: {name} at about {volts:.4f} V")
+        say(f"ramp stopped: {name} held at about {volts:.4f} V", "ok")
+        cmd["stop"] = gone                          # the picture stops where it did
+        cmd["note"] = (f"outputs, the command: the ramp, held on the way at about "
+                       f"{volts:.4f} V")
+        draw_command()
 
     # ======================================================================
     # Keithley
@@ -922,6 +1306,7 @@ def run(cfg: RigConfig, simulate: bool, autoclose: float | None = None,
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     refresh_devices()
+    draw_command()
     root.after(100, poll)
     if autoclose is not None:
         # A smoke run: inputs on, two outputs driven, the details window,
@@ -939,8 +1324,28 @@ def run(cfg: RigConfig, simulate: bool, autoclose: float | None = None,
             if len(rows) > 1:
                 rows[1]["on"].set(True)
                 rows[1]["volts"].set("2.5")
+            apply_outputs()                 # refused: the sine goes below 0 V
+            neg_var.set(True)
             apply_outputs()
+
+        def smoke_ramp():
+            # a ramp on the third output while the first two hold DC, held
+            # half-way once, then run to its end
+            rows = list(ao_rows.values())
+            if len(rows) < 3:
+                return
+            rows[0]["mode"].set("DC")
+            rows[0]["volts"].set("0.5")
+            ramp_ch.set(list(ao_rows)[2].split("/")[-1])
+            ramp_from.set("0")
+            ramp_to.set("1")
+            ramp_vps.set("2")
+            start_ramp()
+            root.after(250, hold_ramp)
+            root.after(400, lambda: (ramp_vps.set("5"), start_ramp()))
         root.after(400, smoke)
+        root.after(3000, smoke_ramp)
+        root.after(4000, zero_outputs)
         root.after(1200, lambda: (nb.select(kt), k_connect(), zc_var.set(True),
                                   k_do("zero check ON", lambda i: i.zero_check(True))))
         root.after(1600, lambda: (nb.select(at), find_ports(), a_connect(), a_move(False)))
@@ -954,7 +1359,9 @@ def run(cfg: RigConfig, simulate: bool, autoclose: float | None = None,
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--config", type=Path, help="rig config (Keithley address, actuator port)")
+    p.add_argument("--config", type=Path,
+                   help="rig config (which output is the piezo, Keithley address, "
+                        "actuator port)")
     p.add_argument("--simulate", action="store_true", help="a pretend card, no hardware")
     p.add_argument("--zoom", type=float, default=None, help="window scale (Mac: 1.2)")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -966,7 +1373,11 @@ def main(argv: list[str] | None = None) -> int:
     cfg = RigConfig.from_json(args.config) if args.config else RigConfig()
     if args.simulate:
         cfg.simulate = True
-    return run(cfg, simulate=args.simulate, autoclose=args.autoclose, zoom=args.zoom)
+    # Only a config says which output is the piezo; without one the window
+    # cannot know, and says so.
+    piezo = cfg.channels.path(cfg.channels.ao_piezo) if args.config else None
+    return run(cfg, simulate=args.simulate, autoclose=args.autoclose, zoom=args.zoom,
+               piezo=piezo)
 
 
 if __name__ == "__main__":

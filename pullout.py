@@ -166,7 +166,7 @@ log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v70"
+__version__ = "v71"
 
 # What the Saving tab holds when nothing is remembered yet. ``folder`` is
 # the data folder (the day folder is made under it); ``setup_id`` is Igor's
