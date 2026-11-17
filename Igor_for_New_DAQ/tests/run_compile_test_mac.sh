@@ -32,7 +32,7 @@ while [ $# -gt 0 ]; do
     --setup) SETUP="$2"; shift 2;;
     --stubs) STUBS="$2"; shift 2;;
     --include) EXTRA+=("$2"); shift 2;;
-    --smoke) SMOKE=1; shift;;          # simulator + both smoke passes, result paths generated here
+    --smoke) SMOKE=1; shift;;          # simulator + the three smoke passes, result paths generated here
     --run) RUNS+=("$2"); shift 2;;
     --keep) KEEP=1; shift;;
     -h|--help) sed -n 2,20p "$0"; exit 0;;
@@ -55,12 +55,12 @@ MAC_FOLDER="$(posix2mac "$FOLDER")"
 MAC_HERE="$(posix2mac "$HERE")"
 MAC_GEN="$(posix2mac "$GEN")"
 
-if [ "${SMOKE:-0}" = 1 ]; then
+if [ "${SMOKE:-0}" = 1 ]; then      # passes 1 and 2, then pass 3 = piezo safety (0..10 V, never negative)
   STUBS="MX_Sim_for_test"
   EXTRA+=("Smoke_NewDAQ")
-  RUNS+=("ClaudeSmokeRun(\"$MAC_GEN:smoke_result.txt\")" "ClaudeSmokeRun2(\"$MAC_GEN:smoke_result2.txt\")")
+  RUNS+=("ClaudeSmokeRun(\"$MAC_GEN:smoke_result.txt\")" "ClaudeSmokeRun2(\"$MAC_GEN:smoke_result2.txt\")" "ClaudePiezoSafetyRun(\"$MAC_GEN:smoke_result3.txt\")")
   RUN_TIMEOUT=${RUN_TIMEOUT:-600}
-  rm -f "$GEN/smoke_result.txt" "$GEN/smoke_result2.txt"
+  rm -f "$GEN/smoke_result.txt" "$GEN/smoke_result2.txt" "$GEN/smoke_result3.txt"
 fi
 
 # The marker procedure, generated so it carries this machine's absolute path.
@@ -180,7 +180,7 @@ if [ $ok = 1 ] && [ "$NRUNS" -gt 0 ]; then
 fi
 
 if [ "${SMOKE:-0}" = 1 ]; then
-  for r in smoke_result.txt smoke_result2.txt; do
+  for r in smoke_result.txt smoke_result2.txt smoke_result3.txt; do
     if [ -f "$GEN/$r" ]; then
       p=$(tr '\r' '\n' < "$GEN/$r" | grep -c '^PASS'); f=$(tr '\r' '\n' < "$GEN/$r" | grep -c '^FAIL')
       echo "== $r: $p PASS, $f FAIL =="; tr '\r' '\n' < "$GEN/$r" | grep '^FAIL'

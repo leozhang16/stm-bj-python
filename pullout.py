@@ -71,6 +71,21 @@ Which card input channel 2 is on is the config's ``channels.ai_current_2``
 subfolder under Igor's own names, same blocks and trace numbers, while
 channel 1's files stay exactly as they are.
 
+Three things for bringing a rig up (v69, manual chapter 23). The Current
+amplifier box has a "flip the sign" box for each channel: an amplifier
+whose output is the other way round from the Keithley's gives a negative
+current at a positive bias, so a negative conductance, no logarithm and an
+empty trace panel; ticked, that channel's current is -(V - zero) / gain
+(``cal.current_sign``, ``cal.current_sign_2``). A pull that reads negative
+where the junction conducts says so in red, and three in a row stop the
+run. Above the plots, "plot 1: log I and V" draws the record panel's |V|
+and |I| on logarithmic axes and "plot 2: linear G" draws the trace panel
+as G/G0 itself, sign and all. The Monitor window's Sample-rate check
+holds the outputs where they are for one second, again and again, records
+every input in use, counts the numbers through a scratch file (written,
+read back, deleted) and times the card against this PC's clock
+(``stmlab.ratecheck``).
+
 The Piezo box is Igor's PiezoGroupbox: a slider over the piezo's whole
 voltage range (applies when the mouse is released, as Igor's did), Step
 closer / Step apart by Z nm, and under them Igor's readouts -- I (uA),
@@ -139,7 +154,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import plot as session_plots                     # noqa: E402  (plot.py, beside this file)
-from stmlab import analysis, approach, calibrate, igor_scheme, plots, storage, trace   # noqa: E402,E501
+from stmlab import analysis, approach, calibrate, igor_scheme, plots, ratecheck, storage, trace   # noqa: E402,E501
 from stmlab.actuator import ActuatorError                           # noqa: E402
 from stmlab.approach import ApproachError                           # noqa: E402
 from stmlab.config import ConfigError, G0_SIEMENS, RigConfig, validate   # noqa: E402
@@ -151,7 +166,7 @@ log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v68"
+__version__ = "v69"
 
 # What the Saving tab holds when nothing is remembered yet. ``folder`` is
 # the data folder (the day folder is made under it); ``setup_id`` is Igor's
@@ -485,6 +500,12 @@ class Worker(threading.Thread):
         # open end on channel 1 and, when it has one, on channel 2 (None
         # otherwise). For the report; nothing is decided on it.
         self.floors: list = []
+        # Pulls in a row whose channel-1 current read negative where the
+        # junction conducts (analysis.reads_negative): a current channel
+        # whose sign is the wrong way round. Three of them end a run, since
+        # nothing can be accepted like that (SIGN_STOP).
+        self.negative_in_a_row = 0
+        self.sign_cure = ""                    # what to do about it, in words
         self.bias_dirty = True                 # set_bias before the next cycle
         self.busy = False                      # a command is running
         self.current: str | None = None        # its name
@@ -534,7 +555,7 @@ class Worker(threading.Thread):
             if self._quit.is_set():
                 break
             name, args = command[0], command[1:]
-            if name not in ("monitor", "noop"):
+            if name not in ("monitor", "ratecheck", "noop"):
                 self.stop_flag.clear()         # Stop applies to what is running
             self.busy = True
             self.current = name
@@ -596,11 +617,40 @@ class Worker(threading.Thread):
                 "available": bool(m.ai_current_2),
                 "ch1": m.path(m.ai_current),
                 "ch2": m.path(m.ai_current_2) if m.ai_current_2 else None,
-                "gain1": C.preamp_gain_v_per_a, "gain2": C.preamp_gain_2_v_per_a}
+                "gain1": C.preamp_gain_v_per_a, "gain2": C.preamp_gain_2_v_per_a,
+                "sign1": C.sign_of(1), "sign2": C.sign_of(2)}
 
     def cmd_amplifier(self) -> None:
         """Tell the window how the current amplifier is read."""
         self.post("amplifier", **self.amplifier_state())
+
+    def cmd_current_sign(self, channel: int, sign: float) -> None:
+        """Turn one current channel the other way round: the Current
+        amplifier box's "flip the sign". ``cal.current_sign`` for channel
+        1, ``cal.current_sign_2`` for channel 2, +1 or -1. It is arithmetic
+        only: nothing on the rig changes and the bias on the junction stays
+        as it is. The next file carries the new sign."""
+        channel = 2 if int(channel) == 2 else 1
+        sign = -1.0 if float(sign) < 0 else 1.0
+        name = "current_sign_2" if channel == 2 else "current_sign"
+        C = self.cfg.cal
+        if C.sign_of(channel) == sign:
+            self.post("amplifier", **self.amplifier_state())
+            return
+        setattr(C, name, sign)
+        self.cmd_newfile()                     # the config travels with the data
+        self.post("amplifier", **self.amplifier_state())
+        # (The Status box shows three lines: these fit.)
+        if sign < 0:
+            self.status(f"ch {channel}: sign flipped (current = -(V - zero) / "
+                        "gain). The next trace shows it. To keep it, put "
+                        f'"{name}": -1 in the "cal" part of the config file',
+                        level="ok")
+        else:
+            self.status(f"ch {channel}: sign as the amplifier gives it (current "
+                        "= (V - zero) / gain). The next trace shows it. To keep "
+                        f'it, put "{name}": 1 in the "cal" part of the config '
+                        "file", level="ok")
 
     def cmd_current_channels(self, n: int) -> None:
         """Read one output of the current amplifier or both, live: the
@@ -670,6 +720,37 @@ class Worker(threading.Thread):
         self.post("monitor", t=time.monotonic(), record=rec,
                   piezo_v=self.rig.piezo_v, sense_v=sense_v,
                   ch2=self.rig.channel2_of(rec))
+
+    def cmd_ratecheck(self, seconds: float = 1.0) -> None:
+        """The Monitor window's sample-rate check (``stmlab.ratecheck``).
+        Nothing moves: the piezo and the bias are held where they are for
+        ``seconds`` while every input in use records, as in a pull. The
+        numbers the card returned go into a scratch file, the file is read
+        back and counted, and the file is deleted; the time the card took
+        comes from this PC's clock. The end of the record also feeds the
+        readouts, as a monitor sample would."""
+        self.mon.quiet = True
+        try:
+            result = ratecheck.measure(self.rig, seconds)
+        except Exception as exc:                   # noqa: BLE001
+            log.exception("sample-rate check failed")
+            self.post("ratecheck", error=f"{type(exc).__name__}: "
+                                         f"{str(exc).splitlines()[0] if str(exc) else ''}")
+            return
+        finally:
+            self.mon.quiet = False
+        rec = result.pop("record")
+        self.post("ratecheck", **result)
+        keep = min(400, rec.shape[1])
+        tail = rec[:, -keep:]
+        sense = self.rig.last_sense_v
+        sense_v = (float(np.mean(sense[-keep // 2:]))
+                   if sense is not None and sense.size else None)
+        second = self.rig.last_current2_v
+        self.post("monitor", t=time.monotonic(), record=tail,
+                  piezo_v=self.rig.piezo_v, sense_v=sense_v,
+                  ch2=self.rig.channel2_of(
+                      tail, None if second is None else second[-keep:]))
 
     # -- the Keithley 428 ----------------------------------------------------------
 
@@ -1073,6 +1154,14 @@ class Worker(threading.Thread):
                                         require_engaged=self.require_engaged,
                                         g0_open=g0_open)
         disp = tr.displacement_nm(self.cfg)
+        # A current channel whose sign is the wrong way round reads negative
+        # wherever the junction conducts. Nothing is accepted then and the
+        # trace panel shows no line, so the status line says what it is.
+        # A pull whose conductance is negative where the junction conducts
+        # says so, in front of its status line so the box never cuts it off.
+        sign_note, sign_level, negative = self.sign_words(g0, g0_2, tr.voltage_v)
+        if not test:
+            self.negative_in_a_row = self.negative_in_a_row + 1 if negative else 0
         if test:
             self.post("cycle", cycle=cycle, record=tr, g0=g0, disp=disp,
                       verdict=verdict, g0_2=g0_2)
@@ -1080,9 +1169,9 @@ class Worker(threading.Thread):
             if self.save and self.save_test_pulls:
                 self._save(tr, verdict, test=True)
                 saved = f", saved to the TESTPULLS file ({self.n_saved})"
-            self.status(f"test pull done (not counted{saved}); the selector "
-                        f"would say: {verdict.reason}; alignment delay "
-                        f"{tr.delay_samples} samples")
+            self.status(f"{sign_note}test pull done (not counted{saved}); the "
+                        f"selector would say: {verdict.reason}; alignment delay "
+                        f"{tr.delay_samples} samples", sign_level)
             return verdict
         if verdict.accepted:
             self.accepted += 1
@@ -1098,9 +1187,44 @@ class Worker(threading.Thread):
                   counts=self.histogram(), n=self.hist_n,
                   counts2=self.histogram2())
         word = "accepted" if verdict.accepted else "rejected"
-        self.status(f"trace {word}: {verdict.reason}; {self.accepted} accepted "
-                    f"in {self.attempts} attempts")
+        self.status(f"{sign_note}trace {word}: {verdict.reason}; {self.accepted} "
+                    f"accepted in {self.attempts} attempts", sign_level)
         return verdict
+
+    def sign_words(self, g0, g0_2, voltage_v) -> tuple[str, str | None, bool]:
+        """What to say about the signs of one pull: (a note for the front
+        of the status line, its colour, whether channel 1 read negative).
+
+        A negative conductance means the current and the junction voltage
+        have opposite signs. Which of the two is the odd one out is read
+        off the junction voltage (``voltage_v``, raw volts): with its sign
+        right it has the sign of the bias that was set. Channel 1 reading
+        negative is the red case, and three of them in a row end a run
+        (``SIGN_STOP``); ``sign_cure`` is then what to do about it.
+        Channel 2 alone reading negative is said in orange and ends
+        nothing: it is its sign, or an output at its negative rail. A pull
+        that never touched says nothing about the sign and gets no note
+        (``analysis.reads_negative``)."""
+        if analysis.reads_negative(g0):
+            v_seen = self.cfg.cal.voltage_input_sign * float(np.nanmean(voltage_v))
+            if v_seen * self.cfg.ramp.bias_v < 0:
+                self.sign_cure = ('Put the other sign in "voltage_input_sign" '
+                                  "(the config's cal) and start again")
+                return ("THE JUNCTION VOLTAGE HAS THE WRONG SIGN (opposite to the "
+                        'bias), so G is negative: "voltage_input_sign" in the '
+                        "config's cal is the wrong way round.  ", "bad", True)
+            # The box as it stands is the wrong way: tick it, or untick it.
+            verb = "Untick" if self.cfg.cal.sign_of(1) < 0 else "Tick"
+            self.sign_cure = (f'{verb} "flip the sign of ch 1" in the Current '
+                              "amplifier box, then Start N again")
+            return ("CH 1 CURRENT HAS THE WRONG SIGN (opposite to the bias), so G "
+                    f'is negative: {verb.lower()} "flip the sign of ch 1" (Current '
+                    "amplifier box).  ", "bad", True)
+        if g0_2 is not None and analysis.reads_negative(g0_2):
+            return ('ch 2 reads a NEGATIVE conductance (its sign, or an output at '
+                    'its negative rail): "flip the sign of ch 2" turns it.  ',
+                    "warn", False)
+        return "", None, False
 
     require_engaged = False
 
@@ -1153,6 +1277,8 @@ class Worker(threading.Thread):
         done = 0
         R = self.cfg.ramp
         failed = False
+        sign_stop = False
+        self.negative_in_a_row = 0
         while done < n and not self.stop_flag.is_set():
             if R.smash_every and self.attempts and \
                     self.attempts % R.smash_every == 0:
@@ -1168,8 +1294,15 @@ class Worker(threading.Thread):
             if verdict is not None and verdict.accepted:
                 done += 1
             self.readout()
-        if done < n and (self.stop_flag.is_set() or failed):
-            why = "approach failed" if failed else "Stop"
+            if self.negative_in_a_row >= self.SIGN_STOP:
+                # Every pull reads negative: the sign of the current is the
+                # wrong way round and no trace will ever be accepted. Stop
+                # here rather than crash the tip a thousand times for nothing.
+                sign_stop = True
+                break
+        if done < n and (self.stop_flag.is_set() or failed or sign_stop):
+            why = ("approach failed" if failed else
+                   "the current reads negative" if sign_stop else "Stop")
             self.paused = {"remaining": n - done}
             self.run_pauses.append({"after_trace": self.accepted, "why": why,
                                     "stopped": time.time(), "continued": None})
@@ -1178,6 +1311,11 @@ class Worker(threading.Thread):
             # waits; the .h5 stays open for Continue.
             self.flush_igor(why)
             self.post("paused", remaining=n - done)
+            if sign_stop:
+                self.status(f"RUN STOPPED: {self.SIGN_STOP} pulls in a row gave a "
+                            "NEGATIVE conductance on ch 1, so no trace can be "
+                            f"accepted. {self.sign_cure}", "bad")
+                return
             self.status(f"run paused with {n - done} of {n} traces still to "
                         f"take ({self.accepted} accepted so far). Continue "
                         "carries on into the same file; Start N starts a new "
@@ -1187,6 +1325,9 @@ class Worker(threading.Thread):
         self.status(f"run finished: {self.accepted} accepted in "
                     f"{self.attempts} attempts; rejected {self.rejections}"
                     + (f"; saved {files}" if files else "; nothing saved"))
+
+    # Pulls in a row with a negative channel-1 current that end a run.
+    SIGN_STOP = 3
 
     def cmd_continue(self) -> None:
         self.cmd_run(0, resume=True)
@@ -1245,14 +1386,14 @@ class Worker(threading.Thread):
         (``cal.current_zero_v``, the preamp's output at 0 V bias) as a
         current, in uA -- the same quantity, measured the simpler way."""
         C = self.cfg.cal
-        return 0.0, C.current_zero_v / C.preamp_gain_v_per_a * 1e6
+        return 0.0, C.sign_of(1) * C.current_zero_v / C.preamp_gain_v_per_a * 1e6
 
     def izero2(self) -> float:
         """Slot 16 of channel 2's parameters in the ch2 subfolder: what
         Calibrate zero measured on the amplifier's second output, as a
         current in uA (``offsets`` gives channel 1's)."""
         C = self.cfg.cal
-        return C.current_zero_2_v / C.preamp_gain_2_v_per_a * 1e6
+        return C.sign_of(2) * C.current_zero_2_v / C.preamp_gain_2_v_per_a * 1e6
 
     def _note_fields(self) -> dict:
         """What goes into the ConductanceBlock's wave note besides the
@@ -2730,7 +2871,9 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     lo_v, hi_v = cfg.limits.piezo_ao_min_v, cfg.limits.piezo_ao_max_v
     z_var = tk.StringVar(value="5")
 
-    QUIET = ("monitor", "noop")      # commands that do not count as busy
+    # Commands that do not count as busy: they only read (the idle
+    # sampling, the Monitor window's sample-rate check).
+    QUIET = ("monitor", "ratecheck", "noop")
 
     def rig_is_free() -> bool:
         """Nothing but idle sampling is running or queued."""
@@ -2912,13 +3055,34 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         ent.bind("<Return>", lambda _e: apply_settings())
         ent.bind("<FocusOut>", lambda _e: apply_settings())
         gain_entries[path] = ent
+    # Which way round each output is (cal.current_sign, cal.current_sign_2).
+    # Ticked: the current of that channel is -(V - zero) / gain. For an
+    # amplifier whose output goes negative at a positive bias, which gives
+    # a negative conductance, no logarithm, and an empty trace panel.
+    flip_vars = {ch: tk.BooleanVar(value=cfg.cal.sign_of(ch) < 0) for ch in (1, 2)}
+    flip_boxes = {}
+
+    def on_flip(channel: int):
+        want = -1.0 if flip_vars[channel].get() else 1.0
+        if not hand_move("current_sign", channel, want):
+            flip_vars[channel].set(cfg.cal.sign_of(channel) < 0)
+    for col, channel in enumerate((1, 2)):
+        box = ttk.Checkbutton(amp, text=f"flip the sign of ch {channel}",
+                              variable=flip_vars[channel],
+                              command=lambda c=channel: on_flip(c))
+        box.grid(row=2, column=col * 2, columnspan=2, sticky="w", padx=(6, 2),
+                 pady=(0, 1))
+        flip_boxes[channel] = box
     ttk.Label(amp, text="ch 1: the lower-gain output; contact is judged on it. "
                         "ch 2: the higher-gain output; the Break threshold (junction "
                         "open) is judged on it. Both are drawn, ch 1 blue and ch 2 "
                         "red, nothing stitched. A gain says what the amplifier is "
-                        "set to (1e4, 1e7 ...); it programs nothing.",
+                        "set to (1e4, 1e7 ...); it programs nothing. Flip the sign "
+                        "of a channel whose current reads NEGATIVE at a positive "
+                        "bias: an amplifier whose output is the other way round "
+                        "from the Keithley's.",
               font=("Arial", 9), foreground="#444", wraplength=px(540),
-              justify="left").grid(row=2, column=0, columnspan=5, sticky="w",
+              justify="left").grid(row=3, column=0, columnspan=5, sticky="w",
                                    padx=6, pady=(0, 2))
 
     def show_amplifier(p: dict):
@@ -2929,6 +3093,9 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         two_rb.config(state="normal" if p["available"] else "disabled")
         gain_entries[AMPLIFIER_SETTINGS[1]].config(
             state="normal" if p["channels"] == 2 else "disabled")
+        flip_vars[1].set(p["sign1"] < 0)
+        flip_vars[2].set(p["sign2"] < 0)
+        flip_boxes[2].config(state="normal" if p["channels"] == 2 else "disabled")
         if not p["available"]:
             amp_lbl.config(text=f'ch 1 on {p["ch1"]}; for two, name "ai_current_2" '
                                 "in the config's channels")
@@ -3367,6 +3534,21 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     live_moving = tk.BooleanVar(value=False)
     ttk.Checkbutton(top, text="redraw while moving", variable=live_moving).pack(
         side="left", padx=(0, 3))
+    # How the first two panels are drawn. Plot 1 (the record): |V| and |I|
+    # on logarithmic axes, so a small current beside a large one is still a
+    # line. Plot 2 (the trace): G/G0 itself on a linear axis, sign and all,
+    # where the default is its logarithm. Both redraw what is on screen.
+    log_iv = tk.BooleanVar(value=False)
+    lin_g = tk.BooleanVar(value=False)
+    def replot():
+        """A check box changed what the panels carry: draw again, and fit
+        the panels around their new labels."""
+        live["layout_stale"] = True
+        redraw_now()
+    ttk.Checkbutton(top, text="plot 1: log I and V", variable=log_iv,
+                    command=replot).pack(side="left", padx=(10, 3))
+    ttk.Checkbutton(top, text="plot 2: linear G", variable=lin_g,
+                    command=replot).pack(side="left", padx=(4, 3))
     banner = tk.Label(top, text="", font=("Arial", 9, "bold"), fg="#b06000")
     banner.pack(side="right")
     ttk.Button(top, text="Readback window",
@@ -3384,7 +3566,11 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     from collections import deque
     mon_state: dict = {"win": None, "on": None, "last": 0.0,
                        "t": deque(maxlen=3000), "v": deque(maxlen=3000),
-                       "i": deque(maxlen=3000), "g": deque(maxlen=3000)}
+                       "i": deque(maxlen=3000), "g": deque(maxlen=3000),
+                       # the sample-rate check: its tick box, when the last
+                       # one was sent, how many came back, how to show one
+                       "rate_on": None, "rate_last": 0.0, "rate_n": 0,
+                       "rate_show": None}
 
     def monitor_wants_sample() -> bool:
         """Idle sampling runs for the Piezo box's readouts (its checkbox) or
@@ -3394,6 +3580,12 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         win = mon_state["win"]
         return (win is not None and win.winfo_exists()
                 and mon_state["on"] is not None and mon_state["on"].get())
+
+    def rate_check_wanted() -> bool:
+        """The Monitor window is open and its sample-rate box is ticked."""
+        win = mon_state["win"]
+        return (win is not None and win.winfo_exists()
+                and mon_state["rate_on"] is not None and mon_state["rate_on"].get())
 
     def open_monitor():
         if mon_state["win"] is not None and mon_state["win"].winfo_exists():
@@ -3412,6 +3604,49 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         secs_var = tk.StringVar(value="30")
         ttk.Label(bar, text="seconds shown").pack(side="left", padx=(12, 2))
         ttk.Entry(bar, textvariable=secs_var, width=5).pack(side="left")
+
+        # The sample-rate check (stmlab.ratecheck): is the card really
+        # handing over the configured number of samples a second on every
+        # input in use? While the box is ticked and the rig is idle the
+        # worker holds the outputs where they are for one second, records,
+        # counts the numbers through a scratch file (written, read back,
+        # deleted) and times the card against this PC's clock; the result
+        # is shown here, and the line flashes, once a second.
+        rate_box = ttk.LabelFrame(win, text="Sample-rate check")
+        rate_box.pack(fill="x", padx=8, pady=(6, 0))
+        mon_state["rate_on"] = tk.BooleanVar(value=False)
+        ttk.Checkbutton(rate_box,
+                        text="check the sample rate: record 1 s on every input in "
+                             "use, count it through a scratch file, again and "
+                             "again (nothing moves)",
+                        variable=mon_state["rate_on"]).pack(anchor="w", padx=6,
+                                                            pady=(2, 0))
+        rate_big = tk.Label(rate_box, text="not checked yet: tick the box",
+                            font=("Arial", 18, "bold"), anchor="w", fg="#444444")
+        rate_big.pack(fill="x", padx=6, pady=(2, 0))
+        rate_note = tk.Label(rate_box, text="", font=("Courier", 9), justify="left",
+                             anchor="w")
+        rate_note.pack(fill="x", padx=6, pady=(0, 4))
+        rate_plain = rate_big.cget("bg")           # the colour between flashes
+
+        def show_rate(p: dict):
+            """One finished check: the headline, the lines, and a flash."""
+            if not win.winfo_exists():
+                return
+            mon_state["rate_n"] += 1
+            head, text = ratecheck.lines(p)
+            good = bool(p.get("ok")) and not p.get("error")
+            if p.get("error"):
+                # The card refused: do not ask it again every second.
+                mon_state["rate_on"].set(False)
+                text = text + ["the box was unticked; tick it to try again"]
+            rate_big.config(text=head, fg="#006000" if good else "#b00000")
+            rate_note.config(text="\n".join(text + [f"check number {mon_state['rate_n']}"]))
+            rate_big.config(bg="#ffe066")           # the flash: a new number is in
+            win.after(250, lambda: rate_big.winfo_exists()
+                      and rate_big.config(bg=rate_plain))
+        mon_state["rate_show"] = show_rate
+
         fig3 = Figure(figsize=(7.0, 5.2), dpi=100)
         ax_v, ax_i, ax_g = fig3.subplots(3, 1, sharex=True)
         canvas3 = FigureCanvasTkAgg(fig3, master=win)
@@ -3612,11 +3847,33 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         ax.update(record=grid[0, 0], trace=grid[0, 1],
                   piezo=grid[1, 0], hist=grid[1, 1])
         fig.tight_layout(pad=2.0, w_pad=3.0)   # room for the right-hand axes
+        live["layout_stale"] = True            # and once more when there are labels
         if live["paused"] and browse["session"] is not None:
             draw_saved(browse["session"], int(idx_var.get()) - 1)
         else:
             live["dirty"] = True
             canvas.draw_idle()
+
+    def relayout():
+        """Fit the panels around their labels once more, after the first
+        drawing of a layout and after a check box has changed the labels.
+        The right-hand axes get their labels only when there is something
+        to draw, which is after rebuild() laid the empty figure out; without
+        this the current's label sits on the next panel's. Once per layout,
+        so the panels do not shift from trace to trace."""
+        if live.get("layout_stale") and ax["record"].lines and ax["trace"].lines:
+            live["layout_stale"] = False
+            # Tick labels and axis labels decide the layout. Titles and notes
+            # written on a panel do not: they can be wider than the panel, and
+            # the layout would shrink the panels to make room for them.
+            for a_ in fig.axes:
+                a_.title.set_in_layout(False)
+                for words in a_.texts:
+                    words.set_in_layout(False)
+            try:
+                fig.tight_layout(pad=2.0, w_pad=3.0)
+            except Exception:                   # noqa: BLE001
+                log.debug("tight_layout failed", exc_info=True)
 
     def pull_frame(cyc):
         """The default x range of the record panel: the pull, with a little
@@ -3638,14 +3895,15 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                                      marks=cyc.marks, frame=frame,
                                      title="this cycle: junction V and current"
                                            + (" (framed on the pull)" if frame
-                                              else ""))
+                                              else ""), log=log_iv.get())
         if tr is not None and tr.get("record") is not None:
             rec = tr["record"]
             # g0_2: the same pull on channel 2 of a two-channel amplifier
             # (None with one channel) -- blue and red on the one axis.
             plots.plot_trace(ax["trace"], cfg, tr["g0"], tr["disp"], tr["verdict"],
                              title=f"trace {worker.attempts}",
-                             sense_v=rec.piezo_sense_v, g0_2=tr.get("g0_2"))
+                             sense_v=rec.piezo_sense_v, g0_2=tr.get("g0_2"),
+                             linear=lin_g.get())
         if cyc is not None and cyc.t:
             plots.plot_piezo(ax["piezo"], cfg, np.array(cyc.t), np.array(cyc.piezo_v),
                              np.array(cyc.sense_v), marks=cyc.marks,
@@ -3657,6 +3915,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             ax["hist"].clear()
             ax["hist"].set_title("histogram: 0 traces (new experiment)", fontsize=9)
         apply_limits()
+        relayout()
         canvas.draw_idle()
 
     def draw_igor(s: IgorDay, i: int):
@@ -3679,10 +3938,10 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             # Back to raw volts with this config's calibration, which the
             # record panel undoes again: an exact round trip.
             rec = np.stack([t["voltage_v"] * C.voltage_input_sign,
-                            t["current_a"] * C.preamp_gain_v_per_a + C.current_zero_v])
+                            C.amps_to_volts(t["current_a"])])
             plots.plot_record(ax["record"], scfg, rec, fs,
                               title=f"{who}: junction V and current (Voltage and "
-                                    "Current blocks)")
+                                    "Current blocks)", log=log_iv.get())
         else:
             ax["record"].clear()
             ax["record"].set_title(f"{who}: no Voltage/Current block saved", fontsize=9)
@@ -3690,7 +3949,8 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         if t["extension_nm"] is not None:
             sense_v = t["extension_nm"] / C.sense_nm_per_volt + C.sense_zero_v
         plots.plot_trace(ax["trace"], scfg, g0, disp, verdict, title=who, sense_v=sense_v,
-                         g0_2=t.get("g0_2"))        # channel 2, from the ch2 subfolder
+                         g0_2=t.get("g0_2"),        # channel 2, from the ch2 subfolder
+                         linear=lin_g.get(), saved=True)
         tt = np.arange(g0.size) / fs
         p = t["params"]
         # Slot 3 is the piezo position after the pull, slot 0 the pull.
@@ -3706,6 +3966,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         banner.config(text=f"BROWSING {s.name}: {who}, Igor's numbering; "
                            f"live plots paused")
         apply_limits()
+        relayout()
         canvas.draw_idle()
 
     def draw_saved(s, i: int):
@@ -3725,9 +3986,10 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         g0_2 = s.conductance(i, channel=2) if s.has_current2 else None
         plots.plot_record(ax["record"], scfg, np.stack([voltage, current]), fs,
                           title=f"saved trace {i + 1}: junction V and current "
-                                f"(the file keeps the trace only)")
+                                f"(the file keeps the trace only)", log=log_iv.get())
         plots.plot_trace(ax["trace"], scfg, g0, disp, verdict,
-                         title=f"saved trace {i + 1}", sense_v=sense, g0_2=g0_2)
+                         title=f"saved trace {i + 1}", sense_v=sense, g0_2=g0_2,
+                         linear=lin_g.get(), saved=True)
         t = np.arange(voltage.size) / fs
         cmd = start_v - scfg.cal.nm_to_piezo_volts(disp)
         plots.plot_piezo(ax["piezo"], scfg, t, cmd, sense,
@@ -3741,6 +4003,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         banner.config(text=f"BROWSING {Path(browse['path']).name} trace {i + 1}; "
                            f"live plots paused")
         apply_limits()
+        relayout()
         canvas.draw_idle()
 
     rebuild()
@@ -3869,6 +4132,9 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                                  else f"{live['file']}: {p['n']} test pulls")
                 file_lbl.config(text="writing " + "; ".join(words) if words
                                 else "nothing is being written")
+            elif kind == "ratecheck":
+                if mon_state["rate_show"] is not None:
+                    mon_state["rate_show"](p)
             elif kind == "monitor":
                 rec = p["record"]
                 tail = rec[:, rec.shape[1] // 2:]
@@ -3914,7 +4180,13 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             live["busy_since"] = None
             if status2.cget("text"):
                 working(False)
-        if (monitor_wants_sample() and not worker.busy and worker.commands.empty()
+        if (rate_check_wanted() and not worker.busy and worker.commands.empty()
+                and time.monotonic() - mon_state["rate_last"] > 1.0):
+            # One second on every input, counted and timed; its last
+            # samples feed the readouts as a monitor sample would.
+            mon_state["rate_last"] = mon_state["last"] = time.monotonic()
+            worker.send("ratecheck")
+        elif (monitor_wants_sample() and not worker.busy and worker.commands.empty()
                 and time.monotonic() - mon_state["last"] > 0.3):
             mon_state["last"] = time.monotonic()
             worker.send("monitor")
@@ -3922,7 +4194,8 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             draw_live()
             live["dirty"] = False
             banner.config(text="", fg="#b06000")
-        elif worker.busy and not live["paused"] and live_moving.get():
+        elif (worker.busy and worker.current not in QUIET and not live["paused"]
+              and live_moving.get()):
             # A move in progress: redraw the record, piezo and approach
             # panels from the monitor every few polls, so the staircase
             # grows as you watch. Only when asked: by default the panels
@@ -3940,7 +4213,8 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                             ax["record"], cfg, np.array(cyc.rec_t),
                             np.array(cyc.rec_v), np.array(cyc.rec_i),
                             marks=cyc.marks,
-                            title="this cycle: junction V and current (live)")
+                            title="this cycle: junction V and current (live)",
+                            log=log_iv.get())
                     apply_limits()
                     canvas.draw_idle()
         if not live["paused"] and banner.cget("text").startswith("BROWSING"):
@@ -4005,6 +4279,11 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         root.after(600, on_run)
         root.after(900, open_limits)                 # smoke test: it must open
         root.after(950, open_monitor)
+        # v69: the sample-rate check of the Monitor window (it runs whenever
+        # the worker is idle), and the two plot check boxes on and off again.
+        root.after(1000, lambda: mon_state["rate_on"].set(True))
+        root.after(1300, lambda: (log_iv.set(True), lin_g.set(True), redraw_now()))
+        root.after(2700, lambda: (log_iv.set(False), lin_g.set(False), redraw_now()))
         root.after(1200, lambda: (limits.update(
             trace={"x": (-0.5, 3.0), "y": (-7.0, 1.0), "y2": None}), redraw_now()))
         root.after(3000, lambda: (lim_state["win"].destroy(),   # and close again
@@ -4024,6 +4303,9 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                                   svars["ramp.bias_v"].set("900")))
         root.after(6500, lambda: svars["ramp.bias_v"].set("150"))
         root.after(6700, lambda: (ai_mode_var.set(MODE_WORDS["rse"]), on_ai_mode()))
+        # v69: flip the sign of channel 1 and put it back, as the box does.
+        root.after(6710, lambda: worker.send("current_sign", 1, -1.0))
+        root.after(6730, lambda: worker.send("current_sign", 1, 1.0))
         if has_ch2:
             # A rig with a two-channel amplifier. Its gains must be where
             # they are seen without looking for them: the Current amplifier

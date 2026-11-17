@@ -29,6 +29,12 @@
 //   * Every task remembers its channel list, read channel counts are checked
 //     against the task's channel count, and any mismatch is appended to the
 //     string sim_Errors so a test can assert on it.
+//   * Piezo safety: every 2-channel write is checked against the range its piezo
+//     channel (the first channel) was created with. A write with a sample outside
+//     that range, or with a NaN, is REFUSED like NI-DAQmx does (nothing reaches the
+//     "piezo"), counted in sim_NumRefusedWrites and reported in sim_Errors.
+//     sim_PiezoMinAsked / sim_PiezoMaxAsked remember the lowest and highest piezo
+//     voltage any write has asked for since Sim_Init, refused writes included.
 // ---------------------------------------------------------------------------
 
 Function Sim_Init()
@@ -49,12 +55,18 @@ Function Sim_Init()
 	Variable/G sim_CEVolts = 0
 	Variable/G sim_NumWrites = 0
 	Variable/G sim_NumReads = 0
+	Variable/G sim_PiezoMinAsked = inf		// lowest / highest piezo volts any write asked for since Sim_Init
+	Variable/G sim_PiezoMaxAsked = -inf
+	Variable/G sim_NumRefusedWrites = 0	// writes with a piezo sample outside the channel range (a real card refuses them)
+	Variable/G sim_PiezoChanLo = NaN		// the range the piezo channel was created with, noted at each 2-channel write
+	Variable/G sim_PiezoChanHi = NaN
 	String/G sim_Errors = ""
 	String/G sim_Log = ""
 	Make/O/D/N=0 sim_PiezoHist, sim_BiasHist
 	Make/O/T/N=0 sim_TaskChans		// text wave: index = task id - 100, value = "chan1;chan2;..."
 	Make/O/N=0 sim_TaskNumChans
 	Make/O/N=0 sim_TaskIsAO
+	Make/O/D/N=0 sim_TaskLo0, sim_TaskHi0	// the range of each task's FIRST channel (for the AO task: the piezo)
 	SetRandomSeed 0.5
 End
 
@@ -117,12 +129,16 @@ Function MXCreateTask(globalName)
 	Wave/T chans = sim_TaskChans
 	Wave nch = sim_TaskNumChans
 	Wave isAO = sim_TaskIsAO
+	Wave lo0 = sim_TaskLo0
+	Wave hi0 = sim_TaskHi0
 	Variable id = nextID
 	nextID += 1
-	Redimension/N=(id-100+1) chans, nch, isAO
+	Redimension/N=(id-100+1) chans, nch, isAO, lo0, hi0
 	chans[id-100] = ""
 	nch[id-100] = 0
 	isAO[id-100] = 0
+	lo0[id-100] = NaN
+	hi0[id-100] = NaN
 	NVAR/Z v = $globalName
 	if (NVAR_Exists(v))
 		v = id
@@ -133,17 +149,23 @@ Function MXCreateTask(globalName)
 	return id
 End
 
-Static Function Sim_AddChan(task, chan, ao)
+Static Function Sim_AddChan(task, chan, ao, lo, hi)
 	Variable task
 	String chan
-	Variable ao
+	Variable ao, lo, hi
 	Wave/T chans = sim_TaskChans
 	Wave nch = sim_TaskNumChans
 	Wave isAO = sim_TaskIsAO
+	Wave lo0 = sim_TaskLo0
+	Wave hi0 = sim_TaskHi0
 	Variable i = task - 100
 	if (i < 0 || i >= numpnts(chans))
 		Sim_Err("AddChan: unknown task id " + num2str(task))
 		return -1
+	endif
+	if (nch[i] == 0)
+		lo0[i] = lo		// the first channel of the task
+		hi0[i] = hi
 	endif
 	chans[i] += chan + ";"
 	nch[i] += 1
@@ -156,7 +178,7 @@ Function MXCreateAIVoltageChan(task, chan, lo, hi)
 	String chan
 	Variable lo, hi
 	Sim_LogIt("AI " + num2str(task) + " " + chan + " [" + num2str(lo) + "," + num2str(hi) + "]")
-	return Sim_AddChan(task, chan, 0)
+	return Sim_AddChan(task, chan, 0, lo, hi)
 End
 
 Function MXCreateAOVoltageChan(task, chan, lo, hi)
@@ -164,7 +186,7 @@ Function MXCreateAOVoltageChan(task, chan, lo, hi)
 	String chan
 	Variable lo, hi
 	Sim_LogIt("AO " + num2str(task) + " " + chan + " [" + num2str(lo) + "," + num2str(hi) + "]")
-	return Sim_AddChan(task, chan, 1)
+	return Sim_AddChan(task, chan, 1, lo, hi)
 End
 
 Function MXCfgSampClkTiming(task, rate, sampleMode, samplesPerChan)
@@ -227,6 +249,24 @@ Function MXWriteAnalogF64(task, timeout, numChans, w)
 	endif
 	nw += 1
 	if (numChans == 2)
+		// piezo safety: the piezo block is the first n points
+		NVAR lowAsked = sim_PiezoMinAsked
+		NVAR highAsked = sim_PiezoMaxAsked
+		NVAR numRefused = sim_NumRefusedWrites
+		NVAR chanLow = sim_PiezoChanLo
+		NVAR chanHigh = sim_PiezoChanHi
+		Wave lo0 = sim_TaskLo0
+		Wave hi0 = sim_TaskHi0
+		chanLow = lo0[i]
+		chanHigh = hi0[i]
+		WaveStats/Q/R=[0, n-1] w
+		lowAsked = min(lowAsked, V_min)
+		highAsked = max(highAsked, V_max)
+		if (V_numNans > 0 || V_numINFs > 0 || V_min < chanLow || V_max > chanHigh)
+			numRefused += 1
+			Sim_Err("Write REFUSED: piezo block " + num2str(V_min) + " to " + num2str(V_max) + " V (NaNs: " + num2str(V_numNans) + ") is outside the channel range " + num2str(chanLow) + " to " + num2str(chanHigh) + " V")
+			return -1
+		endif
 		Wave ph = sim_PiezoHist
 		Wave bh = sim_BiasHist
 		Variable old = numpnts(ph)

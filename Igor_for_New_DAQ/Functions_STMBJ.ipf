@@ -7,6 +7,69 @@
 // no coarse actuator. See PORTING_SPEC.md and README.md in this folder.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// [NEWDAQ-SAFETY] PIEZO VOLTAGE LIMITS (2026-11-16)
+// The Z piezo on this rig is unipolar: the voltage sent to it must stay between
+// K_PiezoMinVolt = 0 V (fully retracted) and K_PiezoMaxVolt = 10 V. It must NEVER
+// get a negative voltage. (The ported code had kept the old bipolar range -10..+10 V.)
+// What keeps it there:
+//   1. Every number on its way to the piezo output is limited to that range first:
+//      when Start Writing is pressed (StartHighResWritingTask), in every single move
+//      (WriteToHighRes), and in every sample of a pull and the hold after it
+//      (GenerateTrace). Those are the only places that fill the piezo half of
+//      HighResWriteWave.
+//   2. A pull that would leave the range is refused before it starts (GenerateTrace),
+//      so a trace never has a silently clipped distance axis.
+//   3. The loops that step the piezo stop at the end of the range.
+//   4. The DAQ channel itself is created with the range 0..10 V and the slider on the
+//      panel runs 0..10 V.
+// Change the two constants ONLY if the piezo driver box is replaced by a bipolar one.
+// tests/Smoke_NewDAQ.ipf (ClaudePiezoSafetyRun) asks the slider, the step buttons, the write
+// function, Start Writing, a pull, make-contact, the smash and Find Offset for a voltage
+// outside the range, on the simulated card.
+// ---------------------------------------------------------------------------
+Constant K_PiezoMinVolt = 0
+Constant K_PiezoMaxVolt = 10
+
+// v limited to K_PiezoMinVolt..K_PiezoMaxVolt. A broken number (NaN or Inf) gives
+// K_PiezoMinVolt: fully retracted, the safe end.
+Function PiezoSafeVolt(v)
+	Variable v
+
+	if (numtype(v) != 0)
+		return K_PiezoMinVolt
+	endif
+	return limit(v, K_PiezoMinVolt, K_PiezoMaxVolt)
+End
+
+// G_PiezoOffset_nm is where the code thinks the piezo is (nm; volts = nm / K_ZPiezoScale).
+// If that number is outside the allowed range, put it on the nearest end of the range.
+// Returns 1 if it had to be changed, 0 if it was fine.
+Function PiezoOffsetIntoRange()
+	NVAR DCOffset_nm= G_PiezoOffset_nm
+
+	Variable v= DCOffset_nm/K_ZPiezoScale
+	Variable safe= PiezoSafeVolt(v)
+	if (numtype(v)==0 && abs(safe-v) < 1e-9)
+		return 0	// inside the range (to a nanovolt): the number is left alone
+	endif
+	DCOffset_nm= safe*K_ZPiezoScale
+	return 1
+End
+
+// 1 if the piezo can move by deltaZ_nm (+ = closer, - = apart) from where it is and stay
+// inside the allowed range, 0 if not. The stepping loops ask this before every step.
+Function PiezoCanMove(deltaZ_nm)
+	Variable deltaZ_nm
+
+	NVAR DCOffset_nm= G_PiezoOffset_nm
+	Variable v= (DCOffset_nm + deltaZ_nm)/K_ZPiezoScale
+	if (numtype(v) != 0)
+		return 0
+	endif
+	return (v >= K_PiezoMinVolt && v <= K_PiezoMaxVolt)
+End
+
 Function Declare_STMBJ_Variables()
 	// PXI Variables
 	Variable/G G_AcquisitionRate= 40000
@@ -41,8 +104,8 @@ Function Declare_STMBJ_Variables()
 	Variable/G G_SenseSaveCheck=0
 	Variable/G G_PiezoWaveSaveCheck=0	
       	
-      	Variable/G G_PiezoChanHigh=10
-      	Variable/G G_PiezoChanLow=-10
+      	Variable/G G_PiezoChanHigh=K_PiezoMaxVolt	// [NEWDAQ-SAFETY] 10 V. Shown for reference only: the code reads the constant K_PiezoMaxVolt
+      	Variable/G G_PiezoChanLow=K_PiezoMinVolt	// [NEWDAQ-SAFETY] 0 V (was -10). Shown for reference only: the code reads the constant K_PiezoMinVolt
       	
 	// General Variables
 	String/G G_PathDate	// encodes date and setup ID into path and folder where data is saved
@@ -332,6 +395,23 @@ Function GenerateTrace()
 	Variable NumSeg=NumPtsInAppliedWaves/WriteBufferSize
 	Variable PiezoOrigin=DCOffset_nm/K_ZPiezoScale
 
+	// [NEWDAQ-SAFETY] The pull is PiezoBiasWave (volts, starting at 0 and going negative) added to where the piezo
+	// [NEWDAQ-SAFETY] is now. If any point of it would leave K_PiezoMinVolt..K_PiezoMaxVolt the whole trace is refused
+	// [NEWDAQ-SAFETY] here, before anything is started or written: clipping the ramp instead would save a trace whose
+	// [NEWDAQ-SAFETY] distance axis is wrong. Return value -2 stops the experiment (SingleBreakJunctionAttempt).
+	WaveStats/Q PiezoBiasWave
+	Variable PullLowVolt= PiezoOrigin+V_min
+	Variable PullHighVolt= PiezoOrigin+V_max
+	if (V_npnts<1 || V_numNans>0 || V_numINFs>0 || numtype(PiezoOrigin)!=0 || PullLowVolt < K_PiezoMinVolt-1e-9 || PullHighVolt > K_PiezoMaxVolt+1e-9)
+		Variable PullBadVolt= PullLowVolt
+		if (PullHighVolt > K_PiezoMaxVolt+1e-9)
+			PullBadVolt= PullHighVolt
+		endif
+		Print "GenerateTrace: pull NOT started. The piezo is at "+num2str(PiezoOrigin)+" V and this pull would take it to "+num2str(PullBadVolt)+" V; it is only allowed "+num2str(K_PiezoMinVolt)+" to "+num2str(K_PiezoMaxVolt)+" V."
+		Print "The surface is too close to one end of the piezo range, and the tip is still touching it. Move the coarse stage BY HAND until contact happens near the middle of the range (about 5 V), then start again."
+		return -2
+	endif
+
 	Redimension/D/N=(WriteBufferSize*2) HighResWriteWave
 	Redimension/D/N=(NumPtsIn*K_NumAIChans) HighResReadWave	// [NEWDAQ] 3 channel blocks: voltage, current, piezo sense
 	//[NEWDAQ-REMOVED: LowRes] Redimension/D/N=(NumPtsIn*3) LowResReadWave
@@ -354,7 +434,7 @@ Function GenerateTrace()
 	// The reading tasks were just started and are happening simultaneously to the writing tasks
 	for (k=0;k<NumSeg;k+=1)	   
 		// PiezoBiasWave needs to be offset to starting piezo displacement
-		HighResWriteWave[0,WriteBufferSize-1]=PiezoBiasWave[k*WriteBufferSize+p]+PiezoOrigin
+		HighResWriteWave[0,WriteBufferSize-1]=limit(PiezoBiasWave[k*WriteBufferSize+p]+PiezoOrigin, K_PiezoMinVolt, K_PiezoMaxVolt)	// [NEWDAQ-SAFETY] every sample kept in range (the check above has already refused a pull that would not fit)
 		// [NEWDAQ-NOTE] Pre-existing behaviour, deliberately NOT changed by the port: on the line below p is the
 		// [NEWDAQ-NOTE] destination index (WriteBufferSize..2*WriteBufferSize-1), so segment k of the BIAS wave is
 		// [NEWDAQ-NOTE] taken from JunctionBiasWave[(k+1)*WriteBufferSize ...], one segment AHEAD of the piezo segment
@@ -372,9 +452,11 @@ Function GenerateTrace()
 
 	// save final state of piezo at the end of JunctionBiasWave
 	DCOffset_nm+= PiezoBiasWave[NumPtsInAppliedWaves-1]*K_ZPiezoScale
+	PiezoOffsetIntoRange()	// [NEWDAQ-SAFETY]
+	Variable EndPiezoVolt= PiezoSafeVolt(DCOffset_nm/K_ZPiezoScale)	// [NEWDAQ-SAFETY]
 	
 	// Do one more write
-	HighResWriteWave[0,WriteBufferSize-1]=DCOffset_nm/K_ZPiezoScale
+	HighResWriteWave[0,WriteBufferSize-1]=EndPiezoVolt
 	HighResWriteWave[WriteBufferSize,WriteBufferSize*2-1]=-(TipBias/1000)
 	MXWriteAnalogF64(G_OD1,CardTimeout,2,HighResWriteWave)
 	
@@ -970,6 +1052,8 @@ Function OffsetVoltage()
 	NVAR Vol= G_Vol
 	NVAR Cur= G_Cur
 	NVAR Cond= G_Cond
+	NVAR DCOffset_nm= G_PiezoOffset_nm
+	Variable StartOffset_nm= DCOffset_nm	// [NEWDAQ-SAFETY] where the piezo was when this measurement started
 
 	Redimension/D/N=(2*NumPts) CurrentWave, VoltageWave
 	Redimension/D/N=(2*NumPts) ConductanceWave
@@ -989,7 +1073,12 @@ Function OffsetVoltage()
 	// from point 0 to NumPts tip bias is in the negative region
 	For(i= 0; i < 2*NumPts; i+= 1)
 		// check contact at 100mV
-		HighResContact()
+		if (HighResContact() == -1)
+			// [NEWDAQ-SAFETY] no contact anywhere up to the end of the piezo range: give up, go back, keep the old Vzero
+			Print "Offset measurement stopped: no contact found inside the piezo range. Vzero and Izero were NOT changed."
+			WriteToHighRes(StartOffset_nm-DCOffset_nm, TipBias)
+			return -1
+		endif
 		// apply low bias
 		WriteToHighRes(0,TipBiasRamp[i])
 		Sleep/T 3
@@ -1013,6 +1102,7 @@ Function OffsetVoltage()
 		
 	WriteToHighRes(0, TipBias)
 	
+	return 1	// [NEWDAQ-SAFETY] 1 = measured and fitted; -1 (above) = gave up, nothing measured
 End
 
 // CheckBox: measure and save Vzero offset periodically
@@ -1047,9 +1137,13 @@ Function SaveOffset()
 
 				J+= 1	
 
-				OffsetVoltage()
+				Variable OffsetResult= OffsetVoltage()	// [NEWDAQ-SAFETY] -1 = gave up (no contact inside the piezo range)
 				OffsetWave[J - 1]= Vzero
 				IzeroWave[J - 1]= Izero 
+				if (OffsetResult != 1)
+					OffsetWave[J - 1]= NaN	// [NEWDAQ-SAFETY] not measured this time: no number, rather than the old one again
+					IzeroWave[J - 1]= NaN
+				endif
 				PullOutNumberWave[J - 1]= PullOutNumber
 				
 				Variable i
@@ -1059,9 +1153,11 @@ Function SaveOffset()
 					PullOutNumberWave[i]= NaN
 				EndFor
 				
-				DoWindow/F Izero
-				if(V_flag==0)
-					execute "Izero()"
+				if (OffsetResult == 1)	// [NEWDAQ-SAFETY] the Izero graph needs the fit, which exists only after a finished measurement
+					DoWindow/F Izero
+					if(V_flag==0)
+						execute "Izero()"
+					endif
 				endif
 							
 //				DoWindow/F Izero_Time
@@ -1095,9 +1191,15 @@ Function HighResContact()
 		if(Cond > ConductanceThreshold)
 			break
 		endif
+		// [NEWDAQ-SAFETY] at the top of the piezo range with no contact: stop instead of stepping for ever
+		if (!PiezoCanMove(StepIn))
+			Print "HighResContact: piezo at the top of its range ("+num2str(K_PiezoMaxVolt)+" V) and still no contact."
+			return -1
+		endif
 		// move to contact
 		WriteToHighRes(StepIn, TipBiasContact)
 	While(1)
+	return 1
 End
 
 // Ou of contact with current, voltage, conductance measured by HighRes card
@@ -1121,9 +1223,15 @@ Function HighResOutOfContact()
 		if(Cond < NoiseThreshold)
 			break
 		endif
+		// [NEWDAQ-SAFETY] fully retracted and still in contact: stop instead of asking for a negative voltage
+		if (!PiezoCanMove(StepOut))
+			Print "HighResOutOfContact: piezo fully retracted ("+num2str(K_PiezoMinVolt)+" V) and still in contact. Move the coarse stage back BY HAND."
+			return -1
+		endif
 		// move out of contact
 		WriteToHighRes(StepOut,TipBiasContact)
 	While(1)
+	return 1
 End
 
 // Measures current at zero V applied bias, at the present tip location
@@ -1197,7 +1305,12 @@ Function WriteToHighRes(deltaZ_nm,TipBias)
 	Variable DCOffset
 	
 	DCOffset_nm= DCOffset_nm + deltaZ_nm
-	DCOffset= DCOffset_nm / K_ZPiezoScale
+	// [NEWDAQ-SAFETY] whatever was asked for, the piezo stays inside K_PiezoMinVolt..K_PiezoMaxVolt (0..10 V)
+	Variable AskedVolt= DCOffset_nm / K_ZPiezoScale
+	if (PiezoOffsetIntoRange())
+		Print "Piezo: "+num2str(AskedVolt)+" V was asked for; held at "+num2str(DCOffset_nm/K_ZPiezoScale)+" V (the piezo is only allowed "+num2str(K_PiezoMinVolt)+" to "+num2str(K_PiezoMaxVolt)+" V)."
+	endif
+	DCOffset= PiezoSafeVolt(DCOffset_nm / K_ZPiezoScale)
 
 	Redimension/D/N=(WriteBufferSize*2) HighResWriteWave
 
@@ -1283,8 +1396,8 @@ Function HighResMakeContact()
 	NVAR ConductanceThreshold = G_ConductanceThreshold
 	NVAR ApproachStepSize = G_MakeContactApproachStepSize
 	NVAR DCOffset_nm=G_PiezoOffset_nm	// in nm
-	NVAR PiezoChanHigh= G_PiezoChanHigh
-	NVAR PiezoChanLow= G_PiezoChanLow
+	//[NEWDAQ-SAFETY] NVAR PiezoChanHigh= G_PiezoChanHigh	(the limits are the constants K_PiezoMinVolt / K_PiezoMaxVolt now)
+	//[NEWDAQ-SAFETY] NVAR PiezoChanLow= G_PiezoChanLow
 	NVAR CurrentVoltGain= G_CurrentVoltGain
 	
 	NVAR NoiseThreshold= G_EndOfTraceNoiseThreshold
@@ -1325,7 +1438,9 @@ Function HighResMakeContact()
 		
 		// Try to move them apart until contact is broken
 		do  
-			if (DCOffset_nm/K_ZPiezoScale<=PiezoChanLow||DCOffset_nm/K_ZPiezoScale>=PiezoChanHigh)
+			// [NEWDAQ-SAFETY] was: if (DCOffset_nm/K_ZPiezoScale<=PiezoChanLow||DCOffset_nm/K_ZPiezoScale>=PiezoChanHigh)
+			// Moving out needs room BELOW: stop when the next step out would go under K_PiezoMinVolt (0 V).
+			if (!PiezoCanMove(RetractionStep))
 				print "Could not separate contacts"
 				print "Piezo overextended, voltage= "+num2str(DCOffset_nm/K_ZPiezoScale)
 				return -3
@@ -1364,7 +1479,10 @@ Function HighResMakeContact()
 	
 	// Now push tip and substrate together until contact is made
 	do
-		if (DCOffset_nm/K_ZPiezoScale >= PiezoChanHigh||DCOffset_nm/K_ZPiezoScale <= PiezoChanLow)
+		// [NEWDAQ-SAFETY] was: if (DCOffset_nm/K_ZPiezoScale >= PiezoChanHigh||DCOffset_nm/K_ZPiezoScale <= PiezoChanLow)
+		// Moving in needs room ABOVE: stop when the next step in would go over K_PiezoMaxVolt (10 V). Starting
+		// from 0 V is normal on a unipolar piezo, so the lower end is not an error here.
+		if (!PiezoCanMove(ApproachStepSize))
 			print "Could not make contact"
 			print "Piezo overextended, voltage= "+num2str(DCOffset_nm/K_ZPiezoScale)	
 			return -2
@@ -1672,13 +1790,15 @@ Function SingleBreakJunctionAttempt()
 	NVAR PullOutAttempt= G_PullOutAttempt
 	
 	Variable MakeContactReturnVal
+	Variable TraceReturnVal	// [NEWDAQ-SAFETY]
 	
 	PullOutAttempt+=1
 	
 	MakeContactReturnVal=HighResMakeContact()
 	
 	if (MakeContactReturnVal==1)
-		if (GenerateTrace()==1)
+		TraceReturnVal= GenerateTrace()
+		if (TraceReturnVal==1)
 			if(TestTrace()==1)
 				// Save Offset Voltage and Current if VzeroCheckBox is checked. 
 				SaveOffset()
@@ -1686,6 +1806,9 @@ Function SingleBreakJunctionAttempt()
 				// Updates JunctionBias wave with new Vzero. 
 				CreateInputs()
 			endif
+		elseif (TraceReturnVal==-2)
+			// [NEWDAQ-SAFETY] the pull did not fit in the piezo range (GenerateTrace printed why): stop the experiment
+			return -1
 		endif
 	elseif (MakeContactReturnVal<-1)
 		return -1
@@ -1763,7 +1886,7 @@ End
 // Steps the piezo toward the sample by G_MakeContactApproachStepSize nm per step and reads
 // the current after each step (3-channel read of G_ID1, ReadWaveSize samples per channel).
 // Stops when |I| >= 0.1 uA (same stop level the old actuator loop used), or when the piezo
-// voltage would leave [G_PiezoChanLow, G_PiezoChanHigh], or on the Alt key.
+// voltage would leave [K_PiezoMinVolt, K_PiezoMaxVolt] (0 to 10 V), or on the Alt key.
 // At the limit it prints: "Approach: piezo at its limit with no contact. Move the coarse stage
 // closer BY HAND (a fraction of a turn), then press Start Approach again."
 Function HighResCardApproach()
@@ -1780,8 +1903,8 @@ Function HighResCardApproach()
 	NVAR TipBias= G_TipBias
 	NVAR DCOffset_nm= G_PiezoOffset_nm
 	NVAR ApproachStepSize= G_MakeContactApproachStepSize	// nm per piezo step (replaces the actuator step)
-	NVAR PiezoChanHigh= G_PiezoChanHigh
-	NVAR PiezoChanLow= G_PiezoChanLow
+	//[NEWDAQ-SAFETY] NVAR PiezoChanHigh= G_PiezoChanHigh	(the limits are the constants K_PiezoMinVolt / K_PiezoMaxVolt now)
+	//[NEWDAQ-SAFETY] NVAR PiezoChanLow= G_PiezoChanLow
 	SVAR HighResOutputTaskStatus= G_HighResOutputTaskStatus	// the piezo is moved through the writing task G_OD1
 
 	Variable keys
@@ -1840,7 +1963,7 @@ Function HighResCardApproach()
 
 		// the next step must stay inside the output range of the piezo channel
 		NextPiezoVolt= (DCOffset_nm + ApproachStepSize)/K_ZPiezoScale
-		if (NextPiezoVolt >= PiezoChanHigh || NextPiezoVolt <= PiezoChanLow)
+		if (NextPiezoVolt >= K_PiezoMaxVolt || NextPiezoVolt <= K_PiezoMinVolt)	// [NEWDAQ-SAFETY] the constants (were the globals G_PiezoChanHigh / G_PiezoChanLow)
 			Print "Approach: piezo at its limit ("+num2str(DCOffset_nm/K_ZPiezoScale)+" V) with no contact."
 			// [NEWDAQ] retract to where this approach started BEFORE the coarse stage is moved by hand; otherwise the
 			// [NEWDAQ] piezo would stay fully extended and the next Start Approach could not step anywhere

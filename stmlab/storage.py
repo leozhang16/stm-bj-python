@@ -70,6 +70,8 @@ class SessionWriter:
             "current2_v, when present, is channel 2 of a two-channel current "
             "amplifier in raw volts (gain cal.preamp_gain_2_v_per_a, zero "
             "cal.current_zero_2_v); current_v is then channel 1. "
+            "The current of a channel is cal.current_sign (channel 2: "
+            "cal.current_sign_2) times (volts - zero) / gain. "
             "Conductance is derived, not stored.")
         log.info("writing to %s", self.path)
         return self
@@ -754,7 +756,8 @@ def save_cv_cycles(path: str | Path, cfg: RigConfig, cycles: list,
         h5.attrs["units"] = (
             "applied_v is the commanded electrode potential in volts. "
             "tip_current_v is raw preamp output in volts; divide by "
-            "cal.preamp_gain_v_per_a for amps. Current is derived, not stored.")
+            "cal.preamp_gain_v_per_a and multiply by cal.current_sign for "
+            "amps. Current is derived, not stored.")
 
         h5.create_dataset("applied_v", data=first.applied_v, dtype="float64")
         h5.create_dataset("keep", data=first.keep, dtype="bool")

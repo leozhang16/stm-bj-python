@@ -131,6 +131,19 @@ class Rig:
         return getattr(self._session, "effective_rate_hz",
                        self.cfg.ramp.sample_rate_hz)
 
+    @property
+    def last_play_seconds(self) -> float | None:
+        """How long the card took over the last play, by this PC's clock
+        (``DaqSession.last_play_seconds``); None on the simulated card,
+        where a play takes no real time. For the sample-rate check."""
+        return getattr(self._session, "last_play_seconds", None)
+
+    @property
+    def last_read_seconds(self) -> float | None:
+        """The same stopwatch when the inputs of the last play were all read
+        (``DaqSession.last_read_seconds``); None on the simulated card."""
+        return getattr(self._session, "last_read_seconds", None)
+
     # -- the funnel -------------------------------------------------------
 
     def set_ai_terminal(self, name: str) -> None:

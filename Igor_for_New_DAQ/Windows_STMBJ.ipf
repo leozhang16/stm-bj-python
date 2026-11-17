@@ -144,7 +144,7 @@ Window BreakJunctionMeasurement() : Panel
 	DrawRect -4,153,-4,153
 	Slider SliderPos_Z,pos={47,610},size={301,53},disable=2,proc=SetPiezoBiasFromSlider
 	Slider SliderPos_Z,font="Arial",fSize=12
-	Slider SliderPos_Z,limits={-10,10,0.01},value= 0,live= 0,vert= 0,ticks= 20,thumbColor= (26112,0,0)
+	Slider SliderPos_Z,limits={0,10,0.01},value= 0,live= 0,vert= 0,ticks= 20,thumbColor= (26112,0,0)	// [NEWDAQ-SAFETY] was limits={-10,10,0.01}: the piezo never gets a negative voltage (K_PiezoMinVolt / K_PiezoMaxVolt in Functions_STMBJ.ipf)
 	SetVariable MoveZStepSize,pos={161,581},size={75,18},title="Z (nm)",font="Arial"
 	SetVariable MoveZStepSize,limits={0,100,1},value= G_PiezoDeltaZ_nm
 	SetVariable setvar43,pos={45,405},size={143,20},proc=SetGain,title="Gain ( log(V/A) )"

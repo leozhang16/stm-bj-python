@@ -54,6 +54,26 @@ class SimulatedDaqSession:
         # 1 is the same, sample for sample, with one channel read or two.
         self.rng2 = np.random.default_rng([int(seed), 2])
         self.granted_rate_hz = cfg.ramp.sample_rate_hz
+        # DaqSession.last_play_seconds is how long the card took over the
+        # last play by the PC's clock. A simulated play takes no real time,
+        # so there is nothing to report: None, always.
+        self.last_play_seconds: float | None = None
+        self.last_read_seconds: float | None = None
+        # Which way round this amplifier's two outputs are, fixed here for
+        # the session: what sim.amplifier_output_sign says, or, when that is
+        # None, the way round the config says the real amplifier is
+        # (cal.current_sign) -- so a rig's config simulates right, and
+        # un-ticking "flip the sign" later shows a wrong sign.
+        sim = getattr(cfg, "sim", None)
+
+        def way_round(value, channel: int) -> float:
+            if value is None:
+                return cfg.cal.sign_of(channel)
+            return -1.0 if value < 0 else 1.0
+        self.amplifier_output_sign = way_round(
+            getattr(sim, "amplifier_output_sign", None), 1)
+        self.amplifier_output_sign_2 = way_round(
+            getattr(sim, "amplifier_output_sign_2", None), 2)
         self.idle_behavior = "maintain"
         self.ai_terminal_set: list[str] = []      # every live switch, for tests
         self.current_channels_set: list[int] = []
@@ -199,7 +219,10 @@ class SimulatedDaqSession:
         k = getattr(self, "keithley", None)
         if k is not None and getattr(k, "suppress_on", False):
             current_a = current_a - k.suppress_ua * 1e-6
-        current_v = current_a * cal.preamp_gain_v_per_a + cal.current_zero_v
+        # Which way round the simulated amplifier's outputs are (set when
+        # the session was made: see __init__).
+        out_sign, out_sign_2 = self.amplifier_output_sign, self.amplifier_output_sign_2
+        current_v = out_sign * current_a * cal.preamp_gain_v_per_a + cal.current_zero_v
 
         current_v += self.rng.normal(0.0, self.noise_v_rms, current_v.shape)
         voltage_v = node_v + self.rng.normal(
@@ -229,7 +252,7 @@ class SimulatedDaqSession:
             gain2 = cal.preamp_gain_2_v_per_a
             k_t = 1.380649e-23 * 295.0
             noise2_a = np.sqrt(4.0 * k_t * self.channel2_bandwidth_hz / gain2)
-            current2_v = (current_a * gain2 + cal.current_zero_2_v
+            current2_v = (out_sign_2 * current_a * gain2 + cal.current_zero_2_v
                           + self.rng2.normal(0.0, noise2_a * gain2, current_a.shape)
                           + self.rng2.normal(0.0, self.noise_v_rms, current_a.shape))
             self.last_current2_v = np.clip(current2_v, -limit, limit)

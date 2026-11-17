@@ -7,8 +7,8 @@
 `stmlab/plots.py`, `plot.py`, `pullout.py` v66 (the Current amplifier box),
 v67 (the junction-open test on channel 2: `Rig.is_open`,
 `Rig.open_side_of`, `TraceRecord.open_side_g0`, `analysis.open_side`; the
-simulated card's noise, `sim.ai_noise_v_rms`) and v68 (the box in the
-Keithley box's place).
+simulated card's noise, `sim.ai_noise_v_rms`), v68 (the box in the
+Keithley box's place) and v69 (the sign of each channel: chapter 23).
 Tests: `tests/test_two_channel.py`. Config: `configs/newrig_2ch.json`.*
 
 ## What it is
@@ -147,6 +147,7 @@ Keithley box is where it always was.
 |---|---|
 | one channel / two channels | switches live between reading channel 1 alone and reading both. The card's input task is rebuilt, as for the Input mode; the piezo and the bias stay where they are. Refused while the tip is in contact, and greyed out when the config names no `ai_current_2`. To keep the choice for the next launch, put `"current_channels": 2` in the config, as the status line says |
 | Gain ch 1 (V/A), Gain ch 2 (V/A) | what the amplifier is set to, typed in: `1e4`, `1e7`, `5e7`. They tell the arithmetic and program nothing, so set the amplifier itself first. They are settings like the others: checked against the safety rules as you type, applied on Enter or Apply, and an accepted change closes the open file so that every file carries one gain. To keep them, put them in the config's `cal` |
+| flip the sign of ch 1, flip the sign of ch 2 (v69) | for an amplifier whose output is the other way round from the Keithley's: the current reads negative at a positive bias, the conductance is negative, and the trace panel stays empty. Ticked, that channel's current is `-(V - zero) / gain`. Arithmetic only: nothing on the rig changes. Refused while a command is running. To keep it, put `"current_sign": -1` (channel 2: `"current_sign_2": -1`) in the config's `cal`. Chapter 23 has the whole story |
 
 Channel 1's gain is the same number the Keithley box shows as an exponent.
 Setting either one moves the other, as long as the gain is a whole decade.
@@ -262,7 +263,12 @@ Saving tab have a `channel` box for the same choices.
 3. `python rigcheck.py` reads any input live. Put a known current through
    the amplifier and check each output against its gain before trusting the
    numbers in the config.
-4. In `pullout.py`, with the junction open, press Calibrate zero and read
+4. Take one pull. If the status line starts with `CH 1 CURRENT IS NEGATIVE`
+   and the trace panel says so in red, the amplifier's output is the other
+   way round from the Keithley's: tick "flip the sign of ch 1" in the
+   Current amplifier box (chapter 23). The Monitor window's Sample-rate
+   check (same chapter) shows which inputs are read and how fast.
+5. In `pullout.py`, with the junction open, press Calibrate zero and read
    the `ch 2` line: a few millivolts at most, not RAILED. Bring the tip into
    contact: channel 1 shows the contact current, and channel 2 the same
    current through its own gain, a thousand times channel 1's volts for

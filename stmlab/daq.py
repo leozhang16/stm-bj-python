@@ -33,6 +33,7 @@ arrive faster than the consumer, which at one pull per second they do not.
 from __future__ import annotations
 
 import logging
+import time
 import warnings
 
 import numpy as np
@@ -123,6 +124,18 @@ class DaqSession:
         self._ao_running = False
         self._retriggerable = True
         self.granted_rate_hz: float | None = None
+        # How long the card took over the last play, start to done, by this
+        # PC's clock: n samples at the card's rate plus a few milliseconds
+        # of starting and stopping. The Monitor window's sample-rate check
+        # (stmlab.ratecheck) divides the one by the other. None before the
+        # first play.
+        self.last_play_seconds: float | None = None
+        # The same stopwatch read again when the inputs of that play were
+        # all in the PC's hands. On a healthy card that is a few
+        # milliseconds after the outputs finished; inputs that sample
+        # slower than the outputs would take longer, and the sample-rate
+        # check says so.
+        self.last_read_seconds: float | None = None
         self.idle_behavior: str = "unknown"
         # Piezo sense readback from the last play, (n,) volts, or None when
         # this rig has no sense line.
@@ -474,9 +487,11 @@ class DaqSession:
             self._sense.stop()
             self._sense.start()
 
+        started = time.perf_counter()
         self._ao.start()             # fires ao/StartTrigger -> AI begins
         self._ao_running = True
         self._ao.wait_until_done(timeout=timeout_s)
+        self.last_play_seconds = time.perf_counter() - started
 
         data = np.asarray(self._ai.read(number_of_samples_per_channel=n,
                                         timeout=timeout_s), dtype=float)
@@ -494,6 +509,7 @@ class DaqSession:
             sense = self._sense.read(number_of_samples_per_channel=n,
                                      timeout=timeout_s)
             self.last_sense_v = np.asarray(sense, dtype=float).ravel()
+        self.last_read_seconds = time.perf_counter() - started
         if data.shape[0] > 2:
             data = data[:2]
         # AO is left running: the outputs hold their last sample, which is how

@@ -102,6 +102,44 @@ def to_conductance(current_v: np.ndarray,
         return amps / (denominator * G0_SIEMENS)
 
 
+def reads_negative(g0, floor_g0: float = 0.1, above: float = 10.0,
+                   share: float = 0.9, least: int = 20) -> bool:
+    """Does this conductance trace read NEGATIVE where the junction conducts?
+
+    That is what a current channel whose sign is the wrong way round looks
+    like: the current and the junction voltage have opposite signs, so
+    every conductance in contact comes out negative, its logarithm does
+    not exist, and the trace panel and the histogram stay empty
+    (``cal.current_sign`` / ``cal.current_sign_2`` put it right).
+
+    The test looks only at the samples where the junction clearly
+    conducts: those at least ``floor_g0`` in size, or at least ``above``
+    times the typical (median) size of the trace, whichever is the lower
+    bar. In a pull these are the samples in contact, and whatever plateau
+    stands clear of the noise. When at least ``share`` of them are
+    negative the channel reads negative.
+
+    A junction that stays open is noise around its zero and has no sample
+    that stands ten times clear of itself, so it is never flagged: not
+    when half of the noise is negative, and not when the zero is a little
+    off and all of it sits slightly below zero (a pull that never touched
+    says nothing about the sign). Neither is a trace with fewer than
+    ``least`` conducting samples.
+    """
+    g = np.asarray(g0, dtype=float).ravel()
+    g = g[np.isfinite(g)]
+    if g.size < least:
+        return False
+    size = np.abs(g)
+    bar = min(float(floor_g0), float(above) * float(np.median(size)))
+    if not bar > 0:
+        return False
+    conducting = g[size >= bar]
+    if conducting.size < least:
+        return False
+    return bool(np.mean(conducting < 0) >= share)
+
+
 def displacement_nm(n_samples: int, ramp: RampConfig,
                     sample_rate_hz: float | None = None) -> np.ndarray:
     """Tip displacement axis for a pull, in nm, starting at 0.

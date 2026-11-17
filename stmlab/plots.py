@@ -56,11 +56,25 @@ def channel_labels(cfg: RigConfig) -> tuple[str, str]:
 # One record: what the inputs saw during a play
 # --------------------------------------------------------------------------
 
+def _mostly_negative(y: np.ndarray) -> bool:
+    """Is the middle of this series below zero? (For the labels of a log
+    axis, which cannot show a sign.)"""
+    y = np.asarray(y, dtype=float)
+    y = y[np.isfinite(y)]
+    return bool(y.size and np.median(y) < 0)
+
+
 def plot_record_series(ax, cfg: RigConfig, t_s: np.ndarray, voltage_v: np.ndarray,
                        current_v: np.ndarray, marks: dict | None = None,
                        title: str = "record",
-                       frame: tuple[float, float] | None = None) -> None:
+                       frame: tuple[float, float] | None = None,
+                       log: bool = False) -> None:
     """Junction voltage (mV, left) and current (uA, right) against time (s).
+
+    With ``log`` both y axes are logarithmic and carry the SIZE of the
+    signal, |V| and |I|: a current of a few nA next to one of a few uA is
+    then still a line and not a flat zero. A log axis cannot show a sign,
+    so each label says when its signal is negative.
 
     ``voltage_v`` and ``current_v`` are raw volts, rows 0 and 1 of what the
     card read; the voltage sign and the preamp gain from the config turn
@@ -79,15 +93,28 @@ def plot_record_series(ax, cfg: RigConfig, t_s: np.ndarray, voltage_v: np.ndarra
     i_ua = C.volts_to_amps(np.asarray(current_v, dtype=float)) * 1e6
 
     ax.clear()
+    ax2 = _twin(ax)
+    ax2.set_visible(True)
+    v_label, i_label = "junction (mV)", "current (uA)"
+    if log:
+        # The size of each signal, zeros left out (a log axis has no zero).
+        v_neg, i_neg = _mostly_negative(v_mv), _mostly_negative(i_ua)
+        with np.errstate(invalid="ignore"):
+            v_mv = np.where(np.abs(v_mv) > 0, np.abs(v_mv), np.nan)
+            i_ua = np.where(np.abs(i_ua) > 0, np.abs(i_ua), np.nan)
+        if np.isfinite(v_mv).any():
+            ax.set_yscale("log")
+        if np.isfinite(i_ua).any():
+            ax2.set_yscale("log")
+        v_label = "|junction| (mV), log" + (", NEGATIVE" if v_neg else "")
+        i_label = "|current| (uA), log" + (", NEGATIVE" if i_neg else "")
     ax.plot(t, v_mv, color=C_V, lw=0.8, label="junction V (mV)")
-    ax.set_ylabel("junction (mV)", color=C_V, fontsize=8)
+    ax.set_ylabel(v_label, color=C_V, fontsize=8)
     ax.tick_params(axis="y", colors=C_V, labelsize=8)
     ax.tick_params(axis="x", labelsize=8)
     ax.set_xlabel("time (s)", fontsize=8)
-    ax2 = _twin(ax)
-    ax2.set_visible(True)
     ax2.plot(t, i_ua, color=C_I, lw=0.8, label="current (uA)")
-    ax2.set_ylabel("current (uA)", color=C_I, fontsize=8)
+    ax2.set_ylabel(i_label, color=C_I, fontsize=8)
     ax2.tick_params(axis="y", colors=C_I, labelsize=8)
     ok = np.isfinite(t)
     if frame is not None:
@@ -105,17 +132,19 @@ def plot_record_series(ax, cfg: RigConfig, t_s: np.ndarray, voltage_v: np.ndarra
 
 
 def plot_record(ax, cfg: RigConfig, record: np.ndarray, fs: float,
-                spike_front: int | None = None, title: str = "record") -> None:
+                spike_front: int | None = None, title: str = "record",
+                log: bool = False) -> None:
     """One (2, n) record, raw volts, against time in seconds from its start;
     the alignment spike, if ``spike_front`` is given, is marked where it was
-    *written* (it appears in the data a group delay later)."""
+    *written* (it appears in the data a group delay later). ``log``: both
+    axes logarithmic, as in :func:`plot_record_series`."""
     M = cfg.channels
     n = record.shape[1]
     marks = {}
     if spike_front is not None and 0 <= spike_front < n:
         marks["spike written"] = spike_front / fs
     plot_record_series(ax, cfg, np.arange(n) / fs, record[M.ROW_VOLTAGE],
-                       record[M.ROW_CURRENT], marks=marks, title=title)
+                       record[M.ROW_CURRENT], marks=marks, title=title, log=log)
 
 
 # --------------------------------------------------------------------------
@@ -125,11 +154,25 @@ def plot_record(ax, cfg: RigConfig, record: np.ndarray, fs: float,
 def plot_trace(ax, cfg: RigConfig, g0: np.ndarray, disp_nm: np.ndarray,
                verdict=None, title: str = "trace",
                sense_v: np.ndarray | None = None, smooth: int = 101,
-               g0_2: np.ndarray | None = None) -> None:
+               g0_2: np.ndarray | None = None, linear: bool = False,
+               saved: bool = False) -> None:
     """log10(G/G0) against displacement, Igor's PullOutLowG.
 
     Horizontal lines at 1 G0 and at the break threshold; the title carries
     the selection verdict when one is given.
+
+    With ``linear`` the y axis is G/G0 itself, not its logarithm: the
+    conductance as it was computed, sign and all, with a line at 0 as
+    well. The y range is fitted to the data (the odd wild sample left
+    out), and always shows 0 to 1.2 G0.
+
+    A channel whose conductance is NEGATIVE where the junction conducts
+    (:func:`analysis.reads_negative`: the current and the junction voltage
+    have opposite signs) has no logarithm, so on the log axis its line is
+    off the bottom of the plot. The panel then says so in red, and what to
+    do about it, instead of standing empty. ``saved`` says the trace is
+    one from a file, where the cure is not a box to tick: the file was
+    taken that way.
 
     With ``g0_2`` -- the same pull as channel 2 of a two-channel amplifier
     read it -- both are drawn on the one axis, channel 1 (``g0``) in blue
@@ -150,37 +193,80 @@ def plot_trace(ax, cfg: RigConfig, g0: np.ndarray, disp_nm: np.ndarray,
     R, C = cfg.ramp, cfg.cal
     ax.clear()
     ok = verdict is None or getattr(verdict, "accepted", True)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        y = np.log10(np.clip(g0, 1e-12, None))
-    if g0_2 is None:
+    g1 = np.asarray(g0, dtype=float)
+    g2 = None if g0_2 is None else np.asarray(g0_2, dtype=float)
+    # What is drawn: G/G0 itself, or its logarithm (Igor's picture). The
+    # lines at 1 G0 and at the break threshold are drawn in the same units.
+    if linear:
+        y, y2 = g1, g2
+        one, brk = 1.0, R.break_g0
+    else:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            y = np.log10(np.clip(g1, 1e-12, None))
+            y2 = None if g2 is None else np.log10(np.clip(g2, 1e-12, None))
+        one, brk = 0.0, np.log10(R.break_g0)
+    if g2 is None:
         ax.plot(disp_nm, y, color=C_G if ok else C_REJ, lw=0.8)
-        ax.axhline(0.0, color=C_CMD, lw=0.6, ls="--", alpha=0.7)
-        ax.axhline(np.log10(R.break_g0), color=C_SENSE, lw=0.6, ls=":", alpha=0.7)
+        ax.axhline(one, color=C_CMD, lw=0.6, ls="--", alpha=0.7)
+        ax.axhline(brk, color=C_SENSE, lw=0.6, ls=":", alpha=0.7)
     else:
         # Two channels: blue under, red over, so that channel 2 stays
         # visible where it carries on below channel 1's noise. A rejected
         # trace is drawn paler. The reference lines turn grey here, since
         # blue and red now mean the channels.
-        with np.errstate(divide="ignore", invalid="ignore"):
-            y2 = np.log10(np.clip(np.asarray(g0_2, dtype=float), 1e-12, None))
         name1, name2 = channel_labels(cfg)
         alpha = 1.0 if ok else 0.45
         ax.plot(disp_nm, y, color=C_CH1, lw=0.8, alpha=alpha, label=name1)
         ax.plot(np.asarray(disp_nm)[:y2.size], y2, color=C_CH2, lw=0.8,
                 alpha=alpha * A_CH2, label=name2)
-        ax.axhline(0.0, color=C_REF, lw=0.6, ls="--", alpha=0.7)
-        ax.axhline(np.log10(R.break_g0), color=C_REF, lw=0.6, ls=":", alpha=0.7)
+        ax.axhline(one, color=C_REF, lw=0.6, ls="--", alpha=0.7)
+        ax.axhline(brk, color=C_REF, lw=0.6, ls=":", alpha=0.7)
         ax.legend(fontsize=7, loc="lower left", frameon=False)
     x0, x1 = float(disp_nm[0]), float(disp_nm[-1])
     ax.set_xlim(x0, x1)
-    # One more decade with channel 2 on the plot: its floor lies lower.
-    ax.set_ylim(-7.5 if g0_2 is None else -8.5, 1.0)
+    if linear:
+        ax.axhline(0.0, color=C_REF, lw=0.6, alpha=0.7)
+        # Fitted to the data, the wildest half per cent at each end left out
+        # (one sample divided by a junction voltage near zero must not set
+        # the scale), and always with 0 to 1.2 G0 in view.
+        seen = np.concatenate([a[np.isfinite(a)] for a in (g1, g2)
+                               if a is not None])
+        lo, hi = (np.percentile(seen, [0.5, 99.5]) if seen.size else (0.0, 1.2))
+        lo, hi = min(float(lo), 0.0), max(float(hi), 1.2)
+        pad = 0.06 * (hi - lo)
+        ax.set_ylim(lo - pad, hi + pad)
+        ax.set_ylabel("G / G0 (linear)", fontsize=8)
+    else:
+        # One more decade with channel 2 on the plot: its floor lies lower.
+        ax.set_ylim(-7.5 if g2 is None else -8.5, 1.0)
+        ax.set_ylabel("log10 (G / G0)", fontsize=8)
     ax.set_xlabel("displacement (nm)", fontsize=8)
-    ax.set_ylabel("log10 (G / G0)", fontsize=8)
     ax.tick_params(labelsize=8)
     if verdict is not None:
         title = f"{title}: {verdict.reason}" if verdict.accepted \
             else f"{title}: REJECTED, {verdict.reason}"
+    # A channel that reads negative where the junction conducts: say so.
+    negative = [name for name, g in (("ch 1", g1), ("ch 2", g2))
+                if g is not None and analysis.reads_negative(g)]
+    if negative:
+        who = " and ".join(negative)
+        title = f"{title}  [{who} NEGATIVE]"
+        if not linear:
+            cure = ("This is saved data: it was taken that way.\n"
+                    "Tick \"plot 2: linear G\" to see the trace as it is."
+                    if saved else
+                    f"The box \"flip the sign\" for {who} in the Current\n"
+                    "amplifier box turns it round. Or tick\n"
+                    "\"plot 2: linear G\" to see the trace as it is.")
+            ax.text(0.5, 0.5,
+                    f"{who}: the conductance is NEGATIVE here\n"
+                    "(current and junction voltage have opposite signs).\n"
+                    "A negative number has no logarithm, so the line\n"
+                    "is off this plot.\n\n" + cure,
+                    transform=ax.transAxes, ha="center", va="center",
+                    fontsize=9, color="#b00000",
+                    bbox=dict(boxstyle="round", fc="#fff4f4", ec="#b00000",
+                              alpha=0.95))
     ax.set_title(title, fontsize=9)
     ax.grid(True, alpha=0.3)
 

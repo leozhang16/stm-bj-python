@@ -309,7 +309,7 @@ class CyclicVoltammogram(GraphWindow):
         gain = self.cfg.cal.preamp_gain_v_per_a
         for k, cyc in enumerate(cycles):
             x = np.asarray(cyc.applied_v) * 1e3
-            y = np.asarray(cyc.tip_current_v) / gain * 1e6
+            y = self.cfg.cal.sign_of(1) * np.asarray(cyc.tip_current_v) / gain * 1e6
             keep = np.asarray(cyc.keep, dtype=bool)
             y = np.where(keep, y, np.nan)
             last = k == len(cycles) - 1

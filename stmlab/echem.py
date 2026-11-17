@@ -271,7 +271,8 @@ def _run_cv_simulated(cfg, kind, applied, keep, n_cycles, seed):
     for c in range(1, n_cycles + 1):
         current_a = _simulated_cell_current_a(applied, cfg.echem.cv_rate_hz,
                                               rng)
-        tip_v = current_a * cfg.cal.preamp_gain_v_per_a
+        # (the simulated amplifier is the way round the config says)
+        tip_v = cfg.cal.sign_of(1) * current_a * cfg.cal.preamp_gain_v_per_a
         we_mv = applied * 1000.0 + rng.normal(0, 0.05, applied.size) \
             if kind == "highres" else None
         out.append(CVCycle(c, applied.copy(), tip_v, we_mv, keep.copy(),

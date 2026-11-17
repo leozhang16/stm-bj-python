@@ -376,6 +376,20 @@ class Calibration:
     preamp_gain_2_v_per_a: float = 1e9
     current_zero_2_v: float = 0.0
 
+    # Which way round the amplifier's output is, for each channel: +1 or -1.
+    #     current = current_sign * (V_out - zero) / gain
+    # +1 is the Keithley 428 and every rig before the two-channel amplifier:
+    # with Igor's wiring (the bias output carries -TipBias) a positive tip
+    # bias gives a positive output. An amplifier whose output is the other
+    # way round gives a NEGATIVE current at a positive bias. The conductance
+    # is then negative, a negative number has no logarithm, and the trace
+    # panel and the histogram stay empty. -1 turns that channel the right
+    # way round; nothing else changes (the bias on the junction is the same
+    # as it always was). The window's Current amplifier box has a "flip
+    # the sign" box for each channel.
+    current_sign: float = 1.0
+    current_sign_2: float = 1.0
+
     # Displacement per volt **at the DAQ output**. Igor: K_ZPiezoScale = 62.
     # This is an end-to-end number: it already includes the gain of the piezo
     # driver box, so hv_amp_gain below is documentation, not arithmetic.
@@ -422,10 +436,24 @@ class Calibration:
         """Resting offset of current channel 1 or 2, in volts."""
         return self.current_zero_2_v if channel == 2 else self.current_zero_v
 
+    def sign_of(self, channel: int = 1) -> float:
+        """+1.0 or -1.0: which way round current channel 1 or 2's output is
+        (``current_sign``, ``current_sign_2``)."""
+        sign = self.current_sign_2 if channel == 2 else self.current_sign
+        return -1.0 if sign < 0 else 1.0
+
     def volts_to_amps(self, v: float | Any, channel: int = 1) -> Any:
         """Preamp output volts -> junction current in amps. ``channel`` 2
-        is the second output of a two-channel amplifier."""
-        return (v - self.zero_of(channel)) / self.gain_of(channel)
+        is the second output of a two-channel amplifier. The one place the
+        current is computed: zero, gain and sign are all applied here."""
+        return self.sign_of(channel) * (v - self.zero_of(channel)) \
+            / self.gain_of(channel)
+
+    def amps_to_volts(self, amps: float | Any, channel: int = 1) -> Any:
+        """The inverse of ``volts_to_amps``: the amplifier output, in volts,
+        for a current (zero and sign included)."""
+        return self.sign_of(channel) * amps * self.gain_of(channel) \
+            + self.zero_of(channel)
 
     def volts_to_g0(self, v: float | Any, bias_v: float | Any,
                     channel: int = 1) -> Any:
@@ -649,6 +677,20 @@ class SimConfig:
     # 1e4 V/A output and near 1e-6 G0 on a 1e7 V/A one.
     ai_noise_v_rms: float | None = None
 
+    # Which way round the SIMULATED amplifier's outputs are. None (the
+    # default): the way round the config says the real one is, that is
+    # ``cal.current_sign`` / ``cal.current_sign_2`` as they are when the
+    # program starts. A rig's config then simulates as that rig behaves
+    # once its signs are right, whatever they are; and un-ticking "flip
+    # the sign" during a simulated session shows what a wrong sign looks
+    # like. +1 is the Keithley 428's way (a positive tip bias gives a
+    # positive output), -1 the other way round, like the two-channel
+    # amplifier on the new rig: with -1 here and ``cal.current_sign`` at
+    # +1 a simulated run shows what that rig showed at first, a negative
+    # current and an empty trace panel. Channel 2 has its own.
+    amplifier_output_sign: float | None = None
+    amplifier_output_sign_2: float | None = None
+
 
 @dataclass
 class RigConfig:
@@ -792,6 +834,14 @@ def validate(cfg: RigConfig) -> list[str]:
         raise ConfigError(
             f"cal.preamp_gain_v_per_a must be positive, not "
             f"{C.preamp_gain_v_per_a!r}")
+
+    # The sign of each current channel is +1 or -1 and nothing else: a 0
+    # would silently make every current zero.
+    for name in ("current_sign", "current_sign_2"):
+        if getattr(C, name) not in (1, -1):
+            raise ConfigError(
+                f"cal.{name} must be 1 or -1 (which way round the amplifier's "
+                f"output is), not {getattr(C, name)!r}")
 
     # THE range check: does 1 G0 fit in the AI range? With a series resistor
     # the current is capped at bias / R_series whatever the junction does, so

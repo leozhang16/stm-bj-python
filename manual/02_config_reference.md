@@ -66,9 +66,11 @@ Values beyond which something breaks -- not values you intend to use. All
 piezo limits are expressed at the DAQ output, before the driver box, because
 the displacement calibration (`cal.piezo_nm_per_volt`) is also DAQ-side and
 already folds in the box's gain. This piezo is **unipolar, 0 to 10 V**:
-Igor's own bipolar defaults (`G_PiezoChanLow/High` = -10/+10,
+the original Igor code's bipolar defaults (`G_PiezoChanLow/High` = -10/+10,
 Functions_STMBJ.ipf:1294) would drive it 10 V the wrong way, and Igor itself
-flagged the unipolar case at Functions_STMBJ.ipf:44.
+flagged the unipolar case at Functions_STMBJ.ipf:44. (The Igor code ported
+for the new DAQ, `Igor_for_New_DAQ`, enforces 0 to 10 V as well since
+2026-11-16: `K_PiezoMinVolt` / `K_PiezoMaxVolt`, see its README.)
 
 | Field | Default | Unit | Igor origin | Meaning |
 |---|---|---|---|---|
@@ -121,6 +123,8 @@ Measured constants; produced by `calibrate.py`, saved per session.
 | `current_zero_v` | `0.0` | V | -- | Preamp resting offset; hundreds of microvolts, drifts with temperature, re-measure every session (`validate` warns while it is 0) |
 | `preamp_gain_2_v_per_a` | `1e9` | V/A | -- | Transimpedance of channel 2 of a two-channel amplifier (`channels.ai_current_2`); `preamp_gain_v_per_a` is channel 1's. `validate` warns when it is not above channel 1's (the two inputs are probably swapped) |
 | `current_zero_2_v` | `0.0` | V | -- | Channel 2's resting offset. Calibrate zero measures it in the same hold as channel 1's |
+| `current_sign` | `1.0` | -- | -- | Which way round the amplifier's output is, +1 or -1: `current = current_sign * (V_out - zero) / gain`. +1 is the Keithley 428 and every rig before the two-channel amplifier. -1 for an amplifier whose output goes negative at a positive tip bias, which otherwise gives a negative conductance and an empty trace panel. The window's "flip the sign of ch 1" box sets it for the session. `validate` refuses anything but 1 and -1. Chapter 23 |
+| `current_sign_2` | `1.0` | -- | -- | The same for channel 2 of a two-channel amplifier ("flip the sign of ch 2") |
 | `piezo_nm_per_volt` | `62.0` | nm/V | `K_ZPiezoScale` | Displacement per volt at the DAQ output, end to end including the driver box |
 | `hv_amp_gain` | `None` | -- | -- | Driver-box gain if ever measured separately; documentation only, nothing multiplies by it |
 | `sense_nm_per_volt` | `314.0` | nm/V | `K_SenseScale` | Displacement per volt on the piezo *sense* line (`channels.ai_piezo_sense`): nm = (sense_v − `sense_zero_v`) × this. Converts the readback to nm for SenseInDisplay and `Session.piezo_sense()`; the displacement axis of every trace stays the commanded one. Measured by `rigtests/01_piezo_sweep.py`, which prints both numbers as config lines |
@@ -277,6 +281,8 @@ The simulated card (`--simulate`). No real rig reads it.
 | Field | Default | Unit | Igor origin | Meaning |
 |---|---|---|---|---|
 | `ai_noise_v_rms` | `None` | V rms | -- | Noise of every input of the simulated card, per sample. `None` keeps the simulator's built-in noise (1.87 uV on the current input, four times that on the junction voltage), far below a real card's. With the card's own number a simulated run shows the noise floors the rig will have: NI lists 88 uV for the USB-6453 on its +/-10 V range, which at 100 mV is a floor near 1e-3 G0 at 1e4 V/A and near 1e-6 G0 at 1e7 V/A (`configs/newrig_2ch.json` sets it) |
+| `amplifier_output_sign` | `None` | -- | -- | Which way round the *simulated* amplifier's channel 1 output is. `None`: the way round the config says the real one is (`cal.current_sign` when the program starts), so a rig's config simulates as that rig behaves once its sign is right. +1: as the Keithley 428 (a positive tip bias gives a positive output). -1: the other way round, like the two-channel amplifier on the new rig; with -1 here and `cal.current_sign` at 1 a simulated run shows what that rig showed at first, a negative current and an empty trace panel |
+| `amplifier_output_sign_2` | `None` | -- | -- | The same for the simulated channel 2 (`cal.current_sign_2`) |
 
 ## RigConfig (top level)
 

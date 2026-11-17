@@ -138,6 +138,7 @@ every use removed). `SenseIn`, `SenseInBkgd`, `POExtension` stay.
     conversion; the saved-file layout must not change).
   - comment out (Actuator tag): `G_ActuatorStepSize`, `G_ActuatorCounter`.
   - `G_PiezoChanLow/High` stay as they are (-10/+10). Do NOT change them (README flags it).
+    **Superseded 2026-11-16, see section 9: the piezo range is 0..10 V now.**
 - `SetUpHRTaskID1()`: add the third channel `PiezoSenseIn`.
 - `SetUpLRTaskID3()`, `ClearLRTaskID3()`, `GetLowHighOffset()`: whole functions commented out (LowRes tag).
 - `GenerateTrace()`: rewritten per section 3. Specifically:
@@ -187,6 +188,7 @@ every use removed). `SenseIn`, `SenseInBkgd`, `POExtension` stay.
   `G_PiezoChanLow/High`, `G_CurrentSamplingReadoutVal`, `G_CurrentVoltConversion`,
   `G_FastReadWaveSize`, `G_AcquisitionRate`, `G_ID1`), `WriteToHighRes(step, TipBias)` for the
   step, and clears `G_ID1` on every exit path like the old function did. No new globals.
+  (2026-11-16: the range check uses the constants `K_PiezoMinVolt` / `K_PiezoMaxVolt` now, section 9.)
 - Everything else (SavePullOut, LogHistFromBlocks, WriteToHighRes, TestTrace, SmashFun,
   SingleBreakJunctionAttempt, HighResContact, HighResOutOfContact, SaveOffset, MakePath):
   unchanged, except `NVAR` lines for removed globals, which must go.
@@ -280,7 +282,41 @@ they were only used by the X-piezo functions.
 `MoveXPiezo`, `MoveXPiezoToZero`, `StopXPiezo`, `LateralEXPT`.
 
 ## 8. Things deliberately NOT changed (flagged in README instead)
-- `G_PiezoChanLow = -10` (the piezo is believed to be unipolar 0..10 V; changing a hardware limit is the user's call).
+- ~~`G_PiezoChanLow = -10` (the piezo is believed to be unipolar 0..10 V; changing a hardware limit is the user's call).~~
+  **Changed 2026-11-16 at the user's request, see section 9.**
 - `K_ZPiezoScale`, `K_SenseScale`, `G_SeriesResistance`: old rig's calibration numbers.
 - The XOP cannot set the input terminal configuration (RSE/DIFF); the card's default applies.
 - The data path `D:Experiments:`.
+
+## 9. Piezo safety (2026-11-16, at the user's request)
+The Z piezo is unipolar. The port had kept the old bipolar range, and a negative voltage was applied to
+the piezo once by accident. Rule now: **the piezo command is never below 0 V and never above 10 V.**
+Lines carry `[NEWDAQ-SAFETY]`.
+
+- `Functions_STMBJ.ipf`, top: `Constant K_PiezoMinVolt = 0`, `Constant K_PiezoMaxVolt = 10`, and three
+  helpers: `PiezoSafeVolt(v)` (limit; NaN/Inf give 0 V), `PiezoOffsetIntoRange()` (puts
+  `G_PiezoOffset_nm` back in range, returns 1 if it had to), `PiezoCanMove(deltaZ_nm)` (does the next
+  step fit). The constants are in this file, not in the setup file, so a setup file edited on the lab PC
+  (channel names) is not touched.
+- The four places that fill the piezo half of `HighResWriteWave` are limited:
+  `StartHighResWritingTask` (first write), `WriteToHighRes` (single moves), `GenerateTrace` (every sample
+  of the pull with `limit()`, and the hold write after it).
+- `GenerateTrace` refuses the whole pull, before any task is started, if `PiezoOrigin` plus the lowest
+  or the highest point of `PiezoBiasWave` leaves the range; it returns -2 and `SingleBreakJunctionAttempt` turns
+  that into "stop the experiment". No silent clipping of a ramp.
+- `HighResMakeContact`: the retraction loop stops when the next step out does not fit (return -3 as
+  before); the approach loop stops when the next step in does not fit (return -2 as before) and no longer
+  treats the lower end as an error, so it can start from 0 V.
+- `HighResCardApproach`: same check as before, against the constants.
+- `HighResContact` / `HighResOutOfContact` (Find Offset): return -1 at the end of the range instead of
+  stepping for ever; `OffsetVoltage` then goes back to where it started, leaves Vzero/Izero alone and
+  returns -1 (1 after a finished fit). `FindOffset` and `SaveOffset` draw the Izero graph only after a
+  finished fit (the graph needs `fit_CurrentWave`); `SaveOffset` records NaN for a try that gave up.
+- `StartHighResWritingTask`: `MXCreateAOVoltageChan(G_OD1,HighResPiezoOut,K_PiezoMinVolt,K_PiezoMaxVolt)`,
+  resets `G_PiezoChanLow/High` to 0/10, repairs a stored position outside the range and the slider
+  limits of a panel saved with the older code.
+- `Windows_STMBJ.ipf`: `Slider SliderPos_Z,limits={0,10,0.01}`.
+- `G_PiezoChanLow/High` remain declared (0 and 10) but nothing reads them.
+- Tests: `tests/MX_Sim_for_test.ipf` records the lowest/highest piezo voltage any write asked for and
+  refuses a write outside the channel range; `tests/Smoke_NewDAQ.ipf` checks the range at the end of
+  passes 1 and 2 and adds pass 3, `ClaudePiezoSafetyRun`.

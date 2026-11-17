@@ -1342,7 +1342,11 @@ def test_the_simulated_card_noise_comes_from_the_config():
     assert i == pytest.approx(1e-5, rel=0.05) and v == pytest.approx(4e-5, rel=0.05)
     # it travels in the json, and a file written before v67 loads without it
     blob = cfg.to_dict()
-    assert blob["sim"] == {"ai_noise_v_rms": 8.8e-5}
+    assert blob["sim"]["ai_noise_v_rms"] == 8.8e-5
+    # (v69: the section also says which way round the simulated amplifier's
+    # outputs are; None = the way round cal.current_sign says)
+    assert blob["sim"] == {"ai_noise_v_rms": 8.8e-5, "amplifier_output_sign": None,
+                           "amplifier_output_sign_2": None}
     assert RigConfig.from_dict(blob).sim.ai_noise_v_rms == 8.8e-5
     del blob["sim"]
     assert RigConfig.from_dict(blob).sim.ai_noise_v_rms is None

@@ -16,6 +16,11 @@ port in `STM_Git` was built from). Two changes, as requested, and nothing else o
 Changed or added lines carry a trailing `// [NEWDAQ]` comment, so `grep NEWDAQ *.ipf` shows every edit.
 `PORTING_SPEC.md` is the design the edits follow.
 
+**Added 2026-11-16: the piezo can never get a negative voltage.** The port had kept the old code's
+bipolar piezo range (-10 to +10 V), so the slider, Step apart or a pull that started close to 0 V could
+send a negative voltage to the piezo. The Z piezo on this rig is unipolar, so the range is now
+**0 to 10 V everywhere** (see "Piezo safety" below). Those lines carry `[NEWDAQ-SAFETY]`.
+
 ## Files
 
 | File | What |
@@ -85,6 +90,26 @@ wiring serves both programs.
   names unchanged.
 - Panel text: "Reset DAQ Device" (singular), "Bias Output Range (V)", and the Start Writing tooltip name
   the real channels.
+- **Piezo safety (2026-11-16).** The piezo command is kept between `K_PiezoMinVolt = 0` V and
+  `K_PiezoMaxVolt = 10` V (two constants at the top of `Functions_STMBJ.ipf`):
+  - The **slider** runs 0 to 10 V (it ran -10 to +10 V).
+  - **Every write** to the piezo is limited to that range first. Asking for more (Step apart at 0 V, a
+    typed number, a smash that overshoots) holds the piezo at the end of the range and prints
+    `Piezo: ... V was asked for; held at ... V`.
+  - **A pull that would not fit is refused before it starts**, and the experiment stops with
+    `GenerateTrace: pull NOT started ...`. This happens when the tip touches the surface closer to 0 V
+    than the length of the pull (5 nm is 0.08 V). The cure is the coarse stage: move it so that contact
+    happens near the middle of the piezo range. The ramp is never clipped silently, because a clipped
+    ramp would be saved as a trace with a wrong distance axis.
+  - **Making contact starts happily from 0 V** now. Before, 0 V was the middle of the range; with the
+    old check kept, a unipolar range would have made 0 V look like "overextended".
+  - If the tip still touches and the piezo has less than one step out (5 nm, 0.08 V) left above 0 V,
+    the experiment stops with `Could not separate contacts`. In both of these stops the tip is still on
+    the surface with the bias on: move the coarse stage back by hand before anything else.
+  - **Find Offset** stops and goes back to where it started if it reaches 10 V without contact (it used
+    to step for ever), leaves Vzero as it was and draws no Izero graph for that try.
+  - **Start Writing** creates the piezo channel with the range 0 to 10 V and repairs an experiment file that
+    was saved with the older code (stored limit -10, a negative stored position, the -10..10 slider).
 - Saved-file layout (`PullOut*Block_N.ibw`, `ParameterWave` indices) is unchanged.
 
 ## First run on the lab PC
@@ -130,10 +155,14 @@ wiring serves both programs.
    says `ai1`, `ai2`, `ai3`; change `ai_voltage`, `ai_current` and `ai_piezo_sense` to `ai9`, `ai10`,
    `ai11` (its `rse` setting stays) so the same cables work for both programs. Check the first
    Background Sampling reading against a known voltage before trusting a number.
-3. **Piezo range.** `G_PiezoChanLow = -10`, `G_PiezoChanHigh = +10` are unchanged from the old code.
-   The Z piezo on this rig is unipolar 0..10 V (that is what the Python config enforces). If the piezo
-   driver box must never see a negative command, set `G_PiezoChanLow = 0` in `Declare_STMBJ_Variables`
-   and the slider limits in `Windows_STMBJ.ipf`. This is your call; the port did not change hardware limits.
+3. **Piezo range: 0 to 10 V, enforced since 2026-11-16.** The Z piezo on this rig is unipolar, the same
+   range the Python config enforces. The limits are the constants `K_PiezoMinVolt` and `K_PiezoMaxVolt`
+   at the top of `Functions_STMBJ.ipf`; the old globals `G_PiezoChanLow/High` still exist (now 0 and 10)
+   but the code no longer reads them. Before this date the range was -10 to +10 V, as in the old code.
+   Two things to know: (a) the software limit is what was tested (on the simulated card, see Testing);
+   the channel is also created 0..10 V so that the card driver refuses anything outside, but that part
+   needs the real card to be seen working; (b) park the piezo near the middle (about 5 V on the slider)
+   before the coarse approach by hand, so a pull has room on both sides.
 4. **Counter electrode on `Dev1/ao3` is a spare channel we chose; nothing is wired to it yet.** If you
    use EChem, wire it or change `CounterElectrodeOut`. Whether an on-demand output can run while the
    piezo/bias task runs has not been tried on this card; if DAQmx answers "resource reserved" (-50103),
@@ -188,13 +217,26 @@ Tested on this Mac with Igor Pro 8.04 (64-bit), with the Windows-only XOP replac
   Writing, the piezo-only approach stops 0.5 nm before the surface, a background read returns the bias
   and the piezo position, 100 traces through MakeContact / GenerateTrace / TestTrace / SavePullOut in
   17 s, the alignment spike is found, the log histogram peaks at 1 G0, `PullOutConductanceBlock_1.ibw`
-  and the histogram file are written, Kill Tasks, and every DAQ task named only `Dev1/ai1;ai2;ai3`,
-  `Dev1/ao2;ao1` or `Dev1/ao3`: **27 of 27 checks pass**. Pass 2: tab procedures, the Gain control, Step
+  and the histogram file are written, Kill Tasks, the piezo output stayed inside 0 to 10 V, and every DAQ
+  task named only `Dev1/ai9;ai10;ai11`, `Dev1/ao2;ao1` or `Dev1/ao3`: **28 of 28 checks pass**. Pass 2: tab procedures, the Gain control, Step
   closer/apart, the slider, Tip Bias, Background Sampling on/off, an approach with no reachable surface
   (stops at the piezo limit and retracts to its start), Find Offset (Vzero fit and the Izero graph), one
   attempt in each of the push-pull / IV / AC-hold / high-bias modes, Smash, the EChem gate (500 mV reaches
   `Dev1/ao3`), both CVs refused while the writing task is ON, Kill Tasks, both CVs run with it OFF, Reset
-  DAQ Device: **28 of 28 checks pass**. The code was also reviewed by three independent passes (Igor
+  DAQ Device, and again the piezo output inside 0 to 10 V: **29 of 29 checks pass**. Pass 3
+  (`ClaudePiezoSafetyRun`, added 2026-11-16) asks every path for a piezo voltage outside 0 to 10 V while
+  the simulated card records the lowest and highest voltage any write asked for and refuses anything
+  outside the channel range: an experiment saved with the old -10 limit and a negative stored position,
+  the slider at -5 V and +12 V, Step apart at 0 V, `WriteToHighRes` with -1e6 nm, +1e6 nm and NaN, a
+  negative position typed into the global, a surface 2 nm above full retraction (contact is made, the
+  pull is refused, the experiment stops after one attempt), a tip that touches even at 0 V (moving out
+  stops at 0 V), Find Offset with no surface (stops at 10 V, goes back, no graph, Background Sampling
+  back on), three normal traces starting from exactly 0 V, making contact with no surface (stops at
+  10 V), the smash next to both ends, and a ramp that would rise above 10 V (refused). Over the whole
+  pass the card was asked for nothing below 0 V or above 10 V, and a -1 V write handed straight to the
+  simulated card is refused, which shows the check can fail:
+  **37 of 37 checks pass**. Not covered by a test: the push-pull, IV, AC and high-bias ramps at the
+  ends of the range (they go through the same check in `GenerateTrace`). The code was also reviewed by three independent passes (Igor
   runtime, DAQmx on one card, scope and documentation) with every finding cross-checked; the confirmed
   ones are fixed in this version.
 - **Static checker against the original** (`tests/check_igor.py --baseline`): 0 regressions; the two
@@ -209,7 +251,7 @@ save any open Igor experiment first**):
 tests/run_compile_test_mac.sh
 ```
 ```bash
-tests/run_compile_test_mac.sh --smoke
+tests/run_compile_test_mac.sh --smoke     # passes 1, 2 and 3 (piezo safety)
 ```
 ```bash
 python3 -I tests/check_igor.py . --baseline "../STMBJ2/MKLab_STMBJ - Copy/setup 1 code"

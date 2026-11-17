@@ -180,6 +180,10 @@ Function ClaudeSmokeRun(resultPath)
 	Rep(refnum, StringMatch(status, "OFF"), "writing task OFF after Kill Tasks")
 	SVAR simErr = sim_Errors
 	Rep(refnum, strlen(simErr) == 0, "simulator saw no channel-count or task errors [" + simErr + "]")
+	NVAR lowAsked = sim_PiezoMinAsked
+	NVAR highAsked = sim_PiezoMaxAsked
+	NVAR numRefused = sim_NumRefusedWrites
+	Rep(refnum, lowAsked >= K_PiezoMinVolt && highAsked <= K_PiezoMaxVolt && numRefused == 0, "piezo output stayed inside 0 to 10 V for the whole run (lowest " + num2str(lowAsked) + " V, highest " + num2str(highAsked) + " V)")
 	Wave/T chans = sim_TaskChans
 	Wave isAO = sim_TaskIsAO
 	Variable i, aoOK = 1, aiOK = 1, nAO = 0, nAI = 0
@@ -361,9 +365,218 @@ Function ClaudeSmokeRun2(resultPath)
 
 	SVAR simErr = sim_Errors
 	Rep(refnum, strlen(simErr) == 0, "simulator saw no channel-count or task errors [" + simErr + "]")
+	NVAR lowAsked = sim_PiezoMinAsked
+	NVAR highAsked = sim_PiezoMaxAsked
+	NVAR numRefused = sim_NumRefusedWrites
+	Rep(refnum, lowAsked >= K_PiezoMinVolt && highAsked <= K_PiezoMaxVolt && numRefused == 0, "piezo output stayed inside 0 to 10 V for both runs (lowest " + num2str(lowAsked) + " V, highest " + num2str(highAsked) + " V)")
 	SVAR simLog = sim_Log
 	Rep(refnum, strsearch(simLog, "ev2", 0) < 0, "no second card named in any task")
 	Rep(refnum, strsearch(simLog, "Dev1/ao3", 0) >= 0, "the counter-electrode task used Dev1/ao3")
+
+	fprintf refnum, "END\r"
+	Close refnum
+	return 0
+End
+
+// ---------------------------------------------------------------------------
+// Third pass: PIEZO SAFETY. The piezo must never get a negative voltage and never more
+// than 10 V (K_PiezoMinVolt / K_PiezoMaxVolt in Functions_STMBJ.ipf). Run AFTER
+// ClaudeSmokeRun in the same Igor session (it needs the globals, the panels and the Data path):
+//     ClaudePiezoSafetyRun("Macintosh HD:path:to:result3.txt")
+// Every way the code can move the piezo is asked for a voltage outside the range. The simulated
+// card remembers the lowest and highest piezo voltage any write asked for and refuses a write
+// outside the channel range, so "the card never saw it" is checked, not assumed.
+// ---------------------------------------------------------------------------
+Function ClaudePiezoSafetyRun(resultPath)
+	String resultPath
+
+	Variable refnum
+	Open refnum as resultPath
+	fprintf refnum, "PIEZO SAFETY RUN %s\r", date() + " " + time()
+
+	NVAR Offset_nm = G_PiezoOffset_nm
+	NVAR TipBias = G_TipBias
+	NVAR ChanLow = G_PiezoChanLow
+	NVAR ChanHigh = G_PiezoChanHigh
+	SVAR status = G_HighResOutputTaskStatus
+	NVAR Gain = G_CurrentVoltGain
+	NVAR Conv = G_CurrentVoltConversion
+	NVAR Thresh = G_ConductanceThreshold
+	NVAR PullOutNumber = G_PullOutNumber
+	NVAR StopNumber = G_StopNumber
+	NVAR Attempt = G_PullOutAttempt
+	NVAR SingleFlag = G_SingleAttemptFlag
+	NVAR dz = G_PiezoDeltaZ_nm
+
+	// nothing running, then a fresh simulator so that its lowest/highest start clean
+	if (StringMatch(status, "ON"))
+		StopWritingTasks("")
+	endif
+	Sim_Init()
+	NVAR ContactZ = sim_ContactZ_nm
+	NVAR simGain = sim_GainExp
+	NVAR simZ = sim_ZScale
+	NVAR simS = sim_SenseScale
+	NVAR hp = sim_HoldPiezoV
+	NVAR lowAsked = sim_PiezoMinAsked
+	NVAR highAsked = sim_PiezoMaxAsked
+	NVAR numRefused = sim_NumRefusedWrites
+	NVAR chanLo = sim_PiezoChanLo
+	NVAR chanHi = sim_PiezoChanHi
+	SVAR simErr = sim_Errors
+	simZ = K_ZPiezoScale
+	simS = K_SenseScale
+	Gain = 5
+	Conv = 10^(6-Gain)
+	simGain = Gain
+	Thresh = 1.5
+	ContactZ = 300
+	SingleFlag = 0
+	Rep(refnum, K_PiezoMinVolt == 0 && K_PiezoMaxVolt == 10, "the limits in the code are " + num2str(K_PiezoMinVolt) + " V and " + num2str(K_PiezoMaxVolt) + " V")
+
+	// ---- A. an experiment file saved with the older code: -10 V limit, negative stored position, -10..10 slider
+	ChanLow = -10
+	ChanHigh = 10
+	Offset_nm = -300		// -4.84 V
+	Slider SliderPos_Z win=BreakJunctionMeasurement, limits={-10,10,0.01}
+	StartHighResWritingTask("")
+	Rep(refnum, StringMatch(status, "ON"), "A: Start Writing: writing task ON")
+	Rep(refnum, chanLo == 0 && chanHi == 10, "A: the piezo channel was created with the range " + num2str(chanLo) + " to " + num2str(chanHi) + " V")
+	Rep(refnum, ChanLow == 0 && ChanHigh == 10, "A: the old limits -10/+10 left in the experiment were put back to 0/10")
+	Rep(refnum, Offset_nm == 0 && hp == 0, "A: a stored position of -4.84 V started at " + num2str(hp) + " V")
+	ControlInfo/W=BreakJunctionMeasurement SliderPos_Z
+	Rep(refnum, strsearch(S_recreation, "limits={0,10,0.01}", 0) >= 0, "A: the slider on the panel runs 0 to 10 V")
+
+	// ---- B. the slider
+	SetPiezoBiasFromSlider("", -5, 0)
+	Rep(refnum, Offset_nm == 0 && hp == 0, "B: slider asked for -5 V -> piezo held at " + num2str(hp) + " V")
+	SetPiezoBiasFromSlider("", 12, 0)
+	Rep(refnum, abs(Offset_nm - 10*K_ZPiezoScale) < 1e-9 && hp == 10, "B: slider asked for +12 V -> piezo held at " + num2str(hp) + " V")
+	SetPiezoBiasFromSlider("", 0.02, 0)
+	Rep(refnum, abs(hp - 0.02) < 1e-12, "B: slider to 0.02 V -> " + num2str(hp) + " V (normal moves still work)")
+
+	// ---- C. the step buttons next to 0 V
+	dz = 5
+	PiezoStepApart("")		// 0.02 V minus 5 nm would be -0.06 V
+	Rep(refnum, Offset_nm == 0 && hp == 0, "C: Step apart (5 nm) from 0.02 V -> held at " + num2str(hp) + " V, not -0.06 V")
+	PiezoStepApart("")
+	Rep(refnum, Offset_nm == 0 && hp == 0, "C: Step apart again at 0 V -> still " + num2str(hp) + " V")
+	PiezoStepCloser("")
+	Rep(refnum, abs(Offset_nm - 5) < 1e-9 && abs(hp - 5/K_ZPiezoScale) < 1e-12, "C: Step closer from 0 V still works (" + num2str(Offset_nm) + " nm)")
+
+	// ---- D. the write function itself, with nonsense
+	WriteToHighRes(-1e6, TipBias)
+	Rep(refnum, Offset_nm == 0 && hp == 0, "D: WriteToHighRes(-1e6 nm) -> " + num2str(hp) + " V")
+	WriteToHighRes(1e6, TipBias)
+	Rep(refnum, hp == 10, "D: WriteToHighRes(+1e6 nm) -> " + num2str(hp) + " V")
+	WriteToHighRes(NaN, TipBias)
+	Rep(refnum, hp == 0 && numtype(Offset_nm) == 0, "D: WriteToHighRes(NaN) -> " + num2str(hp) + " V, and the stored position is a number again (" + num2str(Offset_nm) + " nm)")
+	Offset_nm = -124		// a negative position typed into the global by hand (-2 V)
+	SetTipBiasVoltage("", 0, "", "")		// the tip-bias box rewrites both outputs
+	Rep(refnum, Offset_nm == 0 && hp == 0, "D: a negative G_PiezoOffset_nm typed by hand is not sent out (" + num2str(hp) + " V)")
+
+	// ---- E. Kill Tasks, then Start Writing with a stored position above the range
+	StopWritingTasks("")
+	Offset_nm = 2000		// +32 V
+	StartHighResWritingTask("")
+	Rep(refnum, hp == 10, "E: a stored position of +32 V started at " + num2str(hp) + " V")
+	WriteToHighRes(0 - Offset_nm, TipBias)
+
+	// ---- F. the surface sits 2 nm above full retraction: contact is found at about 2.5 nm (0.04 V),
+	//         and the 5 nm pull from there would need -0.04 V. It must be refused, once, cleanly.
+	ContactZ = 2
+	PullOutNumber = 601
+	StopNumber = 611
+	Variable n0 = PullOutNumber
+	Variable att0 = Attempt
+	RunStep(refnum, "MeasureBreakJunctions()")
+	Rep(refnum, PullOutNumber == n0, "F: surface 2 nm above full retraction: no trace taken, because the pull would need a negative voltage")
+	Rep(refnum, Attempt - att0 == 1, "F: the experiment stopped after that one attempt (attempts: " + num2str(Attempt - att0) + ")")
+	Rep(refnum, Offset_nm >= 0 && hp >= 0, "F: piezo left at " + num2str(hp) + " V")
+
+	// ---- G. the tip touches even at 0 V: moving out must stop at 0 V and end the experiment
+	ContactZ = -50
+	WriteToHighRes(30 - Offset_nm, TipBias)		// 30 nm = 0.48 V
+	att0 = Attempt
+	RunStep(refnum, "MeasureBreakJunctions()")
+	Rep(refnum, PullOutNumber == n0 && Attempt - att0 == 1, "G: tip touching even at 0 V: the experiment stopped, no trace taken")
+	Rep(refnum, Offset_nm >= 0 && Offset_nm < 5 && hp >= 0, "G: moving out stopped at " + num2str(hp) + " V (" + num2str(Offset_nm) + " nm)")
+
+	// ---- H. Find Offset with no surface anywhere: must stop at 10 V, go back, and not loop for ever
+	ContactZ = 5000
+	WriteToHighRes(100 - Offset_nm, TipBias)
+	NVAR Vzero = G_Vzero
+	Variable vz0 = Vzero
+	DoWindow/K Izero		// as if Find Offset had never worked in this experiment:
+	KillWaves/Z fit_CurrentWave	// no Izero graph yet and no fit wave for it
+	RunStep(refnum, "FindOffset(\"\")")
+	Rep(refnum, abs(Offset_nm - 100) < 1e-6, "H: Find Offset with no surface gave up at the top of the range and went back to where it started (" + num2str(Offset_nm) + " nm)")
+	Rep(refnum, Vzero == vz0 || (numtype(Vzero) == 2 && numtype(vz0) == 2), "H: Vzero was left as it was")
+	Rep(refnum, WinType("Izero") == 0, "H: no Izero graph was drawn for a measurement that gave up")
+	CtrlNamedBackground BkgdRead, status
+	Rep(refnum, NumberByKey("RUN", S_info) == 1, "H: Background Sampling was switched back on afterwards")
+	StopBkgdSampling()
+
+	// ---- I. normal use still works: start at exactly 0 V, surface at 40 nm, three traces
+	ContactZ = 40
+	WriteToHighRes(0 - Offset_nm, TipBias)
+	PullOutNumber = 601
+	StopNumber = 604
+	RunStep(refnum, "MeasureBreakJunctions()")
+	Rep(refnum, PullOutNumber == 604, "I: starting from 0 V with the surface at 40 nm, three traces were taken (PullOutNumber = " + num2str(PullOutNumber) + ")")
+	Wave PullOutConductance
+	WaveStats/Q/R=[0, 50] PullOutConductance
+	Rep(refnum, V_avg > 0.8 && V_avg < 5, "I: the last trace starts in contact (" + num2str(V_avg) + " G0)")
+
+	// ---- L. no surface anywhere and the piezo near the top: making contact must stop at 10 V and end the experiment
+	ContactZ = 5000
+	WriteToHighRes(600 - Offset_nm, TipBias)		// 9.68 V
+	StopNumber = PullOutNumber + 5
+	n0 = PullOutNumber
+	att0 = Attempt
+	RunStep(refnum, "MeasureBreakJunctions()")
+	Rep(refnum, PullOutNumber == n0 && Attempt - att0 == 1, "L: no surface up to 10 V: the experiment stopped, no trace taken")
+	Rep(refnum, hp <= 10 && Offset_nm <= 10*K_ZPiezoScale + 1e-9, "L: stepping in stopped at " + num2str(hp) + " V (" + num2str(Offset_nm) + " nm)")
+
+	// ---- M. the smash (in 30 nm, then out 40 nm) next to both ends of the range
+	NVAR SmashNum = G_SmashFrequency
+	WriteToHighRes(610 - Offset_nm, TipBias)		// 9.84 V; 30 nm more would be 10.32 V
+	Attempt = SmashNum		// SmashFun smashes when the attempt number is a multiple of this
+	SmashFun()
+	Rep(refnum, highAsked <= 10 && abs(Offset_nm - 580) < 1e-6, "M: smash at 9.84 V: the way in was held at 10 V, then out 40 nm (now " + num2str(Offset_nm) + " nm)")
+	WriteToHighRes(5 - Offset_nm, TipBias)		// 0.08 V; 5 + 30 - 40 would be -5 nm
+	SmashFun()
+	Rep(refnum, lowAsked >= 0 && Offset_nm == 0 && hp == 0, "M: smash at 0.08 V: the way out was held at " + num2str(hp) + " V")
+
+	// ---- N. a pull whose ramp would go ABOVE 10 V is refused too (a made-up ramp that rises by 0.01 V)
+	Wave PiezoBiasWave
+	NVAR numWrites = sim_NumWrites
+	Duplicate/O PiezoBiasWave, sim_SavedRamp
+	WriteToHighRes(10*K_ZPiezoScale - Offset_nm, TipBias)		// 10 V
+	PiezoBiasWave = 0.01*p/numpnts(PiezoBiasWave)
+	Variable writesBefore = numWrites
+	Variable gt = GenerateTrace()
+	Rep(refnum, gt == -2 && numWrites == writesBefore && hp == 10, "N: a ramp that would rise to 10.01 V was refused before anything was written (GenerateTrace returned " + num2str(gt) + ")")
+	Duplicate/O sim_SavedRamp, PiezoBiasWave
+	KillWaves/Z sim_SavedRamp
+
+	// ---- J. the whole run, as the card saw it
+	Rep(refnum, lowAsked >= 0 && highAsked <= 10, "J: over this whole run the card was never asked for a piezo voltage outside 0 to 10 V (lowest " + num2str(lowAsked) + " V, highest " + num2str(highAsked) + " V)")
+	Rep(refnum, numRefused == 0 && strlen(simErr) == 0, "J: the card refused no write and saw no error [" + simErr + "]")
+
+	// ---- K. can these checks fail at all? Hand the simulated card a -1 V write directly, past the Igor code.
+	NVAR G_OD1 = G_OD1
+	NVAR WriteBufferSize = G_WriteBufferSize
+	Make/O/D/N=(2*WriteBufferSize) sim_BadWrite = 0
+	sim_BadWrite[0, WriteBufferSize-1] = -1
+	Variable hpBefore = hp
+	MXWriteAnalogF64(G_OD1, 10, 2, sim_BadWrite)
+	Rep(refnum, numRefused == 1 && hp == hpBefore && lowAsked == -1, "K: a -1 V write handed straight to the simulated card is refused and counted (so J can fail)")
+	KillWaves/Z sim_BadWrite
+	simErr = ""
+
+	StopWritingTasks("")
+	Rep(refnum, StringMatch(status, "OFF") && hp == 0, "Kill Tasks: writing OFF, piezo output at " + num2str(hp) + " V")
 
 	fprintf refnum, "END\r"
 	Close refnum

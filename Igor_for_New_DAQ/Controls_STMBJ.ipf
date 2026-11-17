@@ -145,8 +145,18 @@ Function StartHighResWritingTask(ctrlName) : ButtonControl
 	NVAR HighResOutputRange= G_HighResOutputRange
 	SVAR HighResOutputTaskStatus= G_HighResOutputTaskStatus
 	
+	// [NEWDAQ-SAFETY] The piezo limits are the constants K_PiezoMinVolt / K_PiezoMaxVolt (0 and 10 V, top of
+	// [NEWDAQ-SAFETY] Functions_STMBJ.ipf). An experiment file saved with the older code still carries -10 in
+	// [NEWDAQ-SAFETY] G_PiezoChanLow and perhaps a negative G_PiezoOffset_nm: both are put right here.
+	PiezoChanLow= K_PiezoMinVolt
+	PiezoChanHigh= K_PiezoMaxVolt
+	if (PiezoOffsetIntoRange())
+		Print "Start Writing: the stored piezo position was outside "+num2str(K_PiezoMinVolt)+" to "+num2str(K_PiezoMaxVolt)+" V; starting at "+num2str(PiezoOffset_nm/K_ZPiezoScale)+" V instead."
+	endif
+	Variable StartPiezoVolt= PiezoSafeVolt(PiezoOffset_nm/K_ZPiezoScale)
+	
 	Redimension/D/N=(WriteBufferSize*2) HighResWriteWave
-	HighResWriteWave[0,WriteBufferSize-1]= PiezoOffset_nm/K_ZPiezoScale;
+	HighResWriteWave[0,WriteBufferSize-1]= StartPiezoVolt;	// [NEWDAQ-SAFETY] was PiezoOffset_nm/K_ZPiezoScale, unchecked
 	HighResWriteWave[WriteBufferSize,2*WriteBufferSize-1]= -(TipBias/1000)
 
 	Variable HighResOutputRange_1 = HighResOutputRange
@@ -154,7 +164,7 @@ Function StartHighResWritingTask(ctrlName) : ButtonControl
 
 	// Output Commands
 	MXCreateTask("G_OD1")
-	MXCreateAOVoltageChan(G_OD1,HighResPiezoOut,PiezoChanLow,PiezoChanHigh)
+	MXCreateAOVoltageChan(G_OD1,HighResPiezoOut,K_PiezoMinVolt,K_PiezoMaxVolt)	// [NEWDAQ-SAFETY] 0..10 V (was PiezoChanLow,PiezoChanHigh = -10..10): the card itself is told the piezo range
 	MXCreateAOVoltageChan(G_OD1,HighResBiasOut, HighResOutputRange_2,HighResOutputRange_1)
 	MXCfgSampClkTiming(G_OD1,rate,1,WriteBufferSize)
 	MXWriteAnalogF64(G_OD1,CardTimeout,2,HighResWriteWave)
@@ -165,6 +175,7 @@ Function StartHighResWritingTask(ctrlName) : ButtonControl
 	Button Reset_DAQ disable=2
 	Button Stop_DAQ disable=0
 	Slider SliderPos_Z win=BreakJunctionMeasurement, disable=0
+	Slider SliderPos_Z win=BreakJunctionMeasurement, limits={K_PiezoMinVolt,K_PiezoMaxVolt,0.01}, value=PiezoOffset_nm/K_ZPiezoScale	// [NEWDAQ-SAFETY] also repairs a panel that was saved with the old -10..10 slider
 	SetVariable WriteBufferSize_DAQ disable=2
 	SetVariable ReadWaveSize_DAQ disable=2
 	SetVariable AcqRate_DAQ disable=2
@@ -508,14 +519,16 @@ Function FindOffset(ctrlName) : ButtonControl
 	StopBkgdSampling()
 	
 	SetUpHRTaskID1()
-	OffsetVoltage()
+	Variable OffsetResult= OffsetVoltage()	// [NEWDAQ-SAFETY] 1 = measured, -1 = gave up (no contact inside the piezo range)
 	ClearHRTaskID1()
 	
-	DoWindow/F Izero
-	if(V_flag==0)
-		execute "Izero()"
+	if (OffsetResult == 1)	// [NEWDAQ-SAFETY] the Izero graph needs the fit, which exists only after a finished measurement
+		DoWindow/F Izero
+		if(V_flag==0)
+			execute "Izero()"
+		endif
+		DoUpdate
 	endif
-	DoUpdate
 	
 	StartBkgdSampling()
 End
