@@ -251,6 +251,19 @@ class Rig:
         bias = np.full(piezo.size, self.cfg.cal.bias_output_sign * self._bias_v)
         return self.play(np.stack([piezo, bias]))
 
+    def piezo_glide_to(self, volts: float, seconds: float) -> np.ndarray:
+        """Move the fine piezo to ``volts`` along a straight line lasting
+        ``seconds`` and return the record of it. No settle hold follows:
+        this is one piece of a slow move made of many (the window's guarded
+        approach by hand), and the next piece follows at once. The clamp,
+        the bias check and the tracker are ``play``'s, as for every move."""
+        safety.check_bias(self.cfg, self._bias_v)
+        target = safety.clamp_piezo(self.cfg, volts)
+        n = max(100, int(round(seconds * self.sample_rate_hz)))
+        piezo = np.linspace(self._piezo_v, target, n + 1)[1:]
+        bias = np.full(n, self.cfg.cal.bias_output_sign * self._bias_v)
+        return self.play(np.stack([piezo, bias]))
+
     def set_bias(self, volts: float) -> None:
         safety.check_bias(self.cfg, volts)
         self.hold(bias_v=volts)
@@ -348,9 +361,20 @@ class Rig:
         amps = C.volts_to_amps(float(np.mean(tail)), channel=2)
         return abs(amps) / abs(junction_v) / G0_SIEMENS, False, 2
 
-    def conductance_of(self, record: np.ndarray) -> float:
-        M, C, R = self.cfg.channels, self.cfg.cal, self.cfg.ramp
-        keep = record.shape[1] - min(R.settle_discard, record.shape[1] - 1)
+    def _kept(self, record: np.ndarray, tail: int | None = None) -> int:
+        """How many of a record's last samples a reading is taken from: all
+        but the first ``ramp.settle_discard`` (a hold, which takes that long
+        to settle), or exactly ``tail`` of them (one piece of a slow move,
+        where only the end says where the junction is now)."""
+        n = record.shape[1]
+        if tail is not None:
+            return max(1, min(int(tail), n))
+        return n - min(self.cfg.ramp.settle_discard, n - 1)
+
+    def conductance_of(self, record: np.ndarray, tail: int | None = None) -> float:
+        """Conductance in G0 over the settled end of a record (``_kept``)."""
+        M, C = self.cfg.channels, self.cfg.cal
+        keep = self._kept(record, tail)
 
         current_v = float(np.mean(record[M.ROW_CURRENT, -keep:]))
         voltage_v = float(np.mean(record[M.ROW_VOLTAGE, -keep:]))
@@ -397,22 +421,27 @@ class Rig:
 
     def read_current_ua(self, n_samples: int | None = None) -> float:
         """Junction current in microamps. Used by the coarse approach."""
-        record = self.hold(n_samples=n_samples)
-        M, R = self.cfg.channels, self.cfg.ramp
-        keep = record.shape[1] - min(R.settle_discard, record.shape[1] - 1)
+        return self.current_ua_of(self.hold(n_samples=n_samples))
+
+    def current_ua_of(self, record: np.ndarray, tail: int | None = None) -> float:
+        """Junction current in microamps over the settled end of a record
+        (``_kept``), with its sign."""
+        M = self.cfg.channels
+        keep = self._kept(record, tail)
         current_v = float(np.mean(record[M.ROW_CURRENT, -keep:]))
         return self.cfg.cal.volts_to_amps(current_v) * 1e6
 
-    def is_saturated(self, record: np.ndarray, fraction: float = 0.5) -> bool:
+    def is_saturated(self, record: np.ndarray, fraction: float = 0.5,
+                     tail: int | None = None) -> bool:
         """Is the current channel railed over the settled part of the record?
 
         Judged on the same tail window the conductance uses, and on a majority
         of it: a single railed sample is a transient, half of them is contact.
         """
-        M, R = self.cfg.channels, self.cfg.ramp
-        keep = record.shape[1] - min(R.settle_discard, record.shape[1] - 1)
-        tail = np.abs(record[M.ROW_CURRENT, -keep:])
-        return bool(np.mean(tail >= self.cfg.limits.preamp_saturation_v)
+        M = self.cfg.channels
+        keep = self._kept(record, tail)
+        settled = np.abs(record[M.ROW_CURRENT, -keep:])
+        return bool(np.mean(settled >= self.cfg.limits.preamp_saturation_v)
                     >= fraction)
 
     # -- coarse actuator --------------------------------------------------

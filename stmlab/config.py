@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import math
+import numbers
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, ClassVar
@@ -46,6 +47,17 @@ class ConfigError(Exception):
 # Accepted spellings of ChannelMap.ai_terminal and sense_terminal, mapped to
 # DAQmx's TerminalConfiguration names in daq.py.
 SENSE_TERMINALS = {"default", "rse", "nrse", "diff"}
+# The two positions of the piezo driver's switch (Calibration.piezo_mode).
+PIEZO_MODES = ("standard", "bypass")
+
+
+def _real(value) -> bool:
+    """Is ``value`` a real, finite number? True and False are not: Python
+    counts them as 1 and 0, and a json's ``true`` is a typing mistake."""
+    return (isinstance(value, numbers.Real) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
 AI_TERMINALS = SENSE_TERMINALS
 
 
@@ -393,12 +405,43 @@ class Calibration:
     # Displacement per volt **at the DAQ output**. Igor: K_ZPiezoScale = 62.
     # This is an end-to-end number: it already includes the gain of the piezo
     # driver box, so hv_amp_gain below is documentation, not arithmetic.
+    # DERIVED, not typed, when ``piezo_total_um`` below is set.
     piezo_nm_per_volt: float = 62.0
 
     # Gain of the piezo driver box, if you ever measure it (piezo
     # disconnected). None means "unknown, folded into piezo_nm_per_volt".
     # Nothing in this package multiplies by it.
     hv_amp_gain: float | None = None
+
+    # The piezo driver box (a Nano-Drive) and its two modes. With
+    # ``piezo_total_um`` set, ``piezo_nm_per_volt`` and ``sense_nm_per_volt``
+    # are DERIVED from it and typed values of them are overwritten. It is the
+    # one number on the stage's sheet: how far the piezo moves for its whole
+    # drive voltage (0 to ``piezo_drive_full_v``, 150 V), in micrometres.
+    # ``piezo_mode`` is where the box's switch stands:
+    #
+    #   "standard"  the box amplifies the card's 0-10 V to the piezo's
+    #               0-150 V (``piezo_drive_gain``, 15), so the card's 10 V
+    #               is the whole displacement:
+    #                   nm per card volt = total / 10 V    (10.776 um: 1077.6)
+    #   "bypass"    the box's amplifier is bypassed and the card's volts ARE
+    #               the piezo's volts, so the card's 10 V is a fifteenth of
+    #               the displacement, in steps fifteen times finer:
+    #                   nm per card volt = total / 150 V   (10.776 um: 71.84)
+    #
+    # The sense line is taken to span the whole displacement over its 10 V
+    # in either mode (in standard mode it follows the command volt for
+    # volt): nm per sense volt = total / 10 V.
+    #
+    # None (every config written before v72) leaves both scales as typed.
+    # The two modes differ by the box's gain, 15. A program in one mode
+    # driving a box in the other moves the tip 15 times too far, or too
+    # little. Nothing checks that: the mode here has to be where the
+    # switch on the box stands, and that is for the person at the rig.
+    piezo_total_um: float | None = None
+    piezo_mode: str = "standard"
+    piezo_drive_full_v: float = 150.0
+    piezo_drive_gain: float = 15.0
 
     # Displacement per volt on the piezo *sense* line (the driver box's
     # monitor output, read on the low-res card). Igor: K_SenseScale = 314.
@@ -426,6 +469,42 @@ class Calibration:
     # Fixed AI/AO group delay in samples, if you have measured it. Left None,
     # each trace recovers its own delay from the alignment spike.
     group_delay_samples: int | None = None
+
+    def __post_init__(self) -> None:
+        self.apply_piezo_mode()
+
+    def piezo_scale(self, mode: str | None = None) -> float:
+        """nm per volt at the card's output, from ``piezo_total_um``, for
+        ``mode`` ("standard" or "bypass"; default: ``piezo_mode``).
+        Standard: total / 10 V. Bypass: total / 150 V."""
+        per_piezo_volt = self.piezo_total_um * 1e3 / self.piezo_drive_full_v
+        mode = str(mode or self.piezo_mode).lower()
+        return per_piezo_volt * (self.piezo_drive_gain if mode == "standard" else 1.0)
+
+    def sense_scale(self) -> float:
+        """nm per volt on the sense line, from ``piezo_total_um``: the line
+        spans the whole displacement over its 10 V, in either mode."""
+        return self.piezo_total_um * 1e3 * self.piezo_drive_gain \
+            / self.piezo_drive_full_v
+
+    def apply_piezo_mode(self) -> bool:
+        """Derive ``piezo_nm_per_volt`` and ``sense_nm_per_volt`` from
+        ``piezo_total_um`` and ``piezo_mode``. Call it after changing
+        either. Does nothing, and returns False, while ``piezo_total_um``
+        is None (the scales stay as typed) or the numbers are not usable
+        (``validate`` then says why)."""
+        if self.piezo_total_um is None:
+            return False
+        usable = (all(_real(x) and x > 0 for x in (
+                      self.piezo_total_um, self.piezo_drive_full_v,
+                      self.piezo_drive_gain))
+                  and str(self.piezo_mode).lower() in PIEZO_MODES)
+        if not usable:
+            return False
+        self.piezo_mode = str(self.piezo_mode).lower()
+        self.piezo_nm_per_volt = self.piezo_scale()
+        self.sense_nm_per_volt = self.sense_scale()
+        return True
 
     def gain_of(self, channel: int = 1) -> float:
         """Transimpedance of current channel 1 or 2, in V/A."""
@@ -919,6 +998,39 @@ def validate(cfg: RigConfig) -> list[str]:
             f"({R.break_g0:g})")
 
     # Piezo range vs. the pull it is being asked to make.
+    # The piezo driver's mode and the stage's total displacement, when the
+    # config uses them: both scales must follow from them.
+    if C.piezo_total_um is not None:
+        total_ok = _real(C.piezo_total_um) and C.piezo_total_um > 0
+        if not total_ok:
+            problems.append("cal.piezo_total_um must be a positive number of "
+                            "micrometres (the stage's total displacement), "
+                            f"not {C.piezo_total_um!r}")
+        mode_ok = str(C.piezo_mode).lower() in PIEZO_MODES
+        if not mode_ok:
+            problems.append(f'cal.piezo_mode must be "standard" or "bypass", '
+                            f"not {C.piezo_mode!r}")
+        drive_ok = all(_real(x) and x > 0
+                       for x in (C.piezo_drive_full_v, C.piezo_drive_gain))
+        if not drive_ok:
+            problems.append("cal.piezo_drive_full_v and cal.piezo_drive_gain "
+                            "must be positive numbers, not "
+                            f"{C.piezo_drive_full_v!r} and {C.piezo_drive_gain!r}")
+        if total_ok and mode_ok and drive_ok and not (
+                _real(C.piezo_nm_per_volt) and _real(C.sense_nm_per_volt)
+                and abs(C.piezo_nm_per_volt - C.piezo_scale())
+                <= 1e-9 * C.piezo_scale()
+                and abs(C.sense_nm_per_volt - C.sense_scale())
+                <= 1e-9 * C.sense_scale()):
+            problems.append("cal.piezo_nm_per_volt and cal.sense_nm_per_volt do "
+                            "not follow from cal.piezo_total_um and "
+                            "cal.piezo_mode: cal.apply_piezo_mode() was not "
+                            "called after one of them was changed")
+    if not (_real(C.piezo_nm_per_volt) and C.piezo_nm_per_volt > 0):
+        problems.append("cal.piezo_nm_per_volt must be positive")
+        raise ConfigError(
+            "configuration is unsafe:\n  " + "\n  ".join(problems))
+
     pull_v = C.nm_to_piezo_volts(R.pull_length_nm)
     span_v = L.piezo_ao_max_v - L.piezo_ao_min_v
     if pull_v > span_v:
@@ -1087,7 +1199,7 @@ def validate(cfg: RigConfig) -> list[str]:
         warnings.append(
             "hv_amp_gain is unknown; piezo limits are enforced at the DAQ "
             "output only. That is correct as long as piezo_nm_per_volt "
-            f"({C.piezo_nm_per_volt} nm/V) is an end-to-end measurement on "
+            f"({C.piezo_nm_per_volt:g} nm/V) is an end-to-end measurement on "
             "this exact chain")
 
     if problems:

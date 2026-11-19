@@ -86,15 +86,37 @@ every input in use, counts the numbers through a scratch file (written,
 read back, deleted) and times the card against this PC's clock
 (``stmlab.ratecheck``).
 
-The Piezo box is Igor's PiezoGroupbox: a slider over the piezo's whole
-voltage range (applies when the mouse is released, as Igor's did), Step
-closer / Step apart by Z nm, and under them Igor's readouts -- I (uA),
-V (mV), Piezo (V) and the sense line -- refreshed every 0.3 s while the rig
-is idle by the same quiet 10 ms hold the Monitor window uses (Igor's
-Background Sampling), with Igor's beep above 0.15 uA. A move made by hand
-is ramped over 50 ms, then the junction is probed: in contact, the state
-becomes ENGAGED (Step apart, or the slider, opens it again); Start N starts
-from wherever the slider left the tip, separating first.
+The Piezo box is Igor's PiezoGroupbox, with two things Igor's had not.
+Its first row is the piezo DRIVER: the mode its switch is in (standard or
+bypass) and the stage's total displacement in micrometres; Set makes them
+the program's, and every distance follows (standard: total / 10 V per card
+volt; bypass: total / 150 V). A change of mode takes the piezo to 0 V first.
+Then Step closer / Step apart by Z nm, and TWO sliders on the one piezo
+output, both applying when the mouse is released, as Igor's did (and only
+when the knob was moved: a click on it moves nothing): a coarse
+one over the piezo's whole voltage range, for coming up to the surface
+after the screws, and a fine one over a window of it (half a volt either
+side of where the piezo is, on round numbers; the window walks along with
+the piezo). Under them Igor's readouts -- I (uA), V (mV), Piezo (V) and the
+sense line -- refreshed every 0.3 s while the rig is idle by the same quiet
+10 ms hold the Monitor window uses (Igor's Background Sampling), with
+Igor's beep above 0.15 uA. A move made by hand AWAY from the surface is
+ramped over 50 ms. One TOWARD it goes at a set speed (200 nm/s to begin
+with) in pieces of 25 ms and stops where the junction closes: the
+conductance above the Engage threshold, the amplifier at its rail, or the
+current above the contact current (the CONTACT light's level). Then the
+junction is probed: in contact, the state becomes ENGAGED (Step apart, or
+a slider, opens it again); Start N starts from wherever the sliders left
+the tip, separating first. Nothing checks where the switch on the driver
+box stands: the Driver row has to say what the box is in.
+
+APPROACH (v73) is for a rig whose coarse approach is a screw: the screw
+brings the surface within the piezo's reach, and the button takes the piezo
+toward it from where it is, at that same speed, until contact. The fine
+slider is then around the contact. With no contact up to the top of the
+range the piezo is taken back and the status line says to approach with
+the screw again. Each slider's knob carries its volts and its nanometres,
+and the fine slider's two ends are written in both.
 
 The Keithley 428 tab is Igor's Keithley Controls over GPIB: zero check on
 or off, Zero correct, Suppress I on or off, Find suppress (Igor's
@@ -144,7 +166,7 @@ import re
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 from pathlib import Path
 
 import numpy as np
@@ -166,7 +188,7 @@ log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
 # version it applies to and you can see which one you have.
-__version__ = "v71"
+__version__ = "v73"
 
 # What the Saving tab holds when nothing is remembered yet. ``folder`` is
 # the data folder (the day folder is made under it); ``setup_id`` is Igor's
@@ -237,6 +259,24 @@ def follow_gain(cfg: RigConfig) -> None:
         decades = math.log10(gain)
         if abs(decades - round(decades)) < 1e-9:
             cfg.keithley.gain_exponent = int(round(decades))
+
+
+def fine_window(volts: float, half_v: float, lo_v: float, hi_v: float
+                ) -> tuple[float, float]:
+    """The range of the Piezo box's FINE slider: ``half_v`` volts either
+    side of where the piezo is, on round numbers (a piezo at 7.9868 V with
+    half a volt either side gives 7.5 to 8.5 V), cut off where the piezo's
+    own range ``lo_v``..``hi_v`` ends: around 0.29 V it is 0 to 0.8 V. A
+    range narrower than twice ``half_v`` gets the whole range, and so does
+    a ``half_v`` under a millivolt or a voltage that is not a number."""
+    half_v, volts = abs(float(half_v)), float(volts)
+    if not half_v >= 0.001 or not math.isfinite(volts) \
+            or 2 * half_v >= hi_v - lo_v:
+        return float(lo_v), float(hi_v)
+    grid = half_v / 5.0                          # 0.1 V for half a volt
+    centre = round(volts / grid) * grid
+    return (round(float(max(centre - half_v, lo_v)), 6),
+            round(float(min(centre + half_v, hi_v)), 6))
 
 
 def _get(cfg, path: str):
@@ -424,9 +464,44 @@ class Monitor:
             c.app_railed.append(railed)
         return g0, railed
 
+    # A series of moves by hand is one cycle, and it grows with every play.
+    # Past this many recorded points the next move starts a fresh one
+    # (``spent``), so the pictures, and the copies made for them, stay quick.
+    MAX_POINTS = 200_000
+
     def snapshot(self) -> CycleLog:
+        """The cycle so far, as a copy of its own: its lists and its marks
+        are copied too, under the lock. The worker goes on adding to the
+        cycle (a series of moves by hand is one cycle), and whoever draws
+        from a snapshot must not meet a play that is half added."""
         with self.lock:
-            return copy.copy(self.cycle)
+            c = copy.copy(self.cycle)
+            for f in dataclass_fields(c):
+                value = getattr(c, f.name)
+                if isinstance(value, list):
+                    setattr(c, f.name, list(value))
+                elif isinstance(value, dict):
+                    setattr(c, f.name, dict(value))
+            return c
+
+    def last(self) -> CycleLog:
+        """Only the last play (``last_record``, ``last_waveform``,
+        ``last_current2``), without the cycle's series: what the readouts
+        need, many times a second."""
+        with self.lock:
+            c = self.cycle
+            return CycleLog(last_record=c.last_record,
+                            last_waveform=c.last_waveform,
+                            last_current2=c.last_current2)
+
+    def spent(self) -> bool:
+        """Is this cycle no longer one to add a move by hand to? It is
+        empty, or finished (it has pulled), or has grown past
+        ``MAX_POINTS``."""
+        with self.lock:
+            c = self.cycle
+            return (not c.t or "end" in c.marks
+                    or len(c.rec_t) > self.MAX_POINTS)
 
 
 # --------------------------------------------------------------------------
@@ -506,6 +581,17 @@ class Worker(threading.Thread):
         # nothing can be accepted like that (SIGN_STOP).
         self.negative_in_a_row = 0
         self.sign_cure = ""                    # what to do about it, in words
+        # How fast a move TOWARD the surface made by hand goes (Approach,
+        # the sliders, Step closer): nm a second. It goes in short pieces
+        # and stops at contact (``_approach_by_hand``). The Piezo box sets it.
+        self.hand_speed_nm_s = 200.0
+        # The current, in uA, that counts as contact for such a move: the
+        # Coarse approach box's contact current, the level of its CONTACT
+        # light (``_closed``). The window keeps it in step; 0 switches this
+        # sign of contact off. ``contact_why`` is the sign the last such
+        # move stopped at, in words.
+        self.contact_ua = 0.15
+        self.contact_why = ""
         self.bias_dirty = True                 # set_bias before the next cycle
         self.busy = False                      # a command is running
         self.current: str | None = None        # its name
@@ -623,6 +709,98 @@ class Worker(threading.Thread):
     def cmd_amplifier(self) -> None:
         """Tell the window how the current amplifier is read."""
         self.post("amplifier", **self.amplifier_state())
+
+    def piezo_state(self) -> dict:
+        """The piezo driver as the config has it now, for the Piezo box:
+        the mode, the total displacement (None: not set, the scale is the
+        config's own number), nm per card volt, and the reach of the
+        card's whole output range in nm."""
+        C, L = self.cfg.cal, self.cfg.limits
+        return {"mode": str(C.piezo_mode).lower(), "total_um": C.piezo_total_um,
+                "nm_per_volt": C.piezo_nm_per_volt,
+                "reach_nm": (L.piezo_ao_max_v - L.piezo_ao_min_v) * C.piezo_nm_per_volt,
+                "full_v": C.piezo_drive_full_v, "gain": C.piezo_drive_gain}
+
+    def cmd_piezo(self) -> None:
+        """Tell the window how the piezo driver is set."""
+        self.post("piezo", **self.piezo_state())
+
+    def cmd_piezo_mode(self, mode: str, total_um: float) -> None:
+        """The Piezo box's Set: the driver's mode ("standard" or "bypass")
+        and the stage's total displacement in micrometres. The two scales
+        (nm per card volt, nm per sense volt) follow from them
+        (``Calibration.apply_piezo_mode``); the next file carries them.
+
+        When the MODE changes, the piezo is first taken to 0 V and stays
+        there. The switch on the box is about to be flipped, and at any
+        other voltage that would move the tip by micrometres: from bypass
+        to standard, 8 V at the card goes from 8 V to 120 V at the piezo.
+        At 0 V, and only there, the two modes agree. So a change of mode is
+        refused when the piezo cannot be taken to 0 V (this rig's limits do
+        not include it) or stands below it (going up to 0 V would be a move
+        toward the surface). A change of the total displacement alone moves
+        nothing.
+
+        Nothing here can tell where the switch really stands. The mode is
+        what the person at the rig says it is."""
+        mode = str(mode).lower()
+        C, L = self.cfg.cal, self.cfg.limits
+        try:
+            total_um = float(total_um)
+        except (TypeError, ValueError):
+            total_um = float("nan")
+        # Tried on a copy first: nothing is changed, and nothing moves, for
+        # numbers the scales cannot be worked out from.
+        trial = copy.copy(C)
+        trial.piezo_total_um, trial.piezo_mode = total_um, mode
+        if mode not in ("standard", "bypass") or not 0 < total_um <= 1000 \
+                or not trial.apply_piezo_mode():
+            self.status("piezo driver: refused. The mode is standard or bypass and "
+                        "the total displacement a number of micrometres "
+                        "(10.776, say)", "bad")
+            self.post("piezo", **self.piezo_state())
+            return
+        if self.run_stem is not None and self.paused is None:
+            self.status("a run is in progress: press Stop before changing the "
+                        "piezo driver's mode")
+            self.post("piezo", **self.piezo_state())
+            return
+        switching = mode != str(C.piezo_mode).lower()
+        was_v = self.rig.piezo_v
+        if switching:
+            why = ""
+            if not L.piezo_ao_min_v <= 0.0 <= L.piezo_ao_max_v:
+                why = (f"this rig's piezo range ({L.piezo_ao_min_v:g} to "
+                       f"{L.piezo_ao_max_v:g} V) does not include 0 V")
+            elif was_v < -1e-9:
+                why = (f"the piezo is at {was_v:.3f} V, below it. Take it to "
+                       "0 V with the slider first")
+            if why:
+                self.status("piezo driver: the mode was NOT changed. The switch "
+                            "on the driver may only be flipped with the piezo "
+                            f"at 0 V, and {why}", "bad")
+                self.post("piezo", **self.piezo_state())
+                return
+            if was_v > 1e-9:
+                self.rig.piezo_ramp_to(0.0)
+            self.rig.state = RigState.RETRACTED
+        C.piezo_total_um, C.piezo_mode = total_um, mode
+        C.apply_piezo_mode()
+        self.cmd_newfile()                     # the config travels with the data
+        state = self.piezo_state()
+        self.post("piezo", **state)
+        self.post("moved", cycle=self.mon.snapshot())
+        # The status box shows three lines and no more: what has to be done
+        # comes first, and the numbers stand in the Driver row's own line.
+        keep = (f'To keep it: "piezo_total_um": {total_um:g}, "piezo_mode": '
+                f'"{mode}" in the config\'s cal')
+        if switching:
+            came = f" (it was at {was_v:.3f} V)" if was_v > 1e-9 else ""
+            self.status(f"NOW PUT THE SWITCH ON THE DRIVER TO {mode.upper()}. The "
+                        f"piezo is at 0 V{came}. {keep}", "warn")
+        else:
+            self.status(f"Piezo driver {mode.upper()}, {total_um:g} um in all: 1 V "
+                        f"at the card = {state['nm_per_volt']:.2f} nm. {keep}", "ok")
 
     def cmd_current_sign(self, channel: int, sign: float) -> None:
         """Turn one current channel the other way round: the Current
@@ -1026,27 +1204,150 @@ class Worker(threading.Thread):
     def cmd_goto(self, volts: float) -> None:
         """Igor's SetPiezoBiasFromSlider: put the piezo at ``volts``.
 
-        Ramped over 50 ms rather than jumped, then the junction is probed and
-        the state follows what it reads, so a contact made by hand can be
-        pulled from with the pull command (headless), as Igor's
+        Away from the surface the move is made at once, along a 50 ms ramp.
+        Toward the surface it goes at ``hand_speed_nm_s`` and stops where
+        the junction closes (``_approach_by_hand``). Then the junction is
+        probed and the state follows what it reads, so a contact made by
+        hand can be pulled from with the pull command (headless), as Igor's
         slider-then-measure could. Start N needs no state: it separates first.
         """
+        volts = float(volts)
+        if not math.isfinite(volts):
+            self.status("the piezo was not moved: that voltage is not a number",
+                        "bad")
+            return
+        self._begin_by_hand()
+        was = self.rig.piezo_v
+        L = self.cfg.limits
+        target = min(max(volts, L.piezo_ao_min_v), L.piezo_ao_max_v)
+        if target > was + 1e-9:
+            ended = self._approach_by_hand(target)     # toward the surface
+        else:
+            self.rig.piezo_ramp_to(target)             # away from it: at once
+            ended = "there"
+        g0, word, second = self._settle_by_hand()
+        short = target - self.rig.piezo_v
+        ending = ""
+        if short > 1e-9:                       # it ended before it got there
+            ending = {"contact": f"STOPPED AT CONTACT ({self.contact_why})",
+                      "stop": "stopped by Stop"
+                      }[ended] + (f", {short:.4f} V short of the {target:.4f} V "
+                                  "asked for. ")
+        self.status(f"{ending}piezo {was:.4f} -> {self.rig.piezo_v:.4f} V "
+                    f"({self.rig.piezo_nm:.1f} nm): G = {g0:.3e} G0{second}, {word}",
+                    "warn" if ending else None)
+
+    def cmd_piezo_approach(self) -> None:
+        """The Piezo box's Approach: the piezo itself comes up to the
+        surface, after the screws have brought the surface within its
+        reach. From where the piezo is, toward the surface at
+        ``hand_speed_nm_s``, until the junction closes
+        (``_approach_by_hand``, ``_closed``).
+
+        Contact: the piezo stays there, and the window puts its fine slider
+        around that place. No contact all the way to the top of the range:
+        the piezo is taken back to where it started (over half a second),
+        and the status line says to approach with the screw again. Stop
+        ends it where it is."""
+        C, L = self.cfg.cal, self.cfg.limits
+        self._begin_by_hand()
+        start, top = self.rig.piezo_v, L.piezo_ao_max_v
+
+        def here() -> str:
+            return f"{self.rig.piezo_v:.4f} V = {self.rig.piezo_nm:.1f} nm"
+        why = self._closed(self.rig.hold())
+        if why:
+            self._settle_by_hand()
+            self.status(f"already in contact at {here()} ({why}): nothing to "
+                        "approach. Step apart first, or Start N", "warn")
+            return
+        if start >= top - 1e-9:
+            self._settle_by_hand()
+            self.status(f"NO CONTACT, and the piezo is at the top of its range "
+                        f"({top:g} V): take it down with the coarse slider, then "
+                        "approach with the screw again", "warn")
+            return
+        self.status(f"approaching with the piezo from {start:.3f} V, at "
+                    f"{self.hand_speed_nm_s:g} nm/s ... (Stop ends it)", "busy")
+        ended = self._approach_by_hand(top)
+        if ended == "contact":
+            why = self.contact_why
+            self._settle_by_hand()
+            # A pull goes down from here: is there room for one?
+            R = self.cfg.ramp
+            room = (self.rig.piezo_v - C.nm_to_piezo_volts(R.pull_length_nm)
+                    >= L.piezo_ao_min_v + R.piezo_headroom_v)
+            self.status(f"CONTACT at {here()} ({why}). "
+                        + ("The piezo stays there and the fine slider is around "
+                           "it. Now Start N" if room else
+                           "That is too low in the range to pull from: turn the "
+                           "screw back a little, then Approach again"),
+                        "ok" if room else "warn")
+        elif ended == "stop":
+            g0, word, second = self._settle_by_hand()
+            self.status(f"Approach stopped by Stop at {here()}: G = {g0:.3e} G0"
+                        f"{second}, {word}", "warn")
+        else:
+            self.rig.piezo_ramp_to(start, ramp_s=0.5)
+            self._settle_by_hand()
+            self.status(f"NO CONTACT for the whole range (up to {top:g} V = "
+                        f"{C.piezo_volts_to_nm(top):.0f} nm): approach with the "
+                        f"screw again. The piezo is back at {start:.3f} V", "warn")
+
+    def cmd_sim_surface(self, nm: float) -> None:
+        """The simulator's screw: put the pretend surface ``nm`` up the
+        piezo's travel. On a rig whose coarse approach is a screw turned by
+        hand the simulator has nothing to turn, and its surface stays at
+        300 nm: 0.28 V on a stage with a micrometre to the volt. With this
+        it can be put where a real one ends up (near 8 V, say), or out of
+        the piezo's reach. Simulation only."""
+        session = getattr(self.rig, "_session", None)
+        if not self.cfg.simulate or not hasattr(session, "move_surface"):
+            self.status("the simulator's screw: this is not a simulation", "bad")
+            return
+        try:
+            nm = float(nm)
+        except (TypeError, ValueError):
+            nm = float("nan")
+        if not math.isfinite(nm):
+            self.status("the simulator's screw: that is not a number of nm", "bad")
+            return
+        if nm < self.rig.piezo_nm + 1.0:
+            self.status(f"the simulator's screw: {nm:g} nm would push the surface "
+                        f"into the tip (the piezo is at {self.rig.piezo_nm:.1f} nm). "
+                        "Take the piezo down first", "bad")
+            return
+        session.move_surface(nm - session.surface_nm)
+        C, L = self.cfg.cal, self.cfg.limits
+        reach = C.piezo_volts_to_nm(L.piezo_ao_max_v)
+        self.status(f"simulator's screw: the surface is now {nm:g} nm up the "
+                    f"piezo's travel, "
+                    + (f"which is {C.nm_to_piezo_volts(nm):.3f} V"
+                       if nm <= reach else
+                       f"out of the piezo's reach ({reach:.0f} nm)"), "ok")
+
+    def _begin_by_hand(self) -> None:
+        """Before a move made by hand: the bias on, and a fresh picture for
+        a fresh series of moves (a cycle that has pulled is finished; one
+        that has not keeps accumulating, until it has grown long)."""
         if self.bias_dirty:
             self.cmd_bias()
-        c = self.mon.snapshot()
-        if not c.t or "end" in c.marks:
-            # A fresh picture for a fresh series of moves; a cycle that has
-            # pulled is finished, one that has not keeps accumulating.
+        if self.mon.spent():
             self.mon.begin_cycle()
             self.mon.mark("by hand")
-        was = self.rig.piezo_v
-        self.rig.piezo_ramp_to(volts)
+
+    def _settle_by_hand(self) -> tuple[float, str, str]:
+        """After a move made by hand: probe the junction, let the state
+        follow what it reads, and tell the window. Returns (G in G0, a word
+        for the junction, channel 2's reading in words)."""
         g0, railed = self.rig.probe()
         # The same probe on the open side: channel 2 of a two-channel
         # amplifier while it is in range, else this same pair.
         g_open, railed_open, ch_open = self.rig.open_side()
         R = self.cfg.ramp
-        if railed or g0 > R.engage_g0:
+        record = self.mon.last().last_record       # that probe's own record
+        if railed or g0 > R.engage_g0 or (record is not None
+                                          and self._closed(record)):
             self.rig.state = RigState.ENGAGED
             word = "in contact"
         else:
@@ -1056,8 +1357,75 @@ class Worker(threading.Thread):
                     else "tunnelling")
         self.post("moved", cycle=self.mon.snapshot())
         second = f" (ch 2: {g_open:.3e} G0)" if ch_open == 2 else ""
-        self.status(f"piezo {was:.4f} -> {self.rig.piezo_v:.4f} V "
-                    f"({self.rig.piezo_nm:.1f} nm): G = {g0:.3e} G0{second}, {word}")
+        return g0, word, second
+
+    def _closed(self, record: np.ndarray, tail: int | None = None) -> str:
+        """Has the junction closed, going by the end of ``record``? "" for
+        no; else why, in a few words for the status line. Any one of three
+        signs says yes:
+
+        * the amplifier is at its rail;
+        * the conductance is above the Engage threshold;
+        * the current is above the contact current (``contact_ua``, the
+          level of the Coarse approach box's CONTACT light).
+
+        The third does not use the junction voltage. On a rig whose
+        conductance reading has a ceiling (an offset of a few millivolts on
+        the junction voltage caps G near 4 G0 on the new rig) the second
+        never comes with Engage above that ceiling, and through a series
+        resistor the first never comes at all."""
+        R = self.cfg.ramp
+        if self.rig.is_saturated(record, tail=tail):
+            return "the amplifier is at its rail"
+        g0 = self.rig.conductance_of(record, tail=tail)
+        if g0 > R.engage_g0:
+            return f"G = {g0:.3g} G0"
+        ua = abs(self.rig.current_ua_of(record, tail=tail))
+        if self.contact_ua > 0 and ua > self.contact_ua:
+            return f"{ua:.3g} uA, above the contact current"
+        return ""
+
+    # A move toward the surface made by hand goes in pieces this long, and
+    # the junction is read from this much of the end of each.
+    HAND_PIECE_S = 0.025
+    HAND_LOOK_S = 0.001
+
+    def _approach_by_hand(self, target_v: float) -> str:
+        """Take the piezo toward the surface to ``target_v`` at
+        ``hand_speed_nm_s``, in pieces of 25 ms, reading the junction at
+        the end of each: "contact" when it has closed (``_closed``: the
+        move ends there, short of the target, and ``contact_why`` says by
+        which sign), "stop" when Stop was pressed, "there" when the target
+        was reached.
+
+        A slider is a coarse thing: with a micrometre to the volt, one
+        finger's width of it is hundreds of nm, and a move made in one go
+        would be through the surface before anything could look. In pieces,
+        the tip ends a little more than one piece (speed x 25 ms: 5 nm at
+        200 nm/s) past the place where the junction closed: the piece in
+        which it closed is played to its end, and the junction is read from
+        that piece's last millisecond."""
+        C = self.cfg.cal
+        look = max(8, int(round(self.HAND_LOOK_S * self.rig.sample_rate_hz)))
+        step_v = (max(float(self.hand_speed_nm_s), 1.0) / C.piezo_nm_per_volt
+                  * self.HAND_PIECE_S)
+        pieces = 0
+        while self.rig.piezo_v < target_v - 1e-9:
+            if self.stop_flag.is_set():
+                return "stop"
+            record = self.rig.piezo_glide_to(
+                min(target_v, self.rig.piezo_v + step_v), self.HAND_PIECE_S)
+            why = self._closed(record, tail=look)
+            if why:
+                self.contact_why = why
+                return "contact"
+            pieces += 1
+            if pieces % 8 == 0:
+                self.readout()                     # the sliders and readouts follow
+                if self.mon.spent():               # a long way: a fresh picture
+                    self.mon.begin_cycle()
+                    self.mon.mark("by hand")
+        return "there"
 
     def cmd_step(self, delta_nm: float) -> None:
         """Igor's PiezoStepCloser / PiezoStepApart: closer is +nm."""
@@ -1899,7 +2267,7 @@ class Worker(threading.Thread):
 
     def readout(self) -> None:
         rig = self.rig
-        c = self.mon.snapshot()
+        c = self.mon.last()
         rec = c.last_record
         M, C = self.cfg.channels, self.cfg.cal
         if rec is not None and rec.shape[1] >= 4:
@@ -2847,12 +3215,39 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     ttk.Label(sf, text="turn the screw in slowly; the light and the beep say "
                        "contact; then Start N",
               font=("Arial", 9)).grid(row=1, column=0, columnspan=3, sticky="w", padx=2)
+    if cfg.simulate:
+        # The simulator has no screw to turn: this box is one. It puts the
+        # pretend surface where a real one ends up (near 8 V, say), or out
+        # of the piezo's reach (the worker's cmd_sim_surface).
+        ssf = ttk.Frame(sf)
+        ssf.grid(row=2, column=0, columnspan=3, sticky="w", padx=2, pady=(2, 0))
+        ttk.Label(ssf, text="simulator's screw: surface at",
+                  font=("Arial", 9)).pack(side="left")
+        surface_var = tk.StringVar(
+            value=f"{getattr(rig._session, 'surface_nm', 300.0):g}")
+        ttk.Entry(ssf, textvariable=surface_var, width=7).pack(side="left", padx=2)
+        ttk.Label(ssf, text="nm up the piezo's travel",
+                  font=("Arial", 9)).pack(side="left")
+
+        def turn_screw():
+            try:
+                nm = float(surface_var.get())
+            except ValueError:
+                set_status(f"simulator's screw: '{surface_var.get()}' is not a "
+                           "number of nm", "bad")
+                return
+            hand_move("sim_surface", nm)
+        ttk.Button(ssf, text="Turn", width=5, command=turn_screw).pack(
+            side="left", padx=4)
 
     def apply_contact(*_a):
         try:
             contact["ua"] = abs(float(contact_var.get()))
         except ValueError:
-            pass
+            return
+        # The same current is a sign of contact for a move toward the
+        # surface made by hand (Approach, the sliders, Step closer).
+        worker.contact_ua = contact["ua"]
     contact_var.trace_add("write", apply_contact)
 
     def show_mode():
@@ -2898,27 +3293,169 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         try:
             nm = abs(float(z_var.get()))
         except ValueError:
+            nm = float("nan")
+        if not math.isfinite(nm):
             set_status(f"Z: '{z_var.get()}' is not a number")
             return
         hand_move("step", sign * nm)
 
+    # The driver box: where its switch stands and how far the stage moves in
+    # all. Every distance in this window hangs on these two (the worker's
+    # cmd_piezo_mode has the arithmetic, and the reason a change of mode
+    # takes the piezo to 0 V first). Pick, type, Set: nothing changes
+    # before Set, and the line under the row says what Set would do.
+    df = ttk.Frame(pb)
+    df.grid(row=0, column=0, columnspan=3, sticky="w", padx=2, pady=(1, 0))
+    ttk.Label(df, text="Driver", font=("Arial", 9, "bold")).pack(side="left")
+    pmode_var = tk.StringVar(value=str(C.piezo_mode).lower())
+    ptotal_var = tk.StringVar(
+        value="" if C.piezo_total_um is None else f"{C.piezo_total_um:g}")
+    for word in ("standard", "bypass"):
+        ttk.Radiobutton(df, text=word, value=word, variable=pmode_var).pack(
+            side="left", padx=(6, 0))
+    ttk.Label(df, text="total displacement", font=("Arial", 9)).pack(
+        side="left", padx=(12, 2))
+    pt_entry = ttk.Entry(df, textvariable=ptotal_var, width=8)
+    pt_entry.pack(side="left")
+    ttk.Label(df, text="um", font=("Arial", 9)).pack(side="left", padx=(2, 6))
+    ttk.Button(df, text="Set", width=5, command=lambda: set_piezo()).pack(side="left")
+    drive_lbl = tk.Label(pb, text="", font=("Arial", 9, "bold"), anchor="w",
+                         justify="left", wraplength=px(540), fg="#006000")
+    drive_lbl.grid(row=1, column=0, columnspan=3, sticky="w", padx=4)
+    piezo_ui = {"showing": False}
+
+    def piezo_numbers(mode: str, total_um: float) -> str:
+        """What a mode and a total displacement come to, in words."""
+        per_volt = total_um * 1e3 / C.piezo_drive_full_v * (
+            C.piezo_drive_gain if mode == "standard" else 1.0)
+        return (f"1 V at the card = {per_volt:.2f} nm; the whole {lo_v:g} to "
+                f"{hi_v:g} V = {(hi_v - lo_v) * per_volt:.0f} nm")
+
+    def piezo_label():
+        """The driver as the program has it now."""
+        mode, total = str(C.piezo_mode).lower(), C.piezo_total_um
+        if total is None:
+            drive_lbl.config(fg="#b06000", text=(
+                "no total displacement set: the config's own "
+                f"{C.piezo_nm_per_volt:g} nm per volt is used. Type the stage's "
+                "total displacement (10.776, say), pick the mode, press Set"))
+        else:
+            drive_lbl.config(fg="#006000",
+                             text=f"{mode.upper()}: " + piezo_numbers(mode, total))
+
+    def show_piezo(_p: dict | None = None):
+        """After Set, and at start-up: the row and the sliders follow the
+        program's mode and total displacement."""
+        piezo_ui["showing"] = True
+        try:
+            pmode_var.set(str(C.piezo_mode).lower())
+            if C.piezo_total_um is not None:
+                ptotal_var.set(f"{C.piezo_total_um:g}")
+        finally:
+            piezo_ui["showing"] = False
+        piezo_label()
+        set_fine_window()
+        on_slide(slider_var.get())
+
+    def preview_piezo(*_a):
+        """What Set would do, while the row differs from what is applied."""
+        if piezo_ui["showing"]:
+            return
+        mode = pmode_var.get()
+        try:
+            total = float(ptotal_var.get())
+        except ValueError:
+            return
+        if not total > 0:
+            return
+        same_mode = mode == str(C.piezo_mode).lower()
+        if same_mode and C.piezo_total_um is not None and \
+                abs(total - C.piezo_total_um) < 1e-12:
+            piezo_label()
+            return
+        drive_lbl.config(fg="#b06000", text=(
+            f"press Set for {mode.upper()}, {total:g} um: "
+            + piezo_numbers(mode, total)
+            + ("" if same_mode else ". The piezo goes to 0 V first; then put "
+               f"the driver's switch on {mode.upper()}")))
+
+    def set_piezo():
+        try:
+            total = float(ptotal_var.get())
+        except ValueError:
+            set_status(f"total displacement: '{ptotal_var.get()}' is not a "
+                       "number of micrometres", "bad")
+            return
+        if not hand_move("piezo_mode", pmode_var.get(), total):
+            show_piezo()                           # busy: back to what is applied
+    pmode_var.trace_add("write", preview_piezo)
+    ptotal_var.trace_add("write", preview_piezo)
+    pt_entry.bind("<Return>", lambda _e: set_piezo())
+
     ttk.Button(pb, text="Step apart", command=lambda: on_step(-1)).grid(
-        row=0, column=0, padx=2, pady=1, sticky="ew")
+        row=2, column=0, padx=2, pady=1, sticky="ew")
     zf = ttk.Frame(pb)
-    zf.grid(row=0, column=1, padx=2)
+    zf.grid(row=2, column=1, padx=2)
     ttk.Label(zf, text="Z (nm)", font=("Arial", 9)).pack(side="left")
     ttk.Entry(zf, textvariable=z_var, width=6).pack(side="left", padx=2)
     ttk.Button(pb, text="Step closer", command=lambda: on_step(+1)).grid(
-        row=0, column=2, padx=2, pady=1, sticky="ew")
+        row=2, column=2, padx=2, pady=1, sticky="ew")
 
-    slider_var = tk.DoubleVar(value=rig.piezo_v)
-    slide = {"dragging": False}
-    target_lbl = ttk.Label(pb, text="", font=("Arial", 9))
+    slider_var = tk.DoubleVar(value=rig.piezo_v)       # coarse: the whole range
+    fine_var = tk.DoubleVar(value=rig.piezo_v)         # fine: a window of it
+    fine_half_var = tk.StringVar(value="0.5")
+    speed_var = tk.StringVar(value=f"{worker.hand_speed_nm_s:g}")
+    # dragging: the mouse is down on a slider (which: that slider). window:
+    # the fine slider's range. half: the last usable "fine: +/-" width.
+    # pressed: where the knob stood when the mouse went down on it.
+    slide = {"dragging": False, "which": None, "window": None, "half": 0.5,
+             "pressed": None}
 
-    def on_slide(value):
-        v = float(value)
-        target_lbl.config(text=f"slider {v:.3f} V = {C.piezo_volts_to_nm(v):.1f} nm"
-                               + ("   (release to move)" if slide["dragging"] else ""))
+    # Approach: the piezo itself comes up to the surface, after the screws
+    # have brought it within reach (the worker's cmd_piezo_approach), at the
+    # speed in the box. The sliders and Step closer go toward the surface at
+    # that speed too, and stop at contact in the same way.
+    apf = ttk.Frame(pb)
+    apf.grid(row=3, column=0, columnspan=3, sticky="w", padx=2, pady=(3, 0))
+    ttk.Button(apf, text="Approach", width=10,
+               command=lambda: hand_move("piezo_approach")).pack(side="left")
+    ttk.Label(apf, text="toward the surface at", font=("Arial", 9)).pack(
+        side="left", padx=(6, 2))
+    ttk.Entry(apf, textvariable=speed_var, width=6).pack(side="left")
+    ttk.Label(apf, text="nm/s, stopping at contact (the sliders too)",
+              font=("Arial", 9)).pack(side="left", padx=(2, 0))
+
+    def knob_strip(row: int):
+        """A thin strip over a slider, for the label that rides on its knob:
+        the volts and the nanometres. (Tk's own number over a knob can only
+        be the slider's value, the volts.)"""
+        strip = tk.Frame(pb, height=px(17))
+        strip.grid(row=row, column=0, columnspan=3, sticky="ew", padx=4)
+        return strip, tk.Label(strip, text="", font=("Arial", 9, "bold"))
+
+    def show_knobs(*_a):
+        """The label on each slider's knob: where the knob is, in volts and
+        in nanometres. While the mouse holds a knob, that is where the piezo
+        will go, and the label says so."""
+        for sc, var, strip, lbl, digits in knobs:
+            # The variable, not the slider's own rounded value: with the
+            # piezo at 8.0271 V both labels say 8650.0 nm, though the coarse
+            # slider can only stand on 8.027 V.
+            v = float(var.get())
+            held = slide["dragging"] and slide["which"] is sc
+            lbl.config(text=f"{v:.{digits}f} V = {C.piezo_volts_to_nm(v):.1f} nm"
+                            + ("  (release to move)" if held else ""),
+                       fg="#b06000" if held else "#202020")
+            try:
+                x = float(sc.coords()[0])           # the knob, in pixels
+            except (tk.TclError, IndexError, ValueError):
+                x = 0.0
+            half = lbl.winfo_reqwidth() / 2.0       # kept inside the strip
+            x = min(max(x, half), max(half, strip.winfo_width() - half))
+            lbl.place(x=x, y=0, anchor="n")
+
+    def on_slide(_value=None):
+        show_knobs()
         if slide["dragging"]:
             # Igor's readouts kept ticking under a held mouse. Tk's timers
             # should too, but a drag floods the event queue with motion
@@ -2929,38 +3466,134 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                 poll_body()
                 root.update_idletasks()
 
-    # The classic Tk scale, not the themed one: it has a knob you can see,
-    # a 1 mV resolution when dragged, a 0.1 V step for a click beside the
-    # knob (the themed scale jumped a whole volt per click), the value shown
-    # over the knob and a tick every volt, which is what Igor's looked like.
+    # Two sliders on the one piezo output. The classic Tk scale, not the
+    # themed one: it has a knob you can see and ticks, which is what Igor's
+    # looked like. Over each knob rides a label with its volts and its
+    # nanometres (knob_strip, show_knobs).
+    # COARSE: the piezo's whole range, in steps of 1 mV. With a micrometre
+    # to the volt this is the one for coming up to the surface after the
+    # screws.
+    # FINE: a window of the range, half a volt either side of where the
+    # piezo is (the box beside it), in steps of 0.1 mV. The window is put
+    # on round numbers (7.5 to 8.5 V around 7.99 V), is cut off where the
+    # piezo's range ends, and walks along whenever the piezo nears one of
+    # its ends (fine_window). After Approach the piezo is at the contact,
+    # so the window is around the contact. Its two ends are written under
+    # it, in volts and in nanometres.
+    # On either: drag the knob and let go, or click beside the knob for one
+    # step that way (hold the mouse down for more). A click on the knob
+    # that does not move it moves nothing.
+    ttk.Label(pb, text="coarse: the whole range (V)", font=("Arial", 9)).grid(
+        row=4, column=0, columnspan=3, sticky="w", padx=4, pady=(4, 0))
+    coarse_strip, coarse_knob = knob_strip(5)
     scale = tk.Scale(pb, from_=lo_v, to=hi_v, orient="horizontal",
                      variable=slider_var, command=on_slide, length=px(360),
                      resolution=0.001, bigincrement=0.1, tickinterval=1.0,
-                     showvalue=True, sliderlength=18, font=("Arial", 9))
-    scale.grid(row=1, column=0, columnspan=3, sticky="ew", padx=4, pady=(6, 0))
-    target_lbl.grid(row=2, column=0, columnspan=3, sticky="w", padx=4)
+                     showvalue=False, sliderlength=18, font=("Arial", 9))
+    scale.grid(row=6, column=0, columnspan=3, sticky="ew", padx=4)
+    ff = ttk.Frame(pb)
+    ff.grid(row=7, column=0, columnspan=3, sticky="w", padx=4, pady=(3, 0))
+    ttk.Label(ff, text="fine: +/-", font=("Arial", 9)).pack(side="left")
+    ttk.Entry(ff, textvariable=fine_half_var, width=5).pack(side="left", padx=2)
+    ttk.Label(ff, text="V around the piezo (after Approach: around the contact)",
+              font=("Arial", 9)).pack(side="left")
+    fine_strip, fine_knob = knob_strip(8)
+    fine = tk.Scale(pb, from_=lo_v, to=hi_v, orient="horizontal",
+                    variable=fine_var, command=on_slide, length=px(360),
+                    resolution=0.0001, bigincrement=0.01, showvalue=False,
+                    sliderlength=18, font=("Arial", 9))
+    fine.grid(row=9, column=0, columnspan=3, sticky="ew", padx=4)
+    knobs = ((scale, slider_var, coarse_strip, coarse_knob, 3),
+             (fine, fine_var, fine_strip, fine_knob, 4))
+    # The two ends of the fine window, written out in volts and nanometres
+    # (Tk's own tick labels round 7.45 to "7.5", and know no nanometres).
+    fl = ttk.Frame(pb)
+    fl.grid(row=10, column=0, columnspan=3, sticky="ew", padx=6)
+    fine_lo_lbl = ttk.Label(fl, text="", font=("Arial", 9))
+    fine_lo_lbl.pack(side="left")
+    fine_hi_lbl = ttk.Label(fl, text="", font=("Arial", 9))
+    fine_hi_lbl.pack(side="right")
 
-    def on_press(_e):
-        slide["dragging"] = True
+    def set_fine_window(volts: float | None = None):
+        """Put the fine slider's window around ``volts`` (default: where
+        the piezo is) and its knob on it. Always: while the "fine: +/-"
+        box holds nothing usable (it is being typed in), the last usable
+        width stays, so the knob is never left where the piezo is not."""
+        try:
+            half = abs(float(fine_half_var.get()))
+        except ValueError:
+            half = float("nan")
+        if 0.001 <= half <= hi_v - lo_v:
+            slide["half"] = half
+        v = rig.piezo_v if volts is None else float(volts)
+        window = fine_window(v, slide["half"], lo_v, hi_v)
+        if slide["window"] != window:
+            slide["window"] = window
+            fine.config(from_=window[0], to=window[1])
+        fine_var.set(min(max(v, window[0]), window[1]))
+        # The ends in nanometres change with the driver's mode, not only
+        # with the window: written afresh every time.
+        fine_lo_lbl.config(
+            text=f"{window[0]:g} V = {C.piezo_volts_to_nm(window[0]):.0f} nm")
+        fine_hi_lbl.config(
+            text=f"{window[1]:g} V = {C.piezo_volts_to_nm(window[1]):.0f} nm")
+        show_knobs()
+    fine_half_var.trace_add("write", lambda *_a: set_fine_window())
 
-    def on_release(_e):
-        slide["dragging"] = False
-        v = float(slider_var.get())
-        if not hand_move("goto", v):
-            slider_var.set(rig.piezo_v)         # put it back where the piezo is
-        on_slide(slider_var.get())
+    def set_speed(*_a):
+        """How fast a move toward the surface made by hand goes."""
+        try:
+            speed = float(speed_var.get())
+        except ValueError:
+            return
+        if 1.0 <= speed <= 5000.0:
+            worker.hand_speed_nm_s = speed
+    speed_var.trace_add("write", set_speed)
+
+    def pressed(widget, var):
+        def on_press(_e):
+            slide["dragging"], slide["which"] = True, widget
+            slide["pressed"] = float(var.get())     # where the knob stands
+            show_knobs()
+        return on_press
+
     def on_drag(_e):
         # The same refresh as on_slide's, from the motion event itself, in
         # case the platform does not call the scale's -command mid-drag.
+        show_knobs()
         if slide["dragging"] and time.monotonic() - live.get("last_poll", 0.0) > 0.15:
             poll_body()
             root.update_idletasks()
-    scale.bind("<ButtonPress-1>", on_press, add="+")
-    scale.bind("<B1-Motion>", on_drag, add="+")
-    scale.bind("<ButtonRelease-1>", on_release, add="+")
+
+    def released(var):
+        def on_release(_e):
+            slide["dragging"], slide["which"] = False, None
+            v = float(var.get())
+            was, slide["pressed"] = slide["pressed"], None
+            # Only a knob that was moved moves the piezo. A click on the
+            # knob that leaves it where it is asks for nothing (was: the
+            # value when the mouse went down; None: it never went down on
+            # the slider in the ordinary way).
+            if was is None or abs(v - was) < 1e-9 or not hand_move("goto", v):
+                slider_var.set(rig.piezo_v)         # both knobs back on the piezo
+                set_fine_window()
+            on_slide()
+        return on_release
+    for widget, var in ((scale, slider_var), (fine, fine_var)):
+        widget.bind("<ButtonPress-1>", pressed(widget, var), add="+")
+        widget.bind("<B1-Motion>", on_drag, add="+")
+        widget.bind("<ButtonRelease-1>", released(var), add="+")
+        # Tk's own Control-click sends a scale's knob to the END of its
+        # range: one slip, and the piezo is asked for 10 V. Not here.
+        widget.bind("<Control-ButtonPress-1>", lambda _e: "break")
+        # The knob's label is placed by the knob's pixels: again whenever
+        # the slider is laid out anew.
+        widget.bind("<Configure>", show_knobs, add="+")
+    set_fine_window()
+    piezo_label()
 
     rof = ttk.Frame(pb)
-    rof.grid(row=3, column=0, columnspan=3, sticky="ew", padx=2, pady=(3, 1))
+    rof.grid(row=11, column=0, columnspan=3, sticky="ew", padx=2, pady=(3, 1))
     big: dict[str, tk.Label] = {}
     cells = [("i", "I (uA)"), ("v", "V (mV)"), ("p", "Piezo (V)"), ("s", "Sense (V)")]
     if has_ch2:
@@ -2977,10 +3610,10 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     bkgd_var = tk.BooleanVar(value=True)
     beep_var = tk.BooleanVar(value=True)
     ttk.Checkbutton(pb, text="background sampling while idle (Igor: Beep is ON)",
-                    variable=bkgd_var).grid(row=4, column=0, columnspan=2,
+                    variable=bkgd_var).grid(row=12, column=0, columnspan=2,
                                             sticky="w", padx=2)
     ttk.Checkbutton(pb, text="beep at the contact current",
-                    variable=beep_var).grid(row=4, column=2, sticky="w", padx=2)
+                    variable=beep_var).grid(row=12, column=2, sticky="w", padx=2)
 
     def show_big(i_ua, v_mv, piezo_v, sense_v, beep_ok: bool = False, ch2=None):
         big["i"].config(text=f"{i_ua:9.4f}" if np.isfinite(i_ua) else "--")
@@ -2996,7 +3629,13 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         big["p"].config(text=f"{piezo_v:7.4f}")
         big["s"].config(text=f"{sense_v:7.4f}" if sense_v is not None else "none")
         if not slide["dragging"]:
-            slider_var.set(piezo_v)             # the slider follows every move
+            slider_var.set(piezo_v)             # both sliders follow every move
+            low, high = slide["window"] or (lo_v, hi_v)
+            edge = 0.1 * (high - low)
+            if low + edge <= piezo_v <= high - edge:
+                fine_var.set(piezo_v)
+            else:
+                set_fine_window(piezo_v)        # the fine window walks along
             on_slide(piezo_v)
         touching = np.isfinite(i_ua) and abs(i_ua) > contact["ua"]
         contact_lbl.config(text=" CONTACT " if touching else "  OPEN  ",
@@ -4095,12 +4734,15 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                 # panels show it at once, whatever "redraw while moving" says.
                 live["cycle"] = p["cycle"]
                 live["dirty"] = True
+                set_fine_window()               # the fine window, around where it ended
             elif kind == "keithley":
                 show_keithley(p)
             elif kind == "ai_modes":
                 show_ai_modes(p)
             elif kind == "amplifier":
                 show_amplifier(p)
+            elif kind == "piezo":
+                show_piezo(p)
             elif kind == "paused":
                 set_continue(bool(p["remaining"]))
             elif kind == "actuator":
@@ -4161,7 +4803,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             # command runs, follow the tracker and the last play's record,
             # so the slider walks up the staircase and down the pull and
             # the readouts show the junction closing, as Igor's did.
-            cyc = mon.snapshot()
+            cyc = mon.last()
             rec = cyc.last_record
             if rec is not None and rec.shape[1] >= 4:
                 tail = rec[:, rec.shape[1] // 2:]
@@ -4278,11 +4920,23 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     worker.send("noop")                              # first readout
     worker.send("ai_modes")                          # the card's input modes
     worker.send("amplifier")                         # one current channel or two
+    worker.send("piezo")                             # the driver's mode and total
     root.after(150, poll)
     if readback:
         root.after(400, open_readback)
     if autoclose is not None:
+        # v72: the driver row and the two sliders. Bypass with 9.3 um in all
+        # is this simulated rig's 62 nm per volt, so nothing else changes;
+        # then the fine window narrowed, the speed of a move made by hand
+        # raised, and one such move toward the surface, before the run.
+        root.after(150, lambda: (pmode_var.set("bypass"), ptotal_var.set("9.3"),
+                                 worker.send("piezo_mode", "bypass", 9.3)))
+        root.after(200, lambda: (fine_half_var.set("0.2"), speed_var.set("400")))
+        root.after(250, lambda: worker.send("goto", 0.15))
         root.after(300, lambda: worker.send("zero"))
+        # v73: Approach, the piezo coming up to the surface by itself, so
+        # that the run starts from a contact the piezo found.
+        root.after(350, lambda: worker.send("piezo_approach"))
         root.after(400, lambda: (name_var.set("smoke"), exp_var.set("clean gold"),
                                  txt_var.set(True)))
         root.after(600, on_run)
