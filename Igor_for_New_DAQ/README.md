@@ -132,9 +132,10 @@ wiring serves both programs.
 5. **Start Writing**, then Background Sampling to watch I, V and Piezo. Move the coarse stage by hand
    until the piezo can reach the surface: press **Start Approach**; at the piezo limit it retracts and
    asks for another fraction of a turn; repeat until it reports contact.
-6. Find Offset, then Start Measurement as before. After the first traces look at `G_DelayOffset` in the
-   history (the alignment delay the card showed); see the `NEWDAQ-NOTE` in `GenerateTrace` if it comes
-   out near 2000 or traces are rejected for a missing pulse.
+6. Find Offset, then Start Measurement as before. After the first traces that are kept, type
+   `print G_DelayOffset` in the command line (the alignment delay the card showed, less one write buffer
+   of 1000 samples) and set `K_ReadExtraPts` from it; see caveat 9. Caveat 9 is also the place to look if
+   traces are rejected with "Did not find both sides of pulse for alignment".
 
 ## Caveats you must read before the first run
 
@@ -174,6 +175,23 @@ wiring serves both programs.
    the threshold, as before.
 7. **Data path** is `C:Data:` (`DataDir` in the setup file), so blocks land in `C:\Data\<date>Merge\`. Create `C:\Data` once, or point `DataDir` elsewhere (Igor colon notation, parent folder must exist).
 8. Start from a **new experiment**: old `.pxp` files carry the old globals and wave sizes.
+9. **The trace read is half a second longer than the pull (since 2026-11-20), and that number is a first
+   try.** `GenerateTrace` records `K_ReadExtraPts` samples more than it sends out (the constant is at the
+   top of `Functions_STMBJ.ipf`, with its reason). What is written to the card comes out of it later than
+   it is written, and the 5 ms alignment spike at the end of the pull has to be inside the recording, or
+   the trace is thrown away with "Did not find both sides of pulse for alignment". The room was 2000
+   samples (50 ms), tuned on the old PXI card. On the USB-6453 the first traces were all thrown away with
+   that message (lab PC, 2026-11-20). NI's specification gives the card an output memory of 16,383
+   samples shared by the outputs in use, about 8,000 for each of the two here (0.2 s), so the spike very
+   probably came out after the recording had ended. The room is 20000 now. **The delay itself has not
+   been measured**: after a trace that was kept, `print G_DelayOffset` gives it less 1000, and the
+   constant can then be set to the delay plus a few thousand (every trace is as much longer as the room).
+   If the message is still there with 20000, the spike is missing for another reason: the junction is
+   still closed at the end of the pull (in contact the junction voltage is near zero, so the flip of the
+   bias does not show), or the junction voltage does not reach its input. `Display VoltageIn` after a
+   rejected trace shows which: a level at the tip bias with no short jump to the other sign near the
+   end, or something else. The Python program does not have this delay: it hands the card a whole pull
+   at once and the card starts the output and the recording together.
 
 ## Pre-existing quirks the tests found (not changed)
 
@@ -242,8 +260,14 @@ Tested on this Mac with Igor Pro 8.04 (64-bit), with the Windows-only XOP replac
 - **Static checker against the original** (`tests/check_igor.py --baseline`): 0 regressions; the two
   errors it reports are pre-existing (items 3 above); 7 baseline findings resolved by the port.
 
+- **2026-11-20, `K_ReadExtraPts`** (caveat 9): the static checker shows the same findings as before the
+  change. The compile and the simulated run have NOT been repeated in Igor since this change; the
+  simulated card recognises a trace read by the same constant (`tests/MX_Sim_for_test.ipf`), so the two
+  commands below are the way to repeat them.
+
 Not tested, because it needs the lab PC: the real XOP with the real card (channel grouping of the read
-buffer, the RSE/differential question, the on-demand counter-electrode task), and the 32-bit Igor.
+buffer, the RSE/differential question, the on-demand counter-electrode task, the output delay of caveat
+9), and the 32-bit Igor.
 
 To repeat the Mac tests from this folder (**warning: the script quits and relaunches Igor64 on this Mac;
 save any open Igor experiment first**):

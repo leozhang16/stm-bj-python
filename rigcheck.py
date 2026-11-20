@@ -69,7 +69,7 @@ from stmlab.config import RigConfig                                  # noqa: E40
 from stmlab.tklook import _light_window, windows_look                # noqa: E402
 
 # Since v71 the bench window carries the repository's version (pullout's).
-__version__ = "v73"
+__version__ = "v74"
 log = logging.getLogger("rigcheck")
 
 TERMINALS = ("card default", "differential", "RSE", "NRSE")

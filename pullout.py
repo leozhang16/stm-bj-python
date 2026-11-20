@@ -187,8 +187,9 @@ from stmlab.tklook import WIN_BG, _light_window, windows_look       # noqa: E402
 log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
-# version it applies to and you can see which one you have.
-__version__ = "v73"
+# version it applies to and you can see which one you have. (v74 is
+# noisecheck.py, a separate program: pullout itself is as it was in v73.)
+__version__ = "v74"
 
 # What the Saving tab holds when nothing is remembered yet. ``folder`` is
 # the data folder (the day folder is made under it); ``setup_id`` is Igor's

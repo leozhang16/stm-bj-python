@@ -31,6 +31,29 @@
 Constant K_PiezoMinVolt = 0
 Constant K_PiezoMaxVolt = 10
 
+// ---------------------------------------------------------------------------
+// [NEWDAQ] ROOM FOR THE CARD'S OUTPUT DELAY IN A TRACE READ (2026-11-20)
+// GenerateTrace records K_ReadExtraPts samples more than it sends out. What is written
+// to the card comes out of it later than it is written, and the 5 ms alignment spike
+// at the end of the pull has to be inside the recording. If it is not, the trace is
+// thrown away with "Did not find both sides of pulse for alignment".
+// This was the number 2000 inside GenerateTrace (50 ms at 40 kHz), tuned on the old
+// PXI-4461. On the USB-6453 the first traces were all thrown away with that message
+// (lab PC, 2026-11-20). NI's specification gives that card an output memory of 16383
+// samples shared by the outputs in use: about 8000 for each of our two, 0.2 s. So the
+// spike very probably came out after the recording had ended. THE DELAY HAS NOT BEEN
+// MEASURED YET: 20000 (half a second) is a generous first try, and it makes every
+// trace half a second longer.
+// To measure it: after a trace that was kept, type  print G_DelayOffset  in the
+// command line. The card's delay is that number plus one write buffer (1000). Then
+// set this constant to the delay plus a few thousand.
+// If the message is still there with 20000, the spike is missing for another reason
+// (the junction still closed at the end of the pull, or the junction voltage not
+// reaching its input): type  Display VoltageIn  and look.
+// tests/MX_Sim_for_test.ipf uses this constant to recognise a trace read.
+// ---------------------------------------------------------------------------
+Constant K_ReadExtraPts = 20000
+
 // v limited to K_PiezoMinVolt..K_PiezoMaxVolt. A broken number (NaN or Inf) gives
 // K_PiezoMinVolt: fully retracted, the safe end.
 Function PiezoSafeVolt(v)
@@ -387,11 +410,11 @@ Function GenerateTrace()
 
 	Variable HighResFrontPulsePt, error
 	Variable k=0
-	// [NEWDAQ-NOTE] The 2000 extra samples (50 ms at 40 kHz) are the room for the card's output-to-input latency: the
-	// [NEWDAQ-NOTE] alignment spike has to land inside the last 6000 samples searched by FindLevels below. Tuned on the
-	// [NEWDAQ-NOTE] PXI-4461, not yet measured on the USB-6453. If the first real traces print "Did not find both sides
-	// [NEWDAQ-NOTE] of pulse" or G_DelayOffset comes out near 2000, raise this 2000 (and the 6000 in the FindLevels range).
-	Variable NumPtsIn= NumPtsInAppliedWaves+2000
+	// [NEWDAQ-NOTE] The extra samples are the room for the card's output-to-input latency: the alignment spike has to
+	// [NEWDAQ-NOTE] land inside the recording, in the part searched by FindLevels below. The room is K_ReadExtraPts,
+	// [NEWDAQ-NOTE] declared at the top of this file with its reason. Until 2026-11-20 it was the number 2000 here,
+	// [NEWDAQ-NOTE] tuned on the PXI-4461; on the USB-6453 that threw every trace away ("Did not find both sides of pulse").
+	Variable NumPtsIn= NumPtsInAppliedWaves+K_ReadExtraPts
 	Variable NumSeg=NumPtsInAppliedWaves/WriteBufferSize
 	Variable PiezoOrigin=DCOffset_nm/K_ZPiezoScale
 
@@ -482,9 +505,12 @@ Function GenerateTrace()
 	//[NEWDAQ-REMOVED: LowRes] LowHighOffset=GetLowHighOffset(CurrentIn, CurrentInLowRes)
 
 	Make/O destWave
-	FindLevels/Q/P/R=[NumPtsIn-1,NumPtsIn-6000]/EDGE=0/N=2 VoltageIn, 0	// [NEWDAQ] alignment pulse found in the one-card voltage (was VoltageInLowRes)
+	// [NEWDAQ] Searched from the end of the recording back to 4000 samples before the end of the applied waves. That
+	// [NEWDAQ] is where the search always ended: it was NumPtsIn-6000 when NumPtsIn was NumPtsInAppliedWaves+2000.
+	Variable SearchEndPt= NumPtsInAppliedWaves-4000
+	FindLevels/Q/P/R=[NumPtsIn-1,SearchEndPt]/EDGE=0/N=2 VoltageIn, 0	// [NEWDAQ] alignment pulse found in the one-card voltage (was VoltageInLowRes)
 	if (V_flag!=0)
-		print "GenerateTrace: Did not find both sides of pulse for alignment"
+		print "GenerateTrace: Did not find both sides of pulse for alignment (trace not saved; see K_ReadExtraPts at the top of Functions_STMBJ.ipf)"
 		return -1
 	endif
 	HighResFrontPulsePt=round(W_Findlevels[1])

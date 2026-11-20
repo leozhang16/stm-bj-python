@@ -320,3 +320,30 @@ Lines carry `[NEWDAQ-SAFETY]`.
 - Tests: `tests/MX_Sim_for_test.ipf` records the lowest/highest piezo voltage any write asked for and
   refuses a write outside the channel range; `tests/Smoke_NewDAQ.ipf` checks the range at the end of
   passes 1 and 2 and adds pass 3, `ClaudePiezoSafetyRun`.
+
+## 10. Room for the card's output delay in a trace read (2026-11-20, after the first run on the lab PC)
+
+- First run on the USB-6453: every trace was rejected with "GenerateTrace: Did not find both sides of
+  pulse for alignment" (seven in a row in the history the user photographed). `GenerateTrace` returns -1
+  for such a trace and `SingleBreakJunctionAttempt` saves nothing, so the histogram stayed empty.
+- `Functions_STMBJ.ipf`: new constant `K_ReadExtraPts = 20000` beside the piezo limits, with the reason.
+  `GenerateTrace`: `NumPtsIn = NumPtsInAppliedWaves + K_ReadExtraPts` (was `+2000`); the search for the
+  spike runs from the end of the recording back to `NumPtsInAppliedWaves - 4000`, a local `SearchEndPt`
+  (was `NumPtsIn-6000`, which is the same point when the room is 2000); the message now ends with
+  "(trace not saved; see K_ReadExtraPts at the top of Functions_STMBJ.ipf)".
+- Why 20000: the writing task is continuous with a 1000-sample buffer and is fed a pull in 1000-sample
+  pieces while a separate finite read runs. NI's USB-6453 specification: "Output FIFO size 16,383
+  samples shared among channels used", about 8,000 per output with two outputs, 0.2 s at 40 kHz. The old
+  room was 50 ms. 20000 samples (0.5 s) is a generous first try. NOT MEASURED: `G_DelayOffset` after a
+  kept trace is the delay less `WriteBufferSize`.
+- Other causes of the same message, if it stays: the junction still closed at the end of the pull (the
+  junction voltage is then near zero and the flip of the bias does not cross zero), or the junction
+  voltage not reaching `HighResVoltageIn`.
+- Probably not the cause: the user's setup file on the lab PC names `Dev1/ai2`, `Dev1/ai21`, `Dev1/ai5`
+  (pins whose default is differential, README caveat 2; NI's specification says so for AI 0-7 and
+  AI 16-23). He reports that every bottom terminal of the connector is tied to the same ground. If those
+  are the partner pins (AI 8-15, AI 24-31), differential and single-ended read the same. Not verified
+  from here; Background Sampling showing the tip bias with the junction open would confirm it.
+- `tests/MX_Sim_for_test.ipf` recognises a trace read by `traceLen + K_ReadExtraPts` (was `+ 2000`).
+- Checked with `tests/check_igor.py` only (same findings as before). Not compiled and not run in Igor
+  since the change.

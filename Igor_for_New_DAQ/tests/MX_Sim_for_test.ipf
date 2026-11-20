@@ -16,7 +16,7 @@
 //     sample, the applied bias as the junction-voltage monitor, the preamp
 //     output for a junction whose conductance depends on the piezo extension,
 //     and the piezo sense readback.
-//   * Reads whose length equals G_NumPtsInAppliedWaves + 2000 (the trace read
+//   * Reads whose length equals G_NumPtsInAppliedWaves + K_ReadExtraPts (the trace read
 //     in GenerateTrace) are "trace reads": they return the trace with a fixed
 //     output-to-input delay of sim_DelayPts samples, exactly the thing
 //     GenerateTrace has to recover from the alignment spike. Any other read is
@@ -333,7 +333,7 @@ Function MXReadAnalogF64(task, timeout, numChans, w)
 		traceLen = NumPtsApplied
 	endif
 	Variable histLen = numpnts(ph)
-	if (traceLen > 0 && n == traceLen + 2000 && histLen >= traceLen + 1000)
+	if (traceLen > 0 && n == traceLen + K_ReadExtraPts && histLen >= traceLen + 1000)	// K_ReadExtraPts: Functions_STMBJ.ipf (was 2000)
 		// trace read: the trace was written as traceLen samples followed by one 1000-sample hold buffer
 		Variable traceStart = histLen - 1000 - traceLen
 		sim_rdPiezo = ph[limit(traceStart - delay + p, 0, histLen-1)]
