@@ -232,20 +232,43 @@ class Selection:
     plateau_counts: float = float("nan")
 
 
+def blank_railed(g0_2, railed2) -> np.ndarray:
+    """Channel 2's conductance with NaN wherever its output was saturated
+    (``railed2``, a boolean per point).
+
+    A saturated output is not a measurement. The current it stands for is
+    the rail divided by the gain, whatever the junction did, and because
+    the conductance is that current divided by the junction voltage -- which
+    still follows the junction through the series resistor -- the result is
+    not a flat line either: it has steps where the gold steps are and
+    makes peaks in a histogram, at conductances that are simply wrong
+    (at 300 mV through 100 kohm, about 0.38 G0 for the 1 G0 plateau). So
+    those points are left out: NaN is not drawn and not counted.
+    """
+    g0_2 = np.asarray(g0_2, dtype=float)
+    return np.where(np.asarray(railed2, dtype=bool), np.nan, g0_2)
+
+
 def open_side(g0, g0_2=None, railed2=None) -> np.ndarray:
-    """The conductance the *open* side of a trace is judged on.
+    """The two channels of a two-channel amplifier as one trace: the
+    conductance the *open* side of a trace is judged on.
 
     With one current channel that is the trace itself. With both outputs
     of a two-channel amplifier it is channel 2 (``g0_2``, the higher-gain
     output) wherever that is in range, and channel 1 (``g0``) wherever
-    channel 2 is at its rail (``railed2``, a boolean per point). At the
+    channel 2 is at its rail (``railed2``, a boolean per point) or has no
+    value (NaN: channel 2 as :func:`blank_railed` leaves it). At the
     break threshold channel 1 is down in its own noise and offset; where
     channel 2 is railed the current is large and channel 1 is good.
-    ``railed2=None`` takes channel 2 as it is, for data that keeps no raw
+    ``railed2=None`` goes by the NaN alone, for data that keeps no raw
     volts to tell by (the Igor day folders).
 
-    For decisions only -- did this trace end in an open junction -- never
-    for what is drawn or saved, where each channel stays as measured.
+    It is what the decisions read -- did this trace end in an open
+    junction -- and, since v75, what the files for Igor and MATLAB hold
+    as channel 2 (the ``ch2`` subfolder, the ``_ch2.txt`` table), because
+    those programs need the contact part of a trace. It is never what is
+    drawn as channel 2: on the screen channel 2 ends where its output
+    saturates.
     """
     g0 = np.asarray(g0, dtype=float)
     if g0_2 is None:
@@ -253,9 +276,10 @@ def open_side(g0, g0_2=None, railed2=None) -> np.ndarray:
     g0_2 = np.asarray(g0_2, dtype=float)
     if g0_2.shape != g0.shape:
         return g0
-    if railed2 is None:
-        return g0_2
-    return np.where(np.asarray(railed2, dtype=bool), g0, g0_2)
+    other = np.isnan(g0_2)
+    if railed2 is not None:
+        other = other | np.asarray(railed2, dtype=bool)
+    return np.where(other, g0, g0_2)
 
 
 def select_trace(g0: np.ndarray, ramp: RampConfig,

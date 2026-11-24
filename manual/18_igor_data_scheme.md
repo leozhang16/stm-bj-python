@@ -415,6 +415,17 @@ for anything that reads one: point the Igor macro at
 channels (chapter 22); the raw `.h5` holds both channels' volts
 (`current_v`, `current2_v`) with both gains in its config.
 
+**Where channel 2's output was saturated, its ConductanceBlock holds
+channel 1's conductance (v75).** Igor's analysis counts a trace only when
+its first 2 % average above 1.02 G0 and finds 0 nm where the trace falls
+through 0.5 G0, so it needs the contact part, which a saturated channel 2
+cannot give. A column of `ch2` is therefore one whole trace: channel 2
+wherever it measured, channel 1 above that. The wave note ends `current
+channel 2; where its output was saturated the conductance is channel 1's`.
+The CurrentBlock in `ch2` is channel 2's own current, saturated where it
+was. Up to v74 the block held the saturated numbers themselves, which gave
+peaks at the wrong conductances (chapter 22 has the arithmetic).
+
 ## Opening a Python day in Igor
 
 Point the analysis macro's path at the day folder (its merge mode,

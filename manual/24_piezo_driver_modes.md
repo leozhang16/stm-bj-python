@@ -4,11 +4,13 @@
 `piezo_drive_full_v`, `piezo_drive_gain`, `piezo_scale`, `sense_scale`,
 `apply_piezo_mode`), `stmlab/instrument.py` (`Rig.piezo_glide_to`, and the
 `tail` of `conductance_of` and `is_saturated`, `current_ua_of`),
-`pullout.py` v72 and v73 (`fine_window`; `Worker.cmd_piezo_mode`,
+`pullout.py` v72, v73 and v75 (`fine_window`; `Worker.cmd_piezo_mode`,
 `piezo_state`, `cmd_goto`, `cmd_piezo_approach`, `_approach_by_hand`,
-`_closed`, `cmd_sim_surface`; the Driver row, the Approach button and the
+`_closed`, `cmd_sim_surface`; since v75 `cmd_follow`, `follow_begin`,
+`follow_to`, `follow_end`; the Driver row, the Approach button and the
 two sliders of the Piezo box).
-Tests: `tests/test_v72_piezo.py`, `tests/test_v73_approach.py`.*
+Tests: `tests/test_v72_piezo.py`, `tests/test_v73_approach.py`,
+`tests/test_v75_channel2_sliders.py`.*
 
 Every distance this program moves the tip is a voltage at the card divided
 by one number: how many nanometres the piezo moves per volt. This chapter is
@@ -139,19 +141,49 @@ output.
 
 On each knob rides a label with where the knob is, in volts and in
 nanometres: `8.027 V = 8650.0 nm`. Both knobs stand on the piezo: they are
-two rulers on one position. While the mouse holds a knob the label turns
-orange and says `(release to move)`: that is where the piezo will go.
+two rulers on one position.
 
-How a slider is worked:
+How a slider is worked (since v75: the piezo follows the slider):
 
-- **Drag the knob and let go.** The piezo moves when the mouse is released,
-  to where the knob then is.
-- **Click beside the knob.** One step of that slider toward the click: 1 mV
-  on the coarse one, 0.1 mV on the fine one. Hold the mouse down for more.
-- **Click on the knob without moving it.** Nothing. Only a knob that was
-  moved moves the piezo.
+- **Click anywhere on the bar.** The knob goes there, and the piezo goes
+  after it. One click in the middle of the coarse bar sends the piezo to
+  5 V.
+- **Drag.** Take the knob, or the bar from where you clicked, and move it:
+  the piezo follows the knob as it moves. Nothing waits for the mouse to
+  let go.
+- **Press the knob and let go without moving it.** Nothing.
 - A Control-click, which in other programs sends a slider's knob to the end
-  of its range, does nothing here.
+  of its range, does nothing here. Nor does a click on the numbers under
+  the coarse bar.
+
+The piezo keeps the rules of section 6 while it follows. Away from the
+surface it is there at once. Toward the surface it goes at the speed in
+the Approach row and stops at contact. So the knob can be **ahead of the
+piezo**:
+
+- the label on the knob is then orange, and a small red mark over the bar
+  shows where the piezo is; the mark moves toward the knob;
+- the status line says how long it will take: `going toward the surface to
+  5.000 V at 200 nm/s: about 27 s more (the box beside Approach is the
+  speed; Stop ends it)`;
+- you can click or drag again at any time: the piezo goes to the new place;
+- **Stop** ends it where it is.
+
+When the piezo is there, or was stopped (by a contact, or by Stop), both
+knobs go back on the piezo and the labels are black again. The status line
+says what happened: `piezo 0.0000 -> 5.0000 V (5388.0 nm) in 27 s: ...`, or
+`STOPPED AT CONTACT (...), 1.4770 V short of the 9.4930 V asked for`.
+
+How fine a click is: the coarse bar is about 30 nm to the pixel in standard
+mode, the fine bar about 3 nm (less with a smaller `fine: +/-`). For a move
+of a few nanometres use Step closer and Step apart.
+
+While another command runs (a run, Approach, a calibration) the sliders do
+nothing and the status line says `busy`.
+
+Up to v74 a slider applied when the mouse was released, the knob jumped
+back to the piezo while the piezo crept toward it, and a click beside the
+knob was one step of 1 mV.
 
 ## 5. Approach: the piezo comes up to the surface (v73)
 
@@ -159,7 +191,10 @@ For a rig whose coarse approach is a screw turned by hand. In standard mode
 the piezo reaches 10.8 um, so the screw does not have to find the contact.
 It only has to bring the surface within the piezo's reach. Then:
 
-    [Approach]  toward the surface at [200] nm/s, stopping at contact
+    [ Approach ]  speed toward the surface [200] nm/s. It stops at contact.
+                  The sliders and Step closer too.
+
+(Since v75 Approach is the big blue button of the box.)
 
 **Approach** takes the piezo toward the surface from where it is, at the
 speed in the box, and stops where the junction closes (section 6 says how
@@ -241,6 +276,22 @@ Asked for more while the junction is already closed, the piezo goes one
 piece further in and stops again. So a slip of the slider in contact costs
 one piece, not the whole slip.
 
+That is the rule of **Step closer**, which is the way to press further in
+on purpose, by Z nm. **A slider never pushes into a junction that is
+closed (v75).** Before the first piece of every stretch toward the surface
+the program looks at the junction where the piezo stands. If it is closed
+already, the piezo stays and the status line says `ALREADY IN CONTACT
+(...): a slider does not push further in (Step closer does, by Z nm)`. So
+clicking past a contact again and again costs nothing. (With one more
+piece each time, ten clicks at 2000 nm/s would be half a micrometre into
+the surface.)
+
+A slider that is held past a contact: the piezo stops at the contact and
+stays there, however far the knob is taken on. It follows the knob again
+once the knob has been brought back below the piezo, and comes up again
+only when the junction has opened. Let go with the knob still past the
+contact and the move ends with `STOPPED AT CONTACT`.
+
 After a move by hand that ended in contact the state is ENGAGED, and
 Start N starts from there, separating first.
 
@@ -262,5 +313,11 @@ slider runs from 7.5 V to 8.5 V. 50000 puts it out of the piezo's reach:
 Approach then ends with `NO CONTACT for the whole range`. The screw will not
 push the surface into the tip: take the piezo down first.
 
-A simulated play takes no time, so a move toward the surface that takes
-a minute on the rig is over at once in the simulator.
+A simulated play takes no time. In the window (since v75) a move toward
+the surface made by hand, by Approach, a slider or Step closer, is made to
+take the time it takes on the rig all the same: 25 ms a piece, distance
+over speed. A slider tried on a laptop is then as slow or as fast as it
+will be at the rig, and the speed box can be tried out. (On the rig a piece
+also costs the card's start-and-stop time, which the simulation does not
+know.) The automatic approach of a run is not slowed, and neither is the
+window's self-test (`--autoclose`) or anything run without the window.

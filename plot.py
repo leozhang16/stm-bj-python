@@ -92,8 +92,14 @@ same trace numbers). Such data is recognised by itself:
     python plot.py data/11_14_26Merge/ch2 1D       the ch2 subfolder alone,
                                             read as the day folder it is
 
-Nothing is stitched: each channel is drawn as it was measured, with its
-own gain, and channel 2 is shown railed where it was railed.
+Each channel is drawn with its own gain, and channel 2 only as far as it
+measured: where its output was saturated it has no line and no counts
+(v75; before, the saturated part was drawn, and made peaks of its own at
+conductances that were wrong). A .h5 session knows that from its raw
+volts. In a day folder written since v75 the saturated part of channel 2
+holds channel 1's conductance, so that Igor's analysis can use the ``ch2``
+subfolder; read here as channel 2, those points are blank again, and the
+``ch2`` subfolder opened by itself is the two channels as one trace.
 
 The window (pullout.py) draws its histogram windows with the functions in
 this file, so a picture is the same from the command line and from the
@@ -349,12 +355,17 @@ class _BlockTraces:
                     traces2=self.traces2)
 
 
-def _channel2_block(folder, k: int) -> igor_scheme.IgorBlock | None:
+def _channel2_block(folder, k: int,
+                    first: igor_scheme.IgorBlock | None = None
+                    ) -> igor_scheme.IgorBlock | None:
     """Block ``k`` of channel 2 of a day folder (its ``ch2`` subfolder), or
     None when there is none. One that cannot be read is reported and left
-    out: channel 1 is still drawn."""
+    out: channel 1 is still drawn. ``first`` is block ``k`` of the folder
+    itself, which tells which points of channel 2 were filled in with
+    channel 1's conductance: those are blank in what comes back."""
     try:
-        return igor_scheme.read_block_channel2(folder, k, companions=False)
+        return igor_scheme.read_block_channel2(folder, k, companions=False,
+                                               first=first)
     except Exception as exc:                              # noqa: BLE001
         print(f"{Path(folder).name}/{igor_scheme.CH2_FOLDER}: block {k} of channel 2 "
               f"cannot be read ({type(exc).__name__}: {exc}); drawing channel 1 only")
@@ -426,7 +437,8 @@ def from_igor(path) -> Data:
                                       params_all[idx], idx, numbers)
         # A block of a day folder taken with a two-channel amplifier:
         # channel 2 of the same block, from the ch2 subfolder beside it.
-        b2 = _channel2_block(path.parent, k) if kind is not None and k else None
+        b2 = (_channel2_block(path.parent, k, first=block)
+              if kind is not None and k else None)
         return _data_from_blocks([block], path.stem, [path], [b2])
 
     # No parameter tail: a bare trace, or a block cut by hand. Taken whole.
@@ -475,7 +487,7 @@ def from_folder(folder, blocks=None, traces=None) -> Data:
                 keep |= (b.numbers >= a) & (b.numbers <= z)
         # Channel 2 of the same block, when the day was taken with a
         # two-channel amplifier (the ch2 subfolder).
-        acc.add(b, keep, _channel2_block(folder, k))
+        acc.add(b, keep, _channel2_block(folder, k, first=b))
         del b
     name = folder.name
     if blocks is not None:
@@ -596,7 +608,8 @@ def hist_1d(ax, data: Data, bins: int = 1000, smooth: int = 11,
     two histograms on the one axis, channel 1 in blue and channel 2 in
     red, each made from its own channel's traces by the recipe below and
     divided by its own trace count. Nothing is merged: the picture has two
-    noise floors, and channel 2's counts while it was railed are in it.
+    noise floors. Channel 2's traces come without the points where its
+    output was saturated (NaN), so its histogram ends where channel 2 ends.
     ``channel`` 1 or 2 draws one of them alone (``--channel``); ``color``
     then colours it, as it colours channel 1 when it is not the default.
     ``xlim`` None is -7 to 1, or -8 to 1 when channel 2 is drawn: its floor
@@ -684,7 +697,8 @@ def hist_1d(ax, data: Data, bins: int = 1000, smooth: int = 11,
                           alpha=plots.A_CH2 if show1 else 1.0)
             if not show1:
                 centres, counts = centres2, counts2
-            note += (f"two channels, nothing stitched: {name1} blue, {name2} red, "
+            note += (f"two channels: {name1} blue, {name2} red (only where its "
+                     f"output was not saturated), "
                      f"{data.n2} of {data.n} traces have channel 2; " if show1
                      else f"channel 2 alone ({name2}), {data.n2} traces; ")
         elif data.two_channels:
@@ -912,7 +926,7 @@ def igor_trace_figure(path, number: int, fig=None):
     cfg = cfg_from_igor_parameters(b.params[j], b.n_points)
     # The same trace as channel 2 of a two-channel amplifier read it, when
     # the day folder has a ch2 subfolder holding this block.
-    b2 = _channel2_block(folder, k)
+    b2 = _channel2_block(folder, k, first=b)
     g0_2 = None
     if b2 is not None and b2.n_points == b.n_points:
         hit = np.flatnonzero(b2.numbers == number)

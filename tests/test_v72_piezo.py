@@ -533,8 +533,8 @@ def test_the_window_runs_with_the_driver_row_and_the_two_sliders(tmp_path):
 
 
 # The real window, driven from inside: Tk's mainloop is replaced by a script
-# that finds the Piezo box's widgets, presses and releases the mouse on them
-# and writes down every move the window asks the worker for.
+# that finds the Piezo box's widgets, presses, moves and releases the mouse
+# on them and writes down what the window asked the worker for.
 _DRIVE = r"""
 import os, sys, time, threading, traceback
 from pathlib import Path
@@ -546,14 +546,20 @@ import pullout as ap
 watchdog = threading.Timer(150, lambda: (print("WATCHDOG", flush=True), os._exit(3)))
 watchdog.daemon = True
 watchdog.start()
-sent, errors, W = [], [], {}
-orig_send = ap.Worker.send
+sent, begun, said, errors, W = [], [], [], [], {}
+orig_send, orig_begin, orig_status = ap.Worker.send, ap.Worker.follow_begin, ap.Worker.status
 def send(self, *command):
     W["w"] = self
     if command and command[0] in ("goto", "step", "piezo_mode"):
         sent.append(command)
     return orig_send(self, *command)
-ap.Worker.send = send
+def follow_begin(self, volts):
+    begun.append(round(float(volts), 4))
+    return orig_begin(self, volts)
+def status(self, text, *a, **k):
+    said.append(text)
+    return orig_status(self, text, *a, **k)
+ap.Worker.send, ap.Worker.follow_begin, ap.Worker.status = send, follow_begin, status
 tk.Tk.report_callback_exception = lambda self, e, v, tb: errors.append(
     "".join(traceback.format_exception(e, v, tb))[-600:])
 
@@ -587,47 +593,74 @@ def script(root):
                  and str(w.cget("text")) == "fine: +/-")
     half_name = next(str(c.cget("textvariable")) for c in label.master.winfo_children()
                      if c.winfo_class() == "TEntry")
-    approach = next(w for w in widgets if w.winfo_class() == "TButton"
+    approach = next(w for w in widgets if w.winfo_class() in ("TButton", "Button")
                     and str(w.cget("text")) == "Approach")
     speed_name = next(str(c.cget("textvariable"))
                       for c in approach.master.winfo_children()
                       if c.winfo_class() == "TEntry")
     rig = W["w"].rig
+    def knob(scale):
+        return float(root.getvar(str(scale.cget("variable"))))
     def knobs(tag):
-        print(f"{tag}: piezo {rig.piezo_v:.4f} coarse {float(coarse.get()):.4f} "
-              f"fine {float(fine.get()):.4f} window {float(fine.cget('from')):g} "
+        print(f"{tag}: piezo {rig.piezo_v:.4f} coarse {knob(coarse):.4f} "
+              f"fine {knob(fine):.4f} window {float(fine.cget('from')):g} "
               f"{float(fine.cget('to')):g}", flush=True)
-    def release_at(scale, volts):
-        # what a drag does: the mouse down on the knob, the knob taken to
-        # volts, the mouse up
-        n = len(sent)
-        x, y = scale.coords()
-        scale.event_generate("<ButtonPress-1>", x=x, y=y)
+    def pixel(scale, volts=None):
+        x, y = scale.coords() if volts is None else scale.coords(volts)
+        return int(x), int(y)
+    def under(scale, x, y):
+        # the volts the slider itself says lie under that pixel
+        return float(scale.tk.call(str(scale), "get", x, y))
+    def tell(n_said, n_begun, was, want=None):
+        # what one mouse gesture did: where the piezo went, whether that is
+        # the place under the mouse, how often the worker was asked, and how
+        # many lines it said
+        moved = abs(rig.piezo_v - was) > 1e-9
+        hit = "" if want is None else f" on the spot {abs(rig.piezo_v - want) < 1e-6}"
+        lines = sum(" -> " in text for text in said[n_said:])     # "piezo a -> b V ..."
+        return (f"moved {moved}{hit} asked {len(begun) - n_begun} "
+                f"said {lines} piezo {rig.piezo_v:.4f}")
+    def click(scale, volts=None, dx=0, mods=""):
+        # the mouse down and up in one place: on the knob (volts None), dx
+        # pixels beside it, or on the bar where ``volts`` is
+        n_said, n_begun, was = len(said), len(begun), rig.piezo_v
+        x, y = pixel(scale, volts)
+        x += dx
+        want = under(scale, x, y) if (volts is not None or dx) else None
+        scale.event_generate(f"<{mods}ButtonPress-1>", x=x, y=y)
         pump(0.05)
-        root.setvar(str(scale.cget("variable")), volts)
-        scale.event_generate("<ButtonRelease-1>", x=x, y=y)
+        scale.event_generate(f"<{mods}ButtonRelease-1>", x=x, y=y)
         idle()
-        return sent[n:]
-    def click(scale, dx=0, mods=""):
-        n = len(sent)
-        x, y = scale.coords()
-        scale.event_generate(f"<{mods}ButtonPress-1>", x=x + dx, y=y)
+        return tell(n_said, n_begun, was, want)
+    def drag(scale, volts):
+        # the mouse down on the knob, the knob taken to ``volts`` in eight
+        # moves, the mouse up
+        n_said, n_begun, was = len(said), len(begun), rig.piezo_v
+        (x0, y), (x1, _) = pixel(scale), pixel(scale, volts)
+        grab = under(scale, x0, y) - knob(scale)
+        scale.event_generate("<ButtonPress-1>", x=x0, y=y)
         pump(0.05)
-        scale.event_generate(f"<{mods}ButtonRelease-1>", x=x + dx, y=y)
+        for i in range(1, 9):
+            scale.event_generate("<B1-Motion>", x=round(x0 + (x1 - x0) * i / 8), y=y)
+            pump(0.03)
+        want = under(scale, x1, y) - grab
+        scale.event_generate("<ButtonRelease-1>", x=x1, y=y)
         idle()
-        return sent[n:]
+        return tell(n_said, n_begun, was, want) + f" near {abs(rig.piezo_v - volts) < 0.05}"
     root.setvar(speed_name, "2000")
     pump(0.2)
-    print("drag coarse to 3.0:", release_at(coarse, 3.0))
+    print("click on the coarse bar at 2.0:", click(coarse, 2.0))
+    knobs("after the click")
+    print("drag coarse to 3.0:", drag(coarse, 3.0))
     knobs("after it")
     print("click on the coarse knob:", click(coarse))
     print("click on the fine knob:", click(fine))
-    print("control-click right of the coarse knob:", click(coarse, +60, "Control-"))
-    print("control-click left of the fine knob:", click(fine, -60, "Control-"))
+    print("control-click right of the coarse knob:", click(coarse, dx=+60, mods="Control-"))
+    print("control-click left of the fine knob:", click(fine, dx=-60, mods="Control-"))
     knobs("after the clicks")
     root.setvar(half_name, "")
     pump(0.3)
-    print("drag coarse to 1.0, fine box empty:", release_at(coarse, 1.0))
+    print("click on the coarse bar at 1.0, fine box empty:", click(coarse, 1.0))
     knobs("fine box empty")
     print("click on the fine knob, box empty:", click(fine))
     root.setvar(half_name, "0")
@@ -636,10 +669,11 @@ def script(root):
     root.setvar(half_name, "0.2")
     pump(0.3)
     knobs("fine box 0.2")
-    print("click right of the fine knob:", click(fine, +60))
-    knobs("after one step")
-    print("drag fine to 1.1500:", release_at(fine, 1.15))
+    print("click right of the fine knob:", click(fine, dx=+60))
+    knobs("after that click")
+    print("drag fine down:", drag(fine, float(fine.cget("from")) + 0.05))
     knobs("after the fine drag")
+    print("goto and step commands:", sent)
     print("errors:", len(errors), errors[:2], flush=True)
 
 def driver(root, n=0):
@@ -655,12 +689,13 @@ os._exit(0)
 """
 
 
-def test_the_sliders_of_the_real_window_only_move_the_piezo_when_they_are_moved(tmp_path):
-    """Found by review: a fine slider left on an old position, and a click on
-    its knob that sent the piezo there. Here the real window is driven:
-    a knob that is let go where it was picked up asks for nothing, nor does
-    Tk's Control-click (which would jump the knob to the end of its range),
-    and the fine knob is on the piezo whatever stands in the "fine: +/-" box."""
+def test_the_sliders_of_the_real_window_take_the_piezo_where_the_mouse_says(tmp_path):
+    """The real window, driven with the mouse. v75: one click on a bar and
+    the piezo goes there; a knob that is dragged is followed. Still true
+    from v72: a knob that is pressed and let go where it stood asks for
+    nothing, nor does Tk's Control-click (which would jump the knob to the
+    end of its range), and the fine knob is on the piezo whatever stands in
+    the "fine: +/-" box."""
     tk = pytest.importorskip("tkinter")
     pytest.importorskip("igor2")
     try:
@@ -678,23 +713,48 @@ def test_the_sliders_of_the_real_window_only_move_the_piezo_when_they_are_moved(
     assert "Traceback" not in out and "WATCHDOG" not in out, out[-3000:]
     lines = dict(line.split(": ", 1) for line in out.splitlines() if ": " in line)
     assert lines["errors"].startswith("0 "), out[-3000:]
-    # a knob that was moved moves the piezo
-    assert lines["drag coarse to 3.0"] == "[('goto', 3.0)]"
-    assert lines["after it"] == "piezo 3.0000 coarse 3.0000 fine 3.0000 window 2.5 3.5"
-    # one that was not, and a Control-click, ask for nothing
-    for what in ("click on the coarse knob", "click on the fine knob",
-                 "control-click right of the coarse knob",
-                 "control-click left of the fine knob",
-                 "click on the fine knob, box empty"):
-        assert lines[what] == "[]", (what, lines[what])
+
+    def piezo(line: str) -> float:
+        return float(lines[line].split()[1])
+    # one click on the bar: the piezo is there, exactly where the slider
+    # says the mouse was, and the worker said so once
+    assert lines["click on the coarse bar at 2.0"].startswith(
+        "moved True on the spot True asked 1 said 1 piezo "), lines
+    assert abs(piezo("after the click") - 2.0) < 0.05
+    two = piezo("after the click")
+    assert lines["after the click"] == (f"piezo {two:.4f} coarse {two:.4f} fine {two:.4f} "
+                                        "window 1.5 2.5")
+    # a knob that is dragged is followed, and ends where it was let go
+    assert lines["drag coarse to 3.0"].startswith("moved True on the spot True asked 1 said 1")
+    assert lines["drag coarse to 3.0"].endswith("near True")
+    three = piezo("after it")
+    assert lines["after it"] == (f"piezo {three:.4f} coarse {three:.4f} fine {three:.4f} "
+                                 "window 2.5 3.5")
+    # a knob pressed and let go where it stood moves nothing and says
+    # nothing; a Control-click does not even ask
+    for what, asked in (("click on the coarse knob", 1), ("click on the fine knob", 1),
+                        ("control-click right of the coarse knob", 0),
+                        ("control-click left of the fine knob", 0),
+                        ("click on the fine knob, box empty", 1)):
+        assert lines[what].startswith("moved False"), (what, lines[what])
+        assert f" asked {asked} said 0 piezo " in lines[what], (what, lines[what])
     assert lines["after the clicks"] == lines["after it"]
     # an empty or useless width keeps the last one, and the knob on the piezo
-    assert lines["drag coarse to 1.0, fine box empty"] == "[('goto', 1.0)]"
-    assert lines["fine box empty"] == "piezo 1.0000 coarse 1.0000 fine 1.0000 window 0.5 1.5"
+    assert lines["click on the coarse bar at 1.0, fine box empty"].startswith(
+        "moved True on the spot True asked 1 said 1")
+    one = piezo("fine box empty")
+    assert abs(one - 1.0) < 0.05
+    assert lines["fine box empty"] == (f"piezo {one:.4f} coarse {one:.4f} fine {one:.4f} "
+                                       "window 0.5 1.5")
     assert lines["fine box 0"] == lines["fine box empty"]
-    assert lines["fine box 0.2"] == "piezo 1.0000 coarse 1.0000 fine 1.0000 window 0.8 1.2"
-    # a click beside the knob is one step of the slider: 0.1 mV on the fine one
-    assert lines["click right of the fine knob"] == "[('goto', 1.0001)]"
-    assert lines["after one step"].startswith("piezo 1.0001 coarse 1.0000 fine 1.0001")
-    assert lines["drag fine to 1.1500"] == "[('goto', 1.15)]"
-    assert lines["after the fine drag"].startswith("piezo 1.1500 coarse 1.1500 fine 1.1500")
+    assert lines["fine box 0.2"] == (f"piezo {one:.4f} coarse {one:.4f} fine {one:.4f} "
+                                     f"window {round(one, 1) - 0.2:g} {round(one, 1) + 0.2:g}")
+    # a click beside the fine knob takes the piezo there too (up to v74 it
+    # was one step of 0.1 mV)
+    assert lines["click right of the fine knob"].startswith(
+        "moved True on the spot True asked 1 said 1")
+    assert 0.01 < piezo("after that click") - one < 0.2
+    assert lines["drag fine down"].startswith("moved True on the spot True asked 1 said 1")
+    assert lines["drag fine down"].endswith("near True")
+    # none of it went through the old goto command
+    assert lines["goto and step commands"] == "[]"

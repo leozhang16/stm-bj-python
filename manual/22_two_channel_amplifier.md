@@ -8,8 +8,12 @@
 v67 (the junction-open test on channel 2: `Rig.is_open`,
 `Rig.open_side_of`, `TraceRecord.open_side_g0`, `analysis.open_side`; the
 simulated card's noise, `sim.ai_noise_v_rms`), v68 (the box in the
-Keithley box's place) and v69 (the sign of each channel: chapter 23).
-Tests: `tests/test_two_channel.py`. Config: `configs/newrig_2ch.json`.*
+Keithley box's place), v69 (the sign of each channel: chapter 23) and v75
+(channel 2 only as far as it measured: `TraceRecord.railed2`,
+`conductance_g0(..., as_measured=)`, `analysis.blank_railed`,
+`igor_scheme.read_block_channel2`, `blank_filled_in`).
+Tests: `tests/test_two_channel.py`, `tests/test_v75_channel2_sliders.py`.
+Config: `configs/newrig_2ch.json`.*
 
 ## What it is
 
@@ -27,12 +31,25 @@ gain: at 100 mV about 1e-3 G0 for 1e4 V/A, 1e-5 G0 for 1e6 V/A and 1e-6 G0
 for 1e7 V/A.
 
 Whether the higher-gain output rails while the junction is closed depends
-on the gain and on the series resistor. Through 106 kohm at 100 mV the
-current never exceeds 0.94 uA, so a 1e7 V/A output reaches 8.4 V at 1 G0
-and stays in range through contact: both channels then show the gold
-steps, and the 1 G0 peaks of the two histograms lie on top of each other.
-A 1e9 V/A output is at its rail for as long as the junction is closed and
-comes into range once the conductance has fallen by three decades.
+on the gain, on the series resistor and on the bias. Through 106 kohm at
+100 mV the current never exceeds 0.94 uA, so a 1e7 V/A output reaches
+8.4 V at 1 G0 and stays in range through contact: both channels then show
+the gold steps, and the 1 G0 peaks of the two histograms lie on top of
+each other. That peak on channel 2 is real. At 300 mV the same output
+would have to give 25 V at 1 G0: it is at its rail from contact down to
+about 0.06 G0 and has nothing to say above that. A 1e9 V/A output is at
+its rail for as long as the junction is closed and comes into range once
+the conductance has fallen by three decades.
+
+The highest conductance channel 2 can read is the current that puts its
+output at the rail, over the junction voltage the series resistor leaves
+at that current:
+
+| Bias | 1e7 V/A, 100 kohm: channel 2 reads up to | The 1 G0 plateau on channel 2 |
+|---|---|---|
+| 100 mV | about 2.5 G0 (0.95 uA with 5 mV left across the junction) | in range (8.9 V): real |
+| 200 mV | about 0.12 G0 | saturated |
+| 300 mV | about 0.06 G0 | saturated |
 
 `pullout.py` reads both and keeps them apart:
 
@@ -51,10 +68,27 @@ refused for its end. On a 1e7 V/A output the same current is 39 mV. Where channe
 at its rail the current is beyond it, and the test reads channel 1
 instead, which is good exactly there.
 
-Nothing is stitched. The program never builds one trace out of the two,
-never cuts the railed part of channel 2 away and never scales one channel
-to meet the other. Every picture shows each channel as it was measured,
-channel 1 in blue and channel 2 in red.
+**Channel 2 is shown only as far as it measured (v75).** Where its output
+is saturated (its raw volts at or beyond `limits.preamp_saturation_v`) it
+has no value: no red line in the trace panel, no counts in the histogram.
+Every picture shows channel 1 in blue, whole, and channel 2 in red from
+where it comes off its rail. Nothing is scaled to make the two meet.
+
+Why: a saturated output is not a measurement, and the number it gives is
+not harmless. The conductance is the current divided by the junction
+voltage, and while the current is stuck at rail / gain the junction
+voltage still follows the junction through the series resistor. So the
+"conductance" of a saturated channel 2 is not a flat line: it has a step
+wherever the gold has one, at the wrong height. At 300 mV, 1e7 V/A and
+100 kohm (an output that stops at 10 V) the 1 G0 plateau came out at
+0.38 G0, the 2 G0 plateau at 0.71 and the 3 G0 plateau at 1.04, each with
+its own peak in the histogram, the last one right where a real 1 G0 peak
+would be. Up to v74 that stretch was drawn and counted, and on the rig it
+read as "the high-gain channel shows G0 peaks too". The program never
+built one trace out of the two for the screen, and still does not.
+
+The files for Igor and MATLAB are the one place where the two channels are
+put together: see "What is saved".
 
 **Which output goes where matters.** Channel 1 must be the output that can
 see contact, channel 2 the one with the higher gain. If the two inputs are
@@ -157,11 +191,18 @@ on it.
 
 With a config that names channel 2, the window has two more readouts. The
 Status box gets a line `ch 2`: channel 2's output in volts, as a current in
-nA and as a conductance, and the word RAILED while it is at its rail. The
-Piezo box gets a cell **I ch 2 (nA)**, red while railed. With a gain high
+nA and as a conductance. While it is at its rail the line is `ch 2
++10.0000 V  RAILED: its output is saturated, no reading`: the volts, and no
+current or conductance made of them (v75). The Piezo box gets a cell
+**I ch 2 (nA)**, which says RAILED in red for as long. With a gain high
 enough to rail, RAILED is channel 2's normal state whenever the junction
-is closed; the only thing that follows from it is that the junction-open
-test reads channel 1 for as long as it lasts.
+is closed: the junction-open test reads channel 1 for as long as it lasts,
+and channel 2 is not drawn or counted there.
+
+**The volts in that line are worth one look on a new amplifier.** In solid
+contact, at a bias that saturates channel 2, they are where its output
+stops. If the line shows a steady voltage there and does NOT say RAILED,
+the output stops below `limits.preamp_saturation_v`: see "Things to know".
 
 After a move made by hand (the slider, the step buttons) the status line
 gives channel 1's conductance and, when channel 2 is the one that judged
@@ -183,17 +224,12 @@ the trace and its gold plateau from channel 1 and its end from channel 2.
 
 Read from left to right, a trace looks like this. While the junction is
 closed, channel 1 shows the contact and its steps down to 1 G0. A channel
-2 that stays in range (1e7 V/A behind the series resistor) shows the same
-steps, the red on top of the blue. A channel 2 that rails still gets
-converted, so it is drawn at an apparent conductance of rail / (gain ×
-junction voltage × G0) — 1.4e-3 G0 for 10 V at 1e9 V/A across 90 mV, and
-higher while the series resistor holds the junction voltage at a few
-millivolts, which is why the railed stretch follows channel 1's steps at
-a distance. That stretch is not a measurement of anything; it is drawn
-because nothing is cut away. Once the contact has broken the two lines run
-together down the tunnelling decay until channel 1 reaches its noise
-floor. Channel 2 carries on below it, through any molecular plateau that
-lies under channel 1's floor.
+2 that stays in range (1e7 V/A behind the series resistor at 100 mV) shows
+the same steps, the red on top of the blue. A channel 2 that rails has no
+line there (v75): its red line begins where its output comes off the rail.
+From there the two lines run together down the tunnelling decay until
+channel 1 reaches its noise floor. Channel 2 carries on below it, through
+any molecular plateau that lies under channel 1's floor.
 
 The **histogram** shows two curves on the same bins, each made from its own
 channel's traces by the one recipe (Igor's: the first 95 % of the trace,
@@ -201,9 +237,9 @@ smoothed over 11 points, the floor subtracted) and divided by its own
 trace count. So it has **two noise floors**: channel 1's where its gain
 runs out, and channel 2's further down. Where both channels are in range
 the curves lie on top of each other: the gold peaks of both, when channel
-2 stays in range through contact. A channel 2 that rails has, instead of
-gold peaks, the counts of its railed stretch between 1e-3 and 1e-1 G0. The
-x axis starts at -8.
+2 stays in range through contact. A channel 2 that rails has no counts
+above the highest conductance it can read (v75): its curve simply ends
+there, and the gold peaks are channel 1's alone. The x axis starts at -8.
 
 Where the files and `plot.py` apply Igor's floor gate (a trace whose floor
 is not below the break threshold is left out of the histogram), the gate
@@ -226,6 +262,33 @@ except that the 2D histogram can be asked for channel 2 (below).
 A run taken with one channel writes none of the channel-2 items, and its
 files are those of a one-channel rig.
 
+**Where channel 2 was saturated, the `ch2` ConductanceBlock and the
+`_ch2.txt` table hold channel 1's conductance (v75).** These two files are
+for Igor's analysis and for MATLAB, and those need the contact part of a
+trace: Igor's panel counts a trace only when its first 2 % average above
+1.02 G0, and puts 0 nm where the trace falls through 0.5 G0. A column that
+is blank through contact would give them nothing at all, and one with the
+saturated numbers in it (as up to v74) gave them peaks at the wrong
+places. So in these files a trace is channel 2 wherever channel 2
+measured, and channel 1 above that: one whole trace, with channel 2's low
+noise floor at the bottom and the real gold steps at the top. The note of
+the block and the header of the table say so. Three things follow:
+
+- Opened in Igor's panel, the `ch2` folder shows the 1 G0 peak. It is
+  channel 1's reading, at the right place.
+- Opened in this program as channel 2 (the window's browser, `plot.py` on
+  the day folder), those points are blank again, as on the live screen:
+  a point of the `ch2` block that is the same number, bit for bit, as the
+  same point of the day folder's own block was put there from channel 1.
+  The `ch2` subfolder opened by itself is read as it is: the whole trace.
+- The CurrentBlock in `ch2` stays channel 2's own current, saturated where
+  it was. The raw volts of both channels are in the `.h5`, whatever the
+  other files hold.
+
+Day folders written before v75 hold the saturated numbers themselves, and
+nothing in them says where. The `.h5` of the same run does: `plot.py` on
+the `.h5` draws channel 2 correctly.
+
 ## Plotting it afterwards
 
 `plot.py` recognises two-channel data by itself, from a `.h5` or from a day
@@ -245,7 +308,9 @@ The 2D histogram is one channel at a time, because a colour map cannot
 carry two. For channel 2 each trace's 0 nm is still taken from channel 1
 (where channel 1 drops below 0.5 G0): channel 2 is railed while the gold
 contact breaks and cannot say where that was. The histogram windows of the
-Saving tab have a `channel` box for the same choices.
+Saving tab have a `channel` box for the same choices. In all of them
+channel 2 is drawn and counted only where its output was not saturated
+(v75).
 
 ## Bringing it up
 
@@ -302,9 +367,18 @@ RAILED is judged at `limits.preamp_saturation_v`, 9.5 V in the shipped
 configs, on both channels. If the amplifier's outputs stop short of that
 (an output stage that swings to 5 V, say), lower the limit in the config
 to just under where they stop. Otherwise channel 2 is never seen as
-railed: Calibrate zero cannot tell a closed junction from an offset, and
-with a very high gain (1e9 V/A and up) a channel 2 stuck at its own rail
-could read as an open junction.
+railed: Calibrate zero cannot tell a closed junction from an offset, with
+a very high gain (1e9 V/A and up) a channel 2 stuck at its own rail could
+read as an open junction, and (v75) its saturated stretch is drawn and
+counted again, with its false steps and peaks. How to see where an output
+stops: bring the tip into solid contact at a bias that saturates channel
+2 (300 mV at 1e7 V/A) and read the volts in the Status box's `ch 2` line.
+
+An amplifier takes a moment to come back from saturation. The first
+samples after channel 2 leaves its rail can still be wrong, and they are
+drawn: nothing here knows how long this amplifier needs. If channel 2
+shows a bump just under the highest conductance it can read, that is the
+place to look.
 
 Contact is judged on channel 1 the same whether channel 2 is read or not.
 

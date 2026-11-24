@@ -60,6 +60,19 @@ a day folder of channel 2: Igor's macro, ``plot.py`` and the window's
 browser open it like any other. The junction voltage and the piezo
 readback are not repeated in it.
 
+**Where channel 2's output was saturated** (since v75). A saturated output
+is not a measurement, and the number it gives is wrong (``analysis.
+blank_railed``). The ConductanceBlock in ``ch2`` holds, at those points,
+*channel 1's* conductance instead (``analysis.open_side``, the two
+channels as one trace): Igor's analysis counts a trace only when it starts
+above 1 G0, and finds 0 nm where the trace falls through 0.5 G0, so a
+column that is blank through contact could not be used at all. The
+CurrentBlock in ``ch2`` stays channel 2's own current, saturated where it
+was. :func:`read_block_channel2` gives channel 2 as it measured: the
+points that are channel 1's (the same number, bit for bit, as the same
+point of the day folder's own block) are NaN again. Blocks written before
+v75 hold the saturated numbers themselves, and nothing in them says where.
+
 Reading from this file
 ----------------------
 :func:`read_block`, :func:`read_day_folder`, :func:`list_blocks`,
@@ -134,6 +147,10 @@ PARAM_NAMES = (
 # Where channel 2 of a two-channel current amplifier is filed: this
 # subfolder of the day folder, with Igor's own file names inside it.
 CH2_FOLDER = "ch2"
+
+# The end of the wave note of a ConductanceBlock in that subfolder.
+CH2_NOTE = ("current channel 2; where its output was saturated the "
+            "conductance is channel 1's")
 
 # File name of each kind of block file; ``{k}`` is the block number.
 FILE_PATTERNS = {
@@ -270,10 +287,12 @@ class IgorTrace:
     :func:`igor_parameters`. Build one with :meth:`from_record`.
 
     A trace taken with both outputs of a two-channel amplifier also
-    carries channel 2: ``g0_2`` (its conductance, G/G0), ``current2_a``
-    (its current, amps) and ``params2`` (its 20 slots: channel 2's gain in
-    slot 9 and its zero in slot 16, slot 4 at 0 because the ch2 subfolder
-    holds no Voltage block). All three are None for a one-channel trace.
+    carries channel 2: ``g0_2`` (the column of the ch2 block, G/G0:
+    channel 2's conductance, and channel 1's at the points where channel
+    2's output was saturated), ``current2_a`` (channel 2's own current,
+    amps) and ``params2`` (its 20 slots: channel 2's gain in slot 9 and
+    its zero in slot 16, slot 4 at 0 because the ch2 subfolder holds no
+    Voltage block). All three are None for a one-channel trace.
     """
     g0: np.ndarray
     voltage_v: np.ndarray
@@ -293,7 +312,8 @@ class IgorTrace:
         calibration: conductance from the *measured* junction voltage, as
         Igor computed it; ``vzero_mv``/``izero`` are the last Find-Offset
         results for slots 15 and 16; ``bias_save`` is slot 4. When the
-        record carries channel 2 (``tr.current2_v``), its conductance,
+        record carries channel 2 (``tr.current2_v``), its conductance
+        (channel 1's where channel 2 was saturated: ``open_side_g0``),
         current and parameters come along, ``izero2`` being its slot 16."""
         cal = cfg.cal
         g0 = np.asarray(tr.conductance_g0(cfg), dtype=float)
@@ -309,7 +329,7 @@ class IgorTrace:
                                  izero=izero, bias_save=bias_save)
         g0_2 = current2_a = params2 = None
         if getattr(tr, "current2_v", None) is not None:
-            g0_2 = np.asarray(tr.conductance_g0(cfg, channel=2), dtype=float)
+            g0_2 = np.asarray(tr.open_side_g0(cfg), dtype=float)
             current2_a = np.asarray(cal.volts_to_amps(
                 np.asarray(tr.current2_v, dtype=float), channel=2))
             params2 = igor_parameters(cfg, tr.start_piezo_v, tr.timestamp,
@@ -359,7 +379,8 @@ def write_block_files(folder: str | Path, k: int, traces, cfg: RigConfig,
 
     Traces that carry channel 2 of a two-channel amplifier (``g0_2``) get a
     second set of files in ``folder/ch2``, written by this same function
-    from those traces alone: the ConductanceBlock of channel 2, its
+    from those traces alone: the ConductanceBlock of channel 2 (with
+    channel 1's conductance where channel 2's output was saturated), its
     CurrentBlock and its Hist as ``flags`` say, under Igor's names, each
     trace in the column it has in ``folder``. Columns of traces without a
     channel 2 are NaN there.
@@ -464,7 +485,7 @@ def write_block_files(folder: str | Path, k: int, traces, cfg: RigConfig,
                            last_trace_files=False)
         written += write_block_files(
             folder / CH2_FOLDER, k, second, cfg, flags2,
-            note=(note + "; " if note else "") + "current channel 2")
+            note=(note + "; " if note else "") + CH2_NOTE)
     return [p for p in written if p is not None]
 
 
@@ -614,7 +635,10 @@ class IgorDayWriter:
         # holds traces of another length, loses only itself.
         b2 = None
         try:
-            b2 = read_block_channel2(self.folder, k, companions=True)
+            # as it is on disk: channel 1's points in it stay, so the
+            # refilled block is written back exactly as it was
+            b2 = read_block_channel2(self.folder, k, companions=True,
+                                     as_saved=True)
             if b2 is not None and b2.g0.shape[0] != n:
                 raise ValueError(f"{b2.g0.shape[0]} points a trace, the block has {n}")
         except Exception as exc:                      # noqa: BLE001
@@ -956,17 +980,65 @@ def channel2_folder(folder: str | Path) -> Path:
 
 
 def read_block_channel2(folder: str | Path, k: int,
-                        companions: bool = False) -> IgorBlock | None:
+                        companions: bool = False,
+                        first: IgorBlock | None = None,
+                        as_saved: bool = False) -> IgorBlock | None:
     """Block ``k`` of channel 2 of a day folder -- ``folder/ch2`` -- or
     None when the day folder has no channel 2 for that block (a day, or a
     block, taken with one current channel). Its ``columns`` and ``numbers``
     are the ones the traces have in ``folder``; its ``current_a`` is
     channel 2's current when the Current block was saved. Needs ``igor2``.
+
+    The block is channel 2 **as it measured**: the points the writer
+    filled with channel 1's conductance, because channel 2's output was
+    saturated there, come back NaN (:func:`blank_filled_in`). ``first`` is
+    block ``k`` of ``folder`` itself when the caller has it in hand
+    (otherwise it is read here). ``as_saved=True`` returns the block as it
+    is on disk, channel 1's points included: for writing it back, and for
+    whoever wants the two channels as one trace.
     """
     sub = channel2_folder(folder)
     if not block_file(sub, "conductance", k).exists():
         return None
-    return read_block(sub, k, companions=companions)
+    block = read_block(sub, k, companions=companions)
+    if as_saved:
+        return block
+    if first is None:
+        try:
+            first = read_block(folder, k, companions=False)
+        except Exception as exc:                      # noqa: BLE001
+            log.warning("block %d of %s cannot be read (%s: %s); channel 2 "
+                        "is shown as it is on disk", k, Path(folder).name,
+                        type(exc).__name__, exc)
+            return block
+    blank_filled_in(block, first)
+    return block
+
+
+def blank_filled_in(second: IgorBlock, first: IgorBlock) -> int:
+    """Make NaN, in place, the points of a ch2 block that are channel 1's:
+    the points the writer filled in where channel 2's output was
+    saturated. They are told by being the *same number, bit for bit,* as
+    the same point of the same trace in the day folder's own block
+    (``first``); a point channel 2 measured itself differs from channel
+    1's by its own noise. Returns how many points were blanked. Columns
+    are matched by their index in the block; a block of another length is
+    left alone."""
+    if second.g0.shape[0] != first.g0.shape[0]:
+        return 0
+    where = {int(c): j for j, c in enumerate(first.columns)}
+    blanked = 0
+    g2 = np.array(second.g0, dtype=float)             # a copy we may write to
+    for j2, c in enumerate(second.columns):
+        j1 = where.get(int(c))
+        if j1 is None:
+            continue
+        same = g2[:, j2] == np.asarray(first.g0[:, j1], dtype=float)
+        if same.any():
+            g2[same, j2] = np.nan
+            blanked += int(np.count_nonzero(same))
+    second.g0 = g2
+    return blanked
 
 
 def read_day_folder(folder: str | Path, blocks=None, traces=None,

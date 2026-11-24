@@ -64,13 +64,32 @@ class TraceRecord:
     # raw volts; None when it was not read. ``current_v`` is channel 1.
     current2_v: np.ndarray | None = None
 
+    def railed2(self, cfg: RigConfig) -> np.ndarray | None:
+        """Where channel 2's output is saturated: a boolean per sample,
+        True where its raw volts are at or beyond
+        ``limits.preamp_saturation_v`` (either sign). None for a trace
+        with one current channel."""
+        if self.current2_v is None:
+            return None
+        return np.abs(np.asarray(self.current2_v, dtype=float)) \
+            >= cfg.limits.preamp_saturation_v
+
     def conductance_g0(self, cfg: RigConfig,
                        use_measured_voltage: bool = True,
-                       channel: int = 1) -> np.ndarray:
+                       channel: int = 1,
+                       as_measured: bool = False) -> np.ndarray:
         """The conductance along the pull, in G0, from current channel 1
         or, with ``channel=2``, from the amplifier's second output
         (ValueError when this trace has none). Each channel with its own
-        gain and zero; nothing is merged."""
+        gain and zero; nothing is merged.
+
+        Channel 2 has NO value (NaN) where its output is saturated
+        (``railed2``): a saturated output is not a measurement, and
+        divided by the junction voltage it gives steps and histogram peaks
+        at conductances that are wrong (``analysis.blank_railed``). So
+        channel 2 is drawn and counted only as far as it measured.
+        ``as_measured=True`` gives the number the saturated volts make
+        anyway: only for looking at the sign of the channel."""
         if channel == 2:
             if self.current2_v is None:
                 raise ValueError("this trace has no second current channel")
@@ -78,27 +97,30 @@ class TraceRecord:
         else:
             current_v = self.current_v
         if use_measured_voltage:
-            return analysis.to_conductance(current_v, cfg.cal,
-                                           voltage_v=self.voltage_v,
-                                           channel=channel)
-        return analysis.to_conductance(current_v, cfg.cal,
-                                       bias_v=self.bias_v, channel=channel)
+            g0 = analysis.to_conductance(current_v, cfg.cal,
+                                         voltage_v=self.voltage_v,
+                                         channel=channel)
+        else:
+            g0 = analysis.to_conductance(current_v, cfg.cal,
+                                         bias_v=self.bias_v, channel=channel)
+        if channel == 2 and not as_measured:
+            g0 = analysis.blank_railed(g0, self.railed2(cfg))
+        return g0
 
     def open_side_g0(self, cfg: RigConfig,
                      use_measured_voltage: bool = True) -> np.ndarray:
-        """The conductance the open side of this pull is judged on
-        (``analysis.open_side``): channel 1's on a one-channel trace; with
-        channel 2 recorded, channel 2's wherever its output is below
-        ``limits.preamp_saturation_v`` and channel 1's wherever it is at
-        its rail. For ``analysis.select_trace(..., g0_open=...)``. What is
-        saved and drawn stays ``conductance_g0`` of each channel."""
+        """The two channels as one trace (``analysis.open_side``): channel
+        1's on a one-channel trace; with channel 2 recorded, channel 2's
+        wherever its output is below ``limits.preamp_saturation_v`` and
+        channel 1's wherever it is saturated. The open side of this pull
+        is judged on it (``analysis.select_trace(..., g0_open=...)``), and
+        it is what the files for Igor and MATLAB hold as channel 2. What
+        is drawn stays ``conductance_g0`` of each channel."""
         g0 = self.conductance_g0(cfg, use_measured_voltage)
         if self.current2_v is None:
             return g0
         g0_2 = self.conductance_g0(cfg, use_measured_voltage, channel=2)
-        railed = np.abs(np.asarray(self.current2_v, dtype=float)) \
-            >= cfg.limits.preamp_saturation_v
-        return analysis.open_side(g0, g0_2, railed)
+        return analysis.open_side(g0, g0_2)
 
     def displacement_nm(self, cfg: RigConfig) -> np.ndarray:
         return analysis.displacement_nm(self.voltage_v.size, cfg.ramp,

@@ -410,8 +410,14 @@ def test_the_h5_session_keeps_channel_2_as_raw_volts(tmp_path):
     with storage.Session(tmp_path / "two.h5") as s:
         assert len(s) == 3 and s.has_current2
         assert np.array_equal(s.raw2(1), got[1][0].current2_v)
+        # channel 2 as far as it measured: NaN where its output was
+        # saturated (v75), the same in the file as in the trace
         assert np.allclose(s.conductance(2, channel=2),
-                           got[2][0].conductance_g0(cfg, channel=2))
+                           got[2][0].conductance_g0(cfg, channel=2), equal_nan=True)
+        assert np.array_equal(np.isnan(s.conductance(2, channel=2)), s.railed2(2))
+        assert s.railed2(2).any() and not s.railed2(2).all()
+        assert np.allclose(s.conductance(2, channel=2, as_measured=True),
+                           got[2][0].conductance_g0(cfg, channel=2, as_measured=True))
         assert np.allclose(s.conductance(2), got[2][0].conductance_g0(cfg))   # channel 1
         assert len(list(s.conductances(channel=2))) == 3
         assert s.cfg.channels.two_current_channels
@@ -419,7 +425,7 @@ def test_the_h5_session_keeps_channel_2_as_raw_volts(tmp_path):
         cal = s.cfg.cal
         cal.preamp_gain_2_v_per_a *= 10.0
         assert np.allclose(s.conductance(0, cal=cal, channel=2) * 10.0,
-                           got[0][0].conductance_g0(cfg, channel=2))
+                           got[0][0].conductance_g0(cfg, channel=2), equal_nan=True)
 
 
 def test_a_one_channel_session_has_no_second_dataset(tmp_path):
@@ -465,8 +471,14 @@ def test_channel_2_goes_into_the_ch2_subfolder_under_igors_names(tmp_path):
     # channel 2: same block, same columns, its own conductance, gain and zero
     b2 = igor_scheme.read_block_channel2(day, 1, companions=True)
     assert list(b2.numbers) == [1, 2, 3] and b2.g0.shape == b1.g0.shape
+    # read as channel 2 it is channel 2 as far as it measured (v75) ...
     assert np.allclose(b2.g0[:, 1], got[1][0].conductance_g0(cfg, channel=2),
-                       rtol=1e-5, atol=1e-12)
+                       rtol=1e-5, atol=1e-12, equal_nan=True)
+    assert np.array_equal(np.isnan(b2.g0[:, 1]), got[1][0].railed2(cfg))
+    # ... and on disk the saturated part holds channel 1's conductance
+    disk = igor_scheme.read_block_channel2(day, 1, companions=True, as_saved=True)
+    assert np.allclose(disk.g0[:, 1], got[1][0].open_side_g0(cfg), rtol=1e-5, atol=1e-12)
+    assert np.isfinite(disk.g0).all()
     assert np.allclose(b2.current_a[:, 2],
                        cfg.cal.volts_to_amps(got[2][0].current2_v, channel=2),
                        rtol=1e-5, atol=1e-15)
@@ -497,10 +509,15 @@ def test_a_resumed_block_keeps_the_channel_2_it_already_had(tmp_path):
         again.append(igor_scheme.IgorTrace.from_record(tr, cfg))
     again.flush()
     b2 = igor_scheme.read_block_channel2(again.folder, 1)
+    disk = igor_scheme.read_block_channel2(again.folder, 1, as_saved=True)
     assert list(b2.numbers) == [1, 2, 3, 4]
     for j in range(4):
-        assert np.allclose(b2.g0[:, j], got[j][0].conductance_g0(cfg, channel=2),
+        # the two written before the restart exactly as the two after it:
+        # channel 2 where it measured, channel 1 where it was saturated
+        assert np.allclose(disk.g0[:, j], got[j][0].open_side_g0(cfg),
                            rtol=1e-5, atol=1e-12)
+        assert np.allclose(b2.g0[:, j], got[j][0].conductance_g0(cfg, channel=2),
+                           rtol=1e-5, atol=1e-12, equal_nan=True)
 
 
 def test_a_block_taken_partly_with_one_channel_keeps_the_columns_in_step(tmp_path):
@@ -569,10 +586,14 @@ def test_the_trace_plot_draws_channel_1_blue_and_channel_2_red():
     assert [ln.get_color() for ln in data] == [plots.C_CH1, plots.C_CH2]
     labels = [t.get_text() for t in ax.get_legend().get_texts()]
     assert labels == ["ch 1 (1e+06 V/A)", "ch 2 (1e+09 V/A)"]
-    # each channel as measured: channel 2's line is its own log10 G, railed part included
+    # channel 2's line is its own log10 G, and has no points where its
+    # output was saturated (v75): matplotlib does not draw a NaN
     with np.errstate(divide="ignore", invalid="ignore"):
         want = np.log10(np.clip(tr.conductance_g0(cfg, channel=2), 1e-12, None))
-    assert np.array_equal(data[1].get_ydata(), want)
+    assert np.array_equal(data[1].get_ydata(), want, equal_nan=True)
+    assert np.array_equal(np.isnan(np.asarray(data[1].get_ydata(), dtype=float)),
+                          tr.railed2(cfg))
+    assert tr.railed2(cfg)[:100].all()               # in contact at the start
     assert ax.get_ylim()[0] == -8.5                  # a decade more than one channel's -7.5
     # one channel: one black line, as before
     ax = _axes()
@@ -686,7 +707,8 @@ def test_plot_py_1d_draws_both_channels_and_one_on_request(plot_py, two_channel_
     info = plot_py.hist_1d(ax, data)
     lines = [ln for ln in ax.lines if len(ln.get_xdata()) == 1000]
     assert [ln.get_color() for ln in lines] == [plots.C_CH1, plots.C_CH2]
-    assert info["counts2"] is not None and "nothing stitched" in info["note"]
+    assert info["counts2"] is not None
+    assert "only where its output was not saturated" in info["note"]
     assert ax.get_xlim() == (-8.0, 1.0)
     assert [t.get_text() for t in ax.get_legend().get_texts()] == [
         "ch 1 (1e+04 V/A)", "ch 2 (1e+07 V/A)"]

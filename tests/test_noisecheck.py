@@ -760,7 +760,7 @@ def test_a_spectrum_is_saved_for_excel_and_comes_back_as_a_reference(ap, nc, tmp
 
 
 def test_the_version_is_the_repos(ap, nc):
-    assert nc.__version__ == ap.__version__ == "v74"
+    assert nc.__version__ == ap.__version__ == "v75"
 
 
 def test_a_card_another_program_holds_is_said_in_two_lines(tmp_path):

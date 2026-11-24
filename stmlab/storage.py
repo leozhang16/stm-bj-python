@@ -269,15 +269,31 @@ class Session:
             return None
         return self._h5["current2_v"][i]
 
+    def railed2(self, i: int) -> np.ndarray | None:
+        """Where channel 2's output was saturated in trace ``i``: a boolean
+        per sample (its raw volts at or beyond the file's
+        ``limits.preamp_saturation_v``), or None for a one-channel file."""
+        second = self.raw2(i)
+        if second is None:
+            return None
+        return np.abs(np.asarray(second, dtype=float)) \
+            >= self.cfg.limits.preamp_saturation_v
+
     def conductance(self, i: int, cal=None,
                     use_measured_voltage: bool = True,
-                    channel: int = 1) -> np.ndarray:
+                    channel: int = 1,
+                    as_measured: bool = False) -> np.ndarray:
         """Conductance in G0, using a calibration you may override.
 
         Passing a corrected ``cal`` is the whole reason raw volts are stored:
         a preamp gain re-measured next month reprocesses this file rather than
         invalidating it. ``channel=2`` is the amplifier's second output, with
         its own gain and zero (ValueError for a one-channel file).
+
+        Channel 2 has no value (NaN) where its output was saturated
+        (``railed2``), as ``TraceRecord.conductance_g0``: it is drawn and
+        counted only as far as it measured. ``as_measured=True`` gives the
+        number the saturated volts make anyway, for looking at its sign.
         """
         from . import analysis
         cal = cal or self.cfg.cal
@@ -287,11 +303,15 @@ class Session:
             if current is None:
                 raise ValueError(f"{self.path.name} has no second current channel")
         if use_measured_voltage:
-            return analysis.to_conductance(current, cal, voltage_v=voltage,
-                                           channel=channel)
-        return analysis.to_conductance(current, cal,
-                                       bias_v=float(self._h5["bias_v"][i]),
-                                       channel=channel)
+            g0 = analysis.to_conductance(current, cal, voltage_v=voltage,
+                                         channel=channel)
+        else:
+            g0 = analysis.to_conductance(current, cal,
+                                         bias_v=float(self._h5["bias_v"][i]),
+                                         channel=channel)
+        if channel == 2 and not as_measured:
+            g0 = analysis.blank_railed(g0, self.railed2(i))
+        return g0
 
     def conductances(self, cal=None, use_measured_voltage: bool = True,
                      channel: int = 1):
@@ -300,7 +320,7 @@ class Session:
 
     def open_side(self, i: int, cal=None,
                   use_measured_voltage: bool = True) -> np.ndarray:
-        """The conductance the open side of trace ``i`` is judged on
+        """The two channels of trace ``i`` as one trace
         (``analysis.open_side``): channel 2 wherever its raw volts are
         below ``limits.preamp_saturation_v`` and channel 1 elsewhere; the
         trace's own conductance in a one-channel file. It is what the
@@ -308,13 +328,10 @@ class Session:
         ``analysis.select_trace(g0, ramp, g0_open=...)`` repeats it."""
         from . import analysis
         g0 = self.conductance(i, cal, use_measured_voltage)
-        second = self.raw2(i)
-        if second is None:
+        if self.raw2(i) is None:
             return g0
         g0_2 = self.conductance(i, cal, use_measured_voltage, channel=2)
-        railed = np.abs(np.asarray(second, dtype=float)) \
-            >= self.cfg.limits.preamp_saturation_v
-        return analysis.open_side(g0, g0_2, railed)
+        return analysis.open_side(g0, g0_2)
 
     def scalar(self, name: str) -> np.ndarray:
         return self._h5[name][:]

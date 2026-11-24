@@ -125,7 +125,11 @@ def test_an_amplifier_the_other_way_round_reads_negative_until_it_is_flipped():
     assert state is RigState.ENGAGED
     wrong = tr.conductance_g0(cfg)
     assert analysis.reads_negative(wrong)
-    assert analysis.reads_negative(tr.conductance_g0(cfg, channel=2))
+    # channel 2's sign is read with its saturated part left in (v75: what
+    # is drawn has no value there, and could not tell)
+    assert analysis.reads_negative(tr.conductance_g0(cfg, channel=2, as_measured=True))
+    assert tr.railed2(cfg)[:200].all()               # at its negative rail in contact
+    assert np.isnan(tr.conductance_g0(cfg, channel=2)[:200]).all()
     assert np.nanmax(wrong[:200]) < 0                # in contact: all negative
     assert not analysis.select_trace(wrong, cfg.ramp).accepted
 
@@ -133,7 +137,10 @@ def test_an_amplifier_the_other_way_round_reads_negative_until_it_is_flipped():
     # card's noise are the same samples; only the noise now enters with the
     # other sign, so the two agree to the noise and not to the last bit.)
     cfg.cal.current_sign = cfg.cal.current_sign_2 = -1.0
-    right, right2 = tr.conductance_g0(cfg), tr.conductance_g0(cfg, channel=2)
+    right = tr.conductance_g0(cfg)
+    right2 = tr.conductance_g0(cfg, channel=2, as_measured=True)
+    ref2 = _one_pull(_sim(two=True))[0].conductance_g0(_sim(two=True), channel=2,
+                                                       as_measured=True)
     assert np.array_equal(right, -wrong)             # the flip is exact
     assert not analysis.reads_negative(right) and not analysis.reads_negative(right2)
     contact = ref > 0.5
@@ -430,11 +437,13 @@ def test_the_trace_panel_as_linear_conductance():
                   if len(ln.get_xdata()) == 2)
     assert flat == sorted([0.0, round(cfg.ramp.break_g0, 6), 1.0])   # 0, break, 1 G0
 
-    # two channels, linear: both as measured
+    # two channels, linear: each as far as it measured (channel 2 has no
+    # points where its output was saturated)
     plots.plot_trace(ax, cfg, g0, disp, sel, g0_2=g0_2, linear=True)
     data = [ln for ln in ax.lines if len(ln.get_xdata()) == disp.size]
     assert [ln.get_color() for ln in data] == [plots.C_CH1, plots.C_CH2]
-    assert np.array_equal(data[1].get_ydata(), g0_2)
+    assert np.array_equal(data[1].get_ydata(), g0_2, equal_nan=True)
+    assert np.isnan(g0_2).any() and np.isfinite(g0_2).any()
 
 
 def test_a_negative_trace_says_so_instead_of_an_empty_panel():

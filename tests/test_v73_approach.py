@@ -337,7 +337,7 @@ def script(root):
     pump(2.5)
     widgets = list(walk(root))
     def button(text):
-        return next(w for w in widgets if w.winfo_class() == "TButton"
+        return next(w for w in widgets if w.winfo_class() in ("TButton", "Button")
                     and str(w.cget("text")) == text)
     def entry_beside(widget):
         return str(next(c for c in widget.master.winfo_children()
@@ -375,15 +375,26 @@ def script(root):
     approach.invoke(); idle()
     look("approach")
     print("knobs over their knobs:", knob_over(coarse), knob_over(fine), flush=True)
+    print("approach button:", approach.winfo_width() > 1.5 * turn.winfo_width(),
+          approach.winfo_height() > turn.winfo_height(), flush=True)
+    def colours():
+        # of the two labels that ride on the knobs
+        return [str(w.cget("fg")) for w in walk(coarse.master)
+                if w.winfo_class() == "Label" and " V = " in str(w.cget("text"))
+                and w.master.winfo_class() == "Frame"]
+    def marks():
+        # the red marks that show where the piezo is while a knob is ahead
+        return [bool(w.winfo_ismapped()) for w in walk(coarse.master)
+                if w.winfo_class() == "Frame" and str(w.cget("bg")) == "#c62828"]
+    print("idle:", colours(), marks(), flush=True)
     x, y = coarse.coords()
     coarse.event_generate("<ButtonPress-1>", x=x, y=y); pump(0.1)
-    print("held:", texts("Label"), flush=True)
+    print("held:", colours(), marks(), texts("Label"), flush=True)
     coarse.event_generate("<ButtonRelease-1>", x=x, y=y); idle()
-    # down again, by the coarse slider: the mouse down on the knob, the knob
-    # taken to 0 V, the mouse up
-    x, y = coarse.coords()
+    print("let go:", colours(), marks(), f"{rig.piezo_v:.4f}", flush=True)
+    # down again, by the coarse slider: one click on its bar at 0 V
+    x, y = coarse.coords(0.0)
     coarse.event_generate("<ButtonPress-1>", x=x, y=y); pump(0.05)
-    root.setvar(str(coarse.cget("variable")), 0.0)
     coarse.event_generate("<ButtonRelease-1>", x=x, y=y); idle()
     look("down")
     root.setvar(entry_beside(turn), "50000")
@@ -443,8 +454,16 @@ def test_the_real_window_approach_button_knob_labels_and_screw(tmp_path):
     assert f"'{volts:.4f} V = {volts * STANDARD:.1f} nm']" in after
     assert "| ends ['7.5 V = 8082 nm', '8.5 V = 9160 nm'] | CONTACT at " in after
     assert lines["knobs over their knobs"] == "True True"
-    # a knob held by the mouse says that letting go will move the piezo
-    assert "(release to move)" in lines["held"]
+    # v75: the Approach button is the big one of the box
+    assert lines["approach button"] == "True True"
+    # v75: while the mouse holds a knob (or the piezo is on its way to it)
+    # the labels are orange and a red mark shows the piezo; nothing waits
+    # for the mouse to let go, and a knob held where it stood moves nothing
+    assert lines["idle"] == "['#202020', '#202020'] [False, False]"
+    assert lines["held"].startswith("['#b06000', '#b06000'] [True, True] ")
+    assert "(release to move)" not in lines["held"]
+    assert lines["let go"] == f"['#202020', '#202020'] [False, False] {volts:.4f}"
+    assert lines["down"].startswith("piezo 0.0000 window 0 0.5 ")
     # out of reach: the words asked for, and the piezo back where it started
     gone = lines["no contact"]
     assert gone.startswith("piezo 0.0000 window 0 0.5 ")

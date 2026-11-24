@@ -17,8 +17,10 @@ of the same pull drawn over it in grey when the rig has one),
 
 With a two-channel current amplifier, :func:`plot_trace` and
 :func:`plot_histogram` take the second channel as well and draw the two
-on the same axes, channel 1 in blue and channel 2 in red, each exactly as
-it was measured: nothing is stitched, cut or scaled to make them meet.
+on the same axes, channel 1 in blue and channel 2 in red, each with its
+own gain: nothing is scaled to make them meet. Channel 2 is drawn only as
+far as it measured: it comes with NaN where its output was saturated
+(``TraceRecord.conductance_g0``), and NaN is not drawn.
 """
 
 from __future__ import annotations
@@ -155,7 +157,7 @@ def plot_trace(ax, cfg: RigConfig, g0: np.ndarray, disp_nm: np.ndarray,
                verdict=None, title: str = "trace",
                sense_v: np.ndarray | None = None, smooth: int = 101,
                g0_2: np.ndarray | None = None, linear: bool = False,
-               saved: bool = False) -> None:
+               saved: bool = False, negative2: bool | None = None) -> None:
     """log10(G/G0) against displacement, Igor's PullOutLowG.
 
     Horizontal lines at 1 G0 and at the break threshold; the title carries
@@ -176,9 +178,13 @@ def plot_trace(ax, cfg: RigConfig, g0: np.ndarray, disp_nm: np.ndarray,
 
     With ``g0_2`` -- the same pull as channel 2 of a two-channel amplifier
     read it -- both are drawn on the one axis, channel 1 (``g0``) in blue
-    and channel 2 in red, sample for sample as measured: nothing is
-    stitched, and where channel 2 is railed (while the junction is closed)
-    it is drawn railed. The verdict is channel 1's.
+    and channel 2 in red. Channel 2 has no line where it is NaN, which is
+    where its output was saturated (while the junction is closed, at a
+    bias and gain that rail it): its red line begins where it comes off
+    the rail. The verdict is channel 1's. ``negative2`` says whether
+    channel 2 reads negative when the caller knows better than this
+    function can tell from a trace without its saturated part (None: it
+    is read off ``g0_2``).
 
     With ``sense_v`` (the piezo readback over the same samples, raw volts)
     a right-hand axis carries, in grey, how far the readback says the piezo
@@ -246,8 +252,10 @@ def plot_trace(ax, cfg: RigConfig, g0: np.ndarray, disp_nm: np.ndarray,
         title = f"{title}: {verdict.reason}" if verdict.accepted \
             else f"{title}: REJECTED, {verdict.reason}"
     # A channel that reads negative where the junction conducts: say so.
-    negative = [name for name, g in (("ch 1", g1), ("ch 2", g2))
-                if g is not None and analysis.reads_negative(g)]
+    negative = [name for name, g, known in (("ch 1", g1, None),
+                                            ("ch 2", g2, negative2))
+                if g is not None and (analysis.reads_negative(g)
+                                      if known is None else known)]
     if negative:
         who = " and ".join(negative)
         title = f"{title}  [{who} NEGATIVE]"
@@ -442,7 +450,8 @@ def plot_histogram(ax, cfg: RigConfig, centres: np.ndarray, counts: np.ndarray,
     together, channel 1 in blue and channel 2 in red. Each is its own
     channel's histogram, made by the one recipe, so the picture has two
     noise floors: channel 1's where its gain runs out and channel 2's
-    further down.
+    further down. Channel 2's counts end where channel 2 ends: the points
+    at which its output was saturated are not in it.
     """
     ax.clear()
     top = float(np.max(counts)) if counts.size else 0.0
@@ -541,10 +550,12 @@ def figure_for_session(path: str | Path, trace_index: int = 0, fig=None):
             g0_open=session.open_side(i) if session.has_current2 else None)
         # A session recorded with both outputs of a two-channel amplifier:
         # channel 2 of this trace, and its histogram over the file.
-        g0_2 = counts2 = None
+        g0_2 = counts2 = negative2 = None
         if session.has_current2:
             g0_2 = session.conductance(i, channel=2)
             counts2 = analysis.log_histogram(session.conductances(channel=2))[1]
+            negative2 = analysis.reads_negative(
+                session.conductance(i, channel=2, as_measured=True))
 
     if fig is None:
         fig = Figure(figsize=(13, 7.5), dpi=100)
@@ -553,7 +564,7 @@ def figure_for_session(path: str | Path, trace_index: int = 0, fig=None):
     record = np.stack([voltage, current])
     plot_record(axes[0, 0], cfg, record, fs, title=f"trace {i + 1} of {n}: record")
     plot_trace(axes[0, 1], cfg, g0, disp, verdict, title=f"trace {i + 1}",
-               sense_v=sense, g0_2=g0_2)
+               sense_v=sense, g0_2=g0_2, negative2=negative2)
     plot_gold_level(axes[0, 2], cfg, g0, disp, voltage_v=voltage)
     t = np.arange(voltage.size) / fs
     cmd = start_v - cfg.cal.nm_to_piezo_volts(disp)

@@ -63,13 +63,21 @@ channel 1 is in its own noise; where channel 2 is at its rail channel 1
 is read instead. Channel 2 is read in the same task during every play,
 saved with every trace, and drawn beside channel 1 -- the trace panel and the
 histogram show both on one plot, channel 1 in blue and channel 2 in red,
-each as it was measured. Nothing is stitched, so the histogram has two
-noise floors and channel 2 is drawn railed where the junction was closed.
+so the histogram has two noise floors. Channel 2 is drawn and counted
+only as far as it measured (v75): where its output is saturated
+(``limits.preamp_saturation_v``) it has no line and no counts. Before, the
+saturated part was drawn too, and since a saturated current divided by
+the junction voltage still has steps where the gold steps are, channel 2
+showed "G0 peaks" at conductances that were wrong (at 300 mV, about
+0.38 G0 for the 1 G0 plateau).
 Which card input channel 2 is on is the config's ``channels.ai_current_2``
 (``configs/newrig_2ch.json`` is such a rig); its raw volts go into the .h5
 (``current2_v``), and its Igor files into the day folder's ``ch2``
 subfolder under Igor's own names, same blocks and trace numbers, while
-channel 1's files stay exactly as they are.
+channel 1's files stay exactly as they are. In the ``ch2`` files and the
+``_ch2.txt`` table the saturated part of channel 2 holds channel 1's
+conductance (Igor's analysis needs the contact part of a trace); read
+back here, those points are blank again.
 
 Three things for bringing a rig up (v69, manual chapter 23). The Current
 amplifier box has a "flip the sign" box for each channel: an amplifier
@@ -92,12 +100,24 @@ bypass) and the stage's total displacement in micrometres; Set makes them
 the program's, and every distance follows (standard: total / 10 V per card
 volt; bypass: total / 150 V). A change of mode takes the piezo to 0 V first.
 Then Step closer / Step apart by Z nm, and TWO sliders on the one piezo
-output, both applying when the mouse is released, as Igor's did (and only
-when the knob was moved: a click on it moves nothing): a coarse
-one over the piezo's whole voltage range, for coming up to the surface
-after the screws, and a fine one over a window of it (half a volt either
-side of where the piezo is, on round numbers; the window walks along with
-the piezo). Under them Igor's readouts -- I (uA), V (mV), Piezo (V) and the
+output: a coarse one over the piezo's whole voltage range, for coming up
+to the surface after the screws, and a fine one over a window of it (half
+a volt either side of where the piezo is, on round numbers; the window
+walks along with the piezo). THE PIEZO FOLLOWS THE SLIDERS (v75): one
+click anywhere on a bar and the knob goes there, and the piezo after it;
+a knob that is dragged is followed while the mouse holds it (the worker's
+``cmd_follow``). Nothing waits for the mouse to let go, and a knob pressed
+and let go where it stood moves nothing. (Up to v74 they applied on mouse
+release, as Igor's did, and a click beside the knob was one step of 1 mV.)
+Because a move toward the surface is slow and may stop at contact, the
+knob can be ahead of the piezo: its label is then orange and a red mark
+over the bar shows where the piezo is; when the piezo is there, or was
+stopped, the knobs are on the piezo again. A slider never pushes into a
+junction that is closed already (Step closer does, by Z nm), so clicking
+past a contact again and again costs nothing. In a simulation such a move
+takes the time it takes on the rig (distance over speed), so that a
+slider tried on a laptop is as slow or as fast as it will be there.
+Under them Igor's readouts -- I (uA), V (mV), Piezo (V) and the
 sense line -- refreshed every 0.3 s while the rig is idle by the same quiet
 10 ms hold the Monitor window uses (Igor's Background Sampling), with
 Igor's beep above 0.15 uA. A move made by hand AWAY from the surface is
@@ -110,7 +130,8 @@ a slider, opens it again); Start N starts from wherever the sliders left
 the tip, separating first. Nothing checks where the switch on the driver
 box stands: the Driver row has to say what the box is in.
 
-APPROACH (v73) is for a rig whose coarse approach is a screw: the screw
+APPROACH (v73; the big blue button since v75) is for a rig whose coarse
+approach is a screw: the screw
 brings the surface within the piezo's reach, and the button takes the piezo
 toward it from where it is, at that same speed, until contact. The fine
 slider is then around the contact. With no contact up to the top of the
@@ -187,9 +208,11 @@ from stmlab.tklook import WIN_BG, _light_window, windows_look       # noqa: E402
 log = logging.getLogger("pullout")
 
 # Shown in the window title and by --version, so a patch can say which
-# version it applies to and you can see which one you have. (v74 is
-# noisecheck.py, a separate program: pullout itself is as it was in v73.)
-__version__ = "v74"
+# version it applies to and you can see which one you have. (v74 was
+# noisecheck.py, a separate program. v75: channel 2 of a two-channel
+# amplifier is drawn and counted only where its output is not saturated,
+# and the piezo follows the sliders -- a click on the bar, or a drag.)
+__version__ = "v75"
 
 # What the Saving tab holds when nothing is remembered yet. ``folder`` is
 # the data folder (the day folder is made under it); ``setup_id`` is Igor's
@@ -586,6 +609,22 @@ class Worker(threading.Thread):
         # the sliders, Step closer): nm a second. It goes in short pieces
         # and stops at contact (``_approach_by_hand``). The Piezo box sets it.
         self.hand_speed_nm_s = 200.0
+        # The sliders (``cmd_follow``). The window writes here from its own
+        # thread, through ``follow_begin`` / ``follow_to`` / ``follow_end``:
+        # where the knob is, in volts; whether the mouse still holds it; and
+        # whether a slider move is under way at all (from the mouse going
+        # down until the piezo has got there, or was stopped). One lock for
+        # the three, so that a press is never lost between two moves.
+        self.follow_lock = threading.Lock()
+        self.follow_v: float | None = None
+        self.follow_held = False
+        self.following = False
+        # A simulated card plays a move in no time at all. With this set
+        # (the window sets it in a simulation) each piece of a move toward
+        # the surface made by hand takes the 25 ms it takes on the rig, so
+        # that a slider or Approach tried on a laptop is as slow or as fast
+        # as it will be there: distance over speed.
+        self.sim_real_time = False
         # The current, in uA, that counts as contact for such a move: the
         # Coarse approach box's contact current, the level of its CONTACT
         # light (``_closed``). The window keeps it in step; 0 switches this
@@ -1238,6 +1277,172 @@ class Worker(threading.Thread):
                     f"({self.rig.piezo_nm:.1f} nm): G = {g0:.3e} G0{second}, {word}",
                     "warn" if ending else None)
 
+    # -- the sliders: the piezo follows the knob ------------------------------
+
+    def follow_begin(self, volts: float) -> None:
+        """From the window: the mouse has gone down on a slider and its knob
+        is at ``volts``. A ``follow`` command is queued unless one is waiting
+        already; if one is running it simply takes the new place."""
+        with self.follow_lock:
+            self.follow_v = float(volts)
+            self.follow_held = True
+            self.following = True
+        if not any(c[0] == "follow" for c in list(self.commands.queue)):
+            self.send("follow")
+
+    def follow_to(self, volts: float) -> bool:
+        """From the window: the knob has been dragged to ``volts``. False
+        when no slider move is under way any more (Stop ended it, or an
+        error): the drag is over, and the knob goes back on the piezo."""
+        with self.follow_lock:
+            if not self.following:
+                return False
+            self.follow_v = float(volts)
+            return True
+
+    def follow_end(self) -> None:
+        """From the window: the mouse has let go. The piezo finishes its
+        way to where the knob was left, and ``cmd_follow`` then ends."""
+        with self.follow_lock:
+            self.follow_held = False
+
+    # While the mouse rests on a knob the piezo has already reached, the
+    # junction is looked at this often (seconds between two looks).
+    FOLLOW_REST_S = 0.03
+
+    def cmd_follow(self) -> None:
+        """The sliders: take the piezo to where the knob is, and go on
+        following the knob for as long as the mouse holds it.
+
+        One click on the bar and the piezo goes there; a drag and it follows
+        the knob. The rules of every move made by hand hold (``cmd_goto``):
+        away from the surface at once, along a 50 ms ramp; toward the
+        surface at ``hand_speed_nm_s`` in pieces of 25 ms, the junction read
+        at the end of each, stopping where it closes (``_closed``). So the
+        knob can be ahead of the piezo, and the window shows both.
+
+        A slider never pushes into a junction that is closed. Before the
+        first piece of every stretch toward the surface the junction is
+        looked at where the piezo stands, and if it is closed already the
+        piezo stays (Step closer is the way to press further in, by Z nm).
+        After a contact the piezo goes no further toward the surface
+        wherever the knob is taken; it follows the knob again once the knob
+        has come back below it, and comes up again only if the junction has
+        opened. So clicking past a contact again and again costs nothing
+        (with ``cmd_goto``'s rule, one more piece each time, ten clicks at
+        2000 nm/s would be half a micrometre into the surface).
+
+        The move ends when the mouse has let go and the piezo is at the
+        knob (or held back by the contact), or when Stop is pressed. A
+        press on a knob that takes it nowhere moves nothing and says
+        nothing.
+        """
+        with self.follow_lock:
+            if not self.following:
+                return                         # nothing asked since the last one ended
+        C, L = self.cfg.cal, self.cfg.limits
+        look = max(8, int(round(self.HAND_LOOK_S * self.rig.sample_rate_hz)))
+        was = asked = self.rig.piezo_v
+        wall = None                # a contact was found here: no further up
+        rising = already = False   # on a stretch toward the surface; closed before it
+        ended, begun, pieces = "there", False, 0
+        said_at, slow_s, clean = 0.0, 0.0, False
+        try:
+            while True:
+                with self.follow_lock:
+                    target, held = self.follow_v, self.follow_held
+                    here = self.rig.piezo_v
+                    if target is None or not math.isfinite(target):
+                        target = here
+                    target = min(max(target, L.piezo_ao_min_v), L.piezo_ao_max_v)
+                    blocked = wall is not None and target > here + 1e-9
+                    resting = abs(target - here) <= 1e-9 or blocked
+                    stopped = self.stop_flag.is_set()
+                    if stopped or (resting and not held):
+                        self.following = False
+                        ended = ("stop" if stopped else
+                                 "contact" if blocked else "there")
+                        asked, clean = target, True
+                        break
+                if not resting and not begun:
+                    self._begin_by_hand()
+                    begun = True
+                if target < here - 1e-9:                   # away from the surface: at once
+                    self.rig.piezo_ramp_to(target)
+                    wall, rising = None, False
+                    if self.rig.piezo_v > here - 1e-12:    # it did not move: never a loop
+                        with self.follow_lock:
+                            self.follow_v = self.rig.piezo_v
+                elif not resting:                          # toward it: piece by piece
+                    if not rising:
+                        # a new stretch toward the surface: a look at the
+                        # junction where the piezo stands, before any move
+                        rising = True
+                        why = self._closed(self.rig.piezo_glide_to(here, self.HAND_PIECE_S),
+                                           tail=look)
+                        if why:
+                            self.contact_why, wall, already = why, here, True
+                            continue
+                    already = False
+                    speed = max(float(self.hand_speed_nm_s), 1.0)
+                    step_v = speed / C.piezo_nm_per_volt * self.HAND_PIECE_S
+                    left_s = (target - here) * C.piezo_nm_per_volt / speed
+                    now = time.monotonic()
+                    if left_s > 1.5 and now - said_at > 1.0:
+                        said_at = now
+                        self.status(f"going toward the surface to {target:.3f} V at "
+                                    f"{speed:g} nm/s: about {left_s:.0f} s more (the "
+                                    "box beside Approach is the speed; Stop ends it)",
+                                    "busy")
+                    started = time.monotonic()
+                    record = self.rig.piezo_glide_to(min(target, here + step_v),
+                                                     self.HAND_PIECE_S)
+                    if self.sim_real_time:
+                        time.sleep(self.HAND_PIECE_S)  # as long as the rig takes
+                    slow_s += time.monotonic() - started
+                    why = self._closed(record, tail=look)
+                    if not why and self.rig.piezo_v <= here + 1e-12:
+                        why = "the piezo does not go further"     # never a loop
+                    if why:
+                        self.contact_why = why
+                        wall = self.rig.piezo_v
+                else:
+                    # at the knob (or held back by the contact) with the
+                    # mouse still down: a look at the junction now and then,
+                    # so that the readouts stay live under a resting hand
+                    rising = False
+                    if begun:
+                        self.rig.piezo_glide_to(here, self.HAND_PIECE_S)
+                    time.sleep(self.FOLLOW_REST_S)
+                pieces += 1
+                if begun and pieces % 4 == 0:
+                    self.readout()                 # the readouts and the mark follow
+                    if self.mon.spent():           # a long way: a fresh picture
+                        self.mon.begin_cycle()
+                        self.mon.mark("by hand")
+        finally:
+            if not clean:                          # an error ends the move too
+                with self.follow_lock:
+                    self.following = False
+        if not begun:
+            return                                 # the knob was taken nowhere
+        g0, word, second = self._settle_by_hand()
+        short = asked - self.rig.piezo_v
+        ending = ""
+        if ended == "contact" and short > 1e-9 and already:
+            ending = (f"ALREADY IN CONTACT ({self.contact_why}): a slider does not "
+                      "push further in (Step closer does, by Z nm). ")
+        elif ended == "contact" and short > 1e-9:
+            ending = (f"STOPPED AT CONTACT ({self.contact_why}), {short:.4f} V short "
+                      f"of the {asked:.4f} V asked for. ")
+        elif ended == "stop" and abs(short) > 1e-9:
+            ending = (f"stopped by Stop, {abs(short):.4f} V short of the "
+                      f"{asked:.4f} V asked for. ")
+        took = f" in {slow_s:.0f} s" if slow_s >= 2.0 else ""
+        self.status(f"{ending}piezo {was:.4f} -> {self.rig.piezo_v:.4f} V "
+                    f"({self.rig.piezo_nm:.1f} nm){took}: G = {g0:.3e} G0{second}, "
+                    f"{word}", "warn" if ending else None)
+
     def cmd_piezo_approach(self) -> None:
         """The Piezo box's Approach: the piezo itself comes up to the
         surface, after the screws have brought the surface within its
@@ -1416,6 +1621,8 @@ class Worker(threading.Thread):
                 return "stop"
             record = self.rig.piezo_glide_to(
                 min(target_v, self.rig.piezo_v + step_v), self.HAND_PIECE_S)
+            if self.sim_real_time:
+                time.sleep(self.HAND_PIECE_S)      # as long as the rig takes
             why = self._closed(record, tail=look)
             if why:
                 self.contact_why = why
@@ -1514,14 +1721,18 @@ class Worker(threading.Thread):
             self.post("cycle", cycle=cycle, record=None, verdict=None)
             return None
         g0 = tr.conductance_g0(self.cfg)
-        # Channel 2 of a two-channel amplifier, as it was measured: shown
-        # and saved beside channel 1. The verdict reads the end of the
-        # trace from it (the open side: channel 2 where it is in range,
-        # channel 1 where it is railed); the start of the trace and the
-        # gold plateau are channel 1's.
-        g0_2 = g0_open = None
+        # Channel 2 of a two-channel amplifier, as far as it measured (no
+        # value where its output is saturated): shown beside channel 1.
+        # The verdict reads the end of the trace from it (the open side:
+        # channel 2 where it is in range, channel 1 where it is railed);
+        # the start of the trace and the gold plateau are channel 1's.
+        # The sign of the channel is read with the saturated part left
+        # in: a channel the wrong way round sits at its negative rail
+        # through contact.
+        g0_2 = g0_open = g0_2_sign = None
         if tr.current2_v is not None:
             g0_2 = tr.conductance_g0(self.cfg, channel=2)
+            g0_2_sign = tr.conductance_g0(self.cfg, channel=2, as_measured=True)
             g0_open = tr.open_side_g0(self.cfg)
         verdict = analysis.select_trace(g0, self.cfg.ramp,
                                         require_engaged=self.require_engaged,
@@ -1532,12 +1743,15 @@ class Worker(threading.Thread):
         # trace panel shows no line, so the status line says what it is.
         # A pull whose conductance is negative where the junction conducts
         # says so, in front of its status line so the box never cuts it off.
-        sign_note, sign_level, negative = self.sign_words(g0, g0_2, tr.voltage_v)
+        sign_note, sign_level, negative = self.sign_words(g0, g0_2_sign, tr.voltage_v)
+        # for the trace panel, which is given channel 2 without its
+        # saturated part and could not tell
+        negative2 = g0_2_sign is not None and analysis.reads_negative(g0_2_sign)
         if not test:
             self.negative_in_a_row = self.negative_in_a_row + 1 if negative else 0
         if test:
             self.post("cycle", cycle=cycle, record=tr, g0=g0, disp=disp,
-                      verdict=verdict, g0_2=g0_2)
+                      verdict=verdict, g0_2=g0_2, negative2=negative2)
             saved = ""
             if self.save and self.save_test_pulls:
                 self._save(tr, verdict, test=True)
@@ -1555,7 +1769,7 @@ class Worker(threading.Thread):
             key = verdict.reason.split(":")[0].split("(")[0].strip()
             self.rejections[key] = self.rejections.get(key, 0) + 1
         self.post("cycle", cycle=cycle, record=tr, g0=g0, disp=disp,
-                  verdict=verdict, g0_2=g0_2)
+                  verdict=verdict, g0_2=g0_2, negative2=negative2)
         self.post("hist", centres=self.hist_centres,
                   counts=self.histogram(), n=self.hist_n,
                   counts2=self.histogram2())
@@ -1575,8 +1789,10 @@ class Worker(threading.Thread):
         negative is the red case, and three of them in a row end a run
         (``SIGN_STOP``); ``sign_cure`` is then what to do about it.
         Channel 2 alone reading negative is said in orange and ends
-        nothing: it is its sign, or an output at its negative rail. A pull
-        that never touched says nothing about the sign and gets no note
+        nothing: it is its sign, or an output at its negative rail
+        (``g0_2`` is channel 2 with its saturated part left in,
+        ``conductance_g0(..., as_measured=True)``). A pull that never
+        touched says nothing about the sign and gets no note
         (``analysis.reads_negative``)."""
         if analysis.reads_negative(g0):
             v_seen = self.cfg.cal.voltage_input_sign * float(np.nanmean(voltage_v))
@@ -1967,7 +2183,8 @@ class Worker(threading.Thread):
                             header_lines=[f"name={sv['name']} experiment={sv['experiment']} "
                                           f"file={h5.name if h5 else final.parent.name}",
                                           "current channel 2 of a two-channel amplifier "
-                                          f"(channel 1: {data.name})",
+                                          f"(channel 1: {data.name}); where its output "
+                                          "was saturated the conductance is channel 1's",
                                           f"notes={sv.get('notes', '')}",
                                           f"auto_notes={auto}"],
                             channel=2)
@@ -2086,7 +2303,9 @@ class Worker(threading.Thread):
     def _accumulate(self, g0: np.ndarray, g0_2: np.ndarray | None = None) -> None:
         """Add an accepted trace to the run's histogram, and its channel 2
         (when it has one) to channel 2's: the same recipe and bins, a
-        histogram of its own."""
+        histogram of its own. ``g0_2`` is channel 2 as far as it measured
+        (NaN where its output was saturated): those points are not
+        counted, so channel 2's histogram ends where channel 2 ends."""
         centres, counts = analysis.log_histogram([g0])
         if self.hist_sum is None:
             self.hist_centres, self.hist_sum = centres, np.zeros_like(counts)
@@ -2105,9 +2324,14 @@ class Worker(threading.Thread):
         # alignment spike).
         a, b = int(g0.size * 0.85), int(g0.size * 0.95)
         if b - a >= 10:
-            self.floors.append((float(np.std(g0[a:b])),
-                                float(np.std(g0_2[a:b])) if g0_2 is not None
-                                else None))
+            floor2 = None
+            if g0_2 is not None:
+                # only where channel 2 measured (an accepted trace is open
+                # there, so that is all of it, bar a stray sample)
+                tail2 = g0_2[a:b]
+                tail2 = tail2[np.isfinite(tail2)]
+                floor2 = float(np.std(tail2)) if tail2.size >= 10 else None
+            self.floors.append((float(np.std(g0[a:b])), floor2))
 
     def noise_floors(self) -> tuple[float | None, float | None]:
         """(channel 1's noise floor, channel 2's) over the run's accepted
@@ -2190,8 +2414,10 @@ class Worker(threading.Thread):
         self.file_traces.append((
             tr.conductance_g0(self.cfg).astype(np.float32),
             tr.start_piezo_v, tr.timestamp,
-            # channel 2, for the second .txt table; None with one channel
-            tr.conductance_g0(self.cfg, channel=2).astype(np.float32)
+            # channel 2, for the second .txt table (None with one channel):
+            # as in the ch2 Igor block, channel 1's conductance where
+            # channel 2's output was saturated
+            tr.open_side_g0(self.cfg).astype(np.float32)
             if tr.current2_v is not None else None))
         v = self.cfg.cal.voltage_input_sign * np.asarray(tr.voltage_v, float) * 1e3
         n = v.size
@@ -2432,8 +2658,12 @@ class IgorDay:
     A day taken with a two-channel amplifier has channel 2 in its ``ch2``
     subfolder (``igor_scheme.CH2_FOLDER``): ``trace(i)`` then carries
     ``g0_2``, the same trace as channel 2 read it, ``hist2`` is channel
-    2's histogram over the day and ``data()`` holds both. (The ``ch2``
-    subfolder opened by itself is simply a day folder of channel 2.)
+    2's histogram over the day and ``data()`` holds both. Channel 2 is
+    read as it measured: the points of the ``ch2`` block that are channel
+    1's conductance, filled in where channel 2's output was saturated,
+    are blank here (``igor_scheme.read_block_channel2``). (The ``ch2``
+    subfolder opened by itself is simply a day folder: the two channels
+    as one trace.)
     """
 
     _BLOCK_FILE = re.compile(r"^PullOutConductanceBlock_(\d+)\.ibw$")
@@ -2476,7 +2706,7 @@ class IgorDay:
             centres = c
             total = counts * b.n_traces if total is None else total + counts * b.n_traces
             # Channel 2 of the same block, when the day has a ch2 subfolder.
-            b2 = self._read2(k, companions=False)
+            b2 = self._read2(k, companions=False, first=b)
             if b2 is not None and b2.n_traces:
                 if n2 == 0:
                     slot9 = float(b2.params[0][9])
@@ -2516,13 +2746,18 @@ class IgorDay:
             return self._single
         return igor_scheme.read_block(self.folder, k, companions=companions)
 
-    def _read2(self, k: int, companions: bool) -> igor_scheme.IgorBlock | None:
+    def _read2(self, k: int, companions: bool,
+               first: igor_scheme.IgorBlock | None = None
+               ) -> igor_scheme.IgorBlock | None:
         """Block ``k`` of channel 2 (the ``ch2`` subfolder), or None when
-        the day has none, or it cannot be read: channel 1 is still shown."""
+        the day has none, or it cannot be read: channel 1 is still shown.
+        ``first`` is block ``k`` of the day folder itself when the caller
+        has it (it tells which points of channel 2 are filled in)."""
         if self._single is not None:
             return None
         try:
-            return igor_scheme.read_block_channel2(self.folder, k, companions=companions)
+            return igor_scheme.read_block_channel2(self.folder, k, companions=companions,
+                                                   first=first)
         except Exception as exc:                   # noqa: BLE001
             log.warning("channel 2 of block %d in %s cannot be read (%s: %s)",
                         k, self.folder.name, type(exc).__name__, exc)
@@ -2538,7 +2773,7 @@ class IgorDay:
         """Block ``k`` of channel 2, the last one looked at kept; None when
         the day has none."""
         if self._cache2 is None or self._cache2[0] != k:
-            self._cache2 = (k, self._read2(k, companions=True))
+            self._cache2 = (k, self._read2(k, companions=True, first=self.block(k)))
         return self._cache2[1]
 
     def __len__(self) -> int:
@@ -2606,7 +2841,8 @@ class IgorDay:
         for k in self.ks:
             b = self._read(k, companions=False)
             d = b.displacement_nm
-            b2 = self._read2(k, companions=False) if self.hist2 is not None else None
+            b2 = (self._read2(k, companions=False, first=b)
+                  if self.hist2 is not None else None)
             where = ({int(num): j2 for j2, num in enumerate(b2.numbers)}
                      if b2 is not None and b2.n_points == b.n_points else {})
             for j in range(b.n_traces):
@@ -2792,6 +3028,11 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     worker = Worker(cfg, rig, mon, save=True, out_dir=out_dir,
                     igor_export=igor_export)
     worker.config_name = config_name
+    # In a simulation a move toward the surface made by hand (Approach, the
+    # sliders, Step closer) takes the time it takes on the rig, so that what
+    # is tried here is what the rig will do. Not in the self-test: that one
+    # is timed.
+    worker.sim_real_time = bool(cfg.simulate and autoclose is None)
     worker.start()
 
     root = tk.Tk()
@@ -2896,8 +3137,10 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     # Mac) themed buttons with coloured styles, which there do show.
     BIG = ("Arial", 11, "bold")
     GREEN, GREEN_DOWN, RED, RED_DOWN = "#2e7d32", "#1b5e20", "#c62828", "#8e0000"
+    BLUE, BLUE_DOWN = "#1565c0", "#0d47a1"         # the Piezo box's Approach
     if themed_buttons:
         for name, bg, down in (("Go", GREEN, GREEN_DOWN), ("Stop", RED, RED_DOWN),
+                               ("Move", BLUE, BLUE_DOWN),
                                ("Off", root.cget("background"), root.cget("background"))):
             style.configure(f"{name}.TButton", font=BIG, foreground="white",
                             background=bg, bordercolor=down, lightcolor=bg,
@@ -2910,7 +3153,7 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
 
     def big_button(parent, text, command, bg, down):
         if themed_buttons:
-            name = "Stop" if bg == RED else "Go"
+            name = {RED: "Stop", BLUE: "Move"}.get(bg, "Go")
             return ttk.Button(parent, text=text, command=command,
                               style=f"{name}.TButton")
         return tk.Button(parent, text=text, font=BIG, command=command, bg=bg,
@@ -3258,9 +3501,10 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     show_mode()
 
     # -- piezo: Igor's PiezoGroupbox, with Igor's readouts under it -----------------
-    # Step apart / Z (nm) / Step closer, a slider over the piezo's whole
-    # range that applies on mouse release (Igor's SetPiezoBiasFromSlider,
-    # live=0), and the readouts Igor kept at the bottom of its panel:
+    # Step apart / Z (nm) / Step closer, two sliders over the piezo's range
+    # that the piezo follows (a click on the bar, or a drag: v75; Igor's
+    # SetPiezoBiasFromSlider applied on mouse release, as these did up to
+    # v74), and the readouts Igor kept at the bottom of its panel:
     # I (uA), V (mV), Piezo, plus the sense line this rig has. They are
     # refreshed by every command and, while idle, every 0.3 s by a quiet
     # hold (Igor's Background Sampling) with Igor's beep above the contact
@@ -3406,47 +3650,56 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     fine_var = tk.DoubleVar(value=rig.piezo_v)         # fine: a window of it
     fine_half_var = tk.StringVar(value="0.5")
     speed_var = tk.StringVar(value=f"{worker.hand_speed_nm_s:g}")
-    # dragging: the mouse is down on a slider (which: that slider). window:
-    # the fine slider's range. half: the last usable "fine: +/-" width.
-    # pressed: where the knob stood when the mouse went down on it.
-    slide = {"dragging": False, "which": None, "window": None, "half": 0.5,
-             "pressed": None}
+    # dragging: the mouse is down on a slider (which: that slider). grab:
+    # how far from the knob's middle the mouse took hold of it, in volts.
+    # target: where a slider has asked the piezo to go, from the mouse going
+    # down until the piezo is there or was stopped (None otherwise: the
+    # knobs are then on the piezo). window: the fine slider's range. half:
+    # the last usable "fine: +/-" width.
+    slide = {"dragging": False, "which": None, "grab": 0.0, "target": None,
+             "window": None, "half": 0.5}
 
     # Approach: the piezo itself comes up to the surface, after the screws
     # have brought it within reach (the worker's cmd_piezo_approach), at the
     # speed in the box. The sliders and Step closer go toward the surface at
-    # that speed too, and stop at contact in the same way.
+    # that speed too, and stop at contact in the same way. A big button: it
+    # is the one pressed with an eye on the rig.
     apf = ttk.Frame(pb)
-    apf.grid(row=3, column=0, columnspan=3, sticky="w", padx=2, pady=(3, 0))
-    ttk.Button(apf, text="Approach", width=10,
-               command=lambda: hand_move("piezo_approach")).pack(side="left")
-    ttk.Label(apf, text="toward the surface at", font=("Arial", 9)).pack(
-        side="left", padx=(6, 2))
+    apf.grid(row=3, column=0, columnspan=3, sticky="ew", padx=2, pady=(3, 0))
+    approach_btn = big_button(apf, "Approach", lambda: hand_move("piezo_approach"),
+                              BLUE, BLUE_DOWN)
+    approach_btn.config(width=12)
+    approach_btn.pack(side="left", ipady=px(3))
+    ttk.Label(apf, text="speed toward\nthe surface", font=("Arial", 9),
+              justify="right").pack(side="left", padx=(8, 3))
     ttk.Entry(apf, textvariable=speed_var, width=6).pack(side="left")
-    ttk.Label(apf, text="nm/s, stopping at contact (the sliders too)",
-              font=("Arial", 9)).pack(side="left", padx=(2, 0))
+    ttk.Label(apf, text="nm/s. It stops at contact.\nThe sliders and Step closer too.",
+              font=("Arial", 9), justify="left").pack(side="left", padx=(3, 0))
 
     def knob_strip(row: int):
-        """A thin strip over a slider, for the label that rides on its knob:
-        the volts and the nanometres. (Tk's own number over a knob can only
-        be the slider's value, the volts.)"""
+        """A thin strip over a slider, for the label that rides on its knob
+        (the volts and the nanometres; Tk's own number over a knob can only
+        be the slider's value, the volts) and for the small red mark that
+        shows where the piezo is while the knob is ahead of it."""
         strip = tk.Frame(pb, height=px(17))
         strip.grid(row=row, column=0, columnspan=3, sticky="ew", padx=4)
-        return strip, tk.Label(strip, text="", font=("Arial", 9, "bold"))
+        return (strip, tk.Label(strip, text="", font=("Arial", 9, "bold")),
+                tk.Frame(strip, width=px(5), height=px(9), bg="#c62828"))
 
     def show_knobs(*_a):
         """The label on each slider's knob: where the knob is, in volts and
-        in nanometres. While the mouse holds a knob, that is where the piezo
-        will go, and the label says so."""
-        for sc, var, strip, lbl, digits in knobs:
+        in nanometres. While a slider has asked for a place the piezo has
+        not reached (the mouse holds a knob, or the piezo is on its way)
+        the labels are orange and a red mark on each strip shows where the
+        piezo is."""
+        ahead = slide["target"] is not None
+        for sc, var, strip, lbl, mark, digits in knobs:
             # The variable, not the slider's own rounded value: with the
             # piezo at 8.0271 V both labels say 8650.0 nm, though the coarse
             # slider can only stand on 8.027 V.
             v = float(var.get())
-            held = slide["dragging"] and slide["which"] is sc
-            lbl.config(text=f"{v:.{digits}f} V = {C.piezo_volts_to_nm(v):.1f} nm"
-                            + ("  (release to move)" if held else ""),
-                       fg="#b06000" if held else "#202020")
+            lbl.config(text=f"{v:.{digits}f} V = {C.piezo_volts_to_nm(v):.1f} nm",
+                       fg="#b06000" if ahead else "#202020")
             try:
                 x = float(sc.coords()[0])           # the knob, in pixels
             except (tk.TclError, IndexError, ValueError):
@@ -3454,6 +3707,16 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             half = lbl.winfo_reqwidth() / 2.0       # kept inside the strip
             x = min(max(x, half), max(half, strip.winfo_width() - half))
             lbl.place(x=x, y=0, anchor="n")
+            at = rig.piezo_v
+            if ahead and float(sc.cget("from")) - 1e-9 <= at <= float(sc.cget("to")) + 1e-9:
+                try:
+                    mx = float(sc.coords(at)[0])
+                except (tk.TclError, IndexError, ValueError):
+                    mx = 0.0
+                mark.place(x=mx, rely=1.0, anchor="s")
+                mark.lift()
+            else:
+                mark.place_forget()
 
     def on_slide(_value=None):
         show_knobs()
@@ -3471,26 +3734,35 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     # themed one: it has a knob you can see and ticks, which is what Igor's
     # looked like. Over each knob rides a label with its volts and its
     # nanometres (knob_strip, show_knobs).
-    # COARSE: the piezo's whole range, in steps of 1 mV. With a micrometre
+    # COARSE: the piezo's whole range, on steps of 1 mV. With a micrometre
     # to the volt this is the one for coming up to the surface after the
     # screws.
     # FINE: a window of the range, half a volt either side of where the
-    # piezo is (the box beside it), in steps of 0.1 mV. The window is put
+    # piezo is (the box beside it), on steps of 0.1 mV. The window is put
     # on round numbers (7.5 to 8.5 V around 7.99 V), is cut off where the
     # piezo's range ends, and walks along whenever the piezo nears one of
     # its ends (fine_window). After Approach the piezo is at the contact,
     # so the window is around the contact. Its two ends are written under
     # it, in volts and in nanometres.
-    # On either: drag the knob and let go, or click beside the knob for one
-    # step that way (hold the mouse down for more). A click on the knob
-    # that does not move it moves nothing.
-    ttk.Label(pb, text="coarse: the whole range (V)", font=("Arial", 9)).grid(
+    # On either (v75): CLICK anywhere on the bar and the knob goes there,
+    # and the piezo after it; DRAG the knob, or the bar from where you
+    # clicked, and the piezo follows it as it moves. Nothing waits for the
+    # mouse to let go. The piezo keeps the rules of every move made by hand
+    # (the worker's cmd_follow): away from the surface at once, toward it at
+    # the speed in the box beside Approach, stopping at contact. So the knob
+    # can be ahead of the piezo: its label is then orange and a red mark on
+    # the strip above the bar shows where the piezo is. When the piezo is
+    # there, or was stopped, the knobs are on the piezo again.
+    ttk.Label(pb, text="coarse: the whole range (V).  Click on a bar or drag: "
+                       "the piezo goes there",
+              font=("Arial", 9)).grid(
         row=4, column=0, columnspan=3, sticky="w", padx=4, pady=(4, 0))
-    coarse_strip, coarse_knob = knob_strip(5)
+    coarse_strip, coarse_knob, coarse_mark = knob_strip(5)
     scale = tk.Scale(pb, from_=lo_v, to=hi_v, orient="horizontal",
                      variable=slider_var, command=on_slide, length=px(360),
                      resolution=0.001, bigincrement=0.1, tickinterval=1.0,
-                     showvalue=False, sliderlength=18, font=("Arial", 9))
+                     showvalue=False, sliderlength=px(26), width=px(18),
+                     font=("Arial", 9))
     scale.grid(row=6, column=0, columnspan=3, sticky="ew", padx=4)
     ff = ttk.Frame(pb)
     ff.grid(row=7, column=0, columnspan=3, sticky="w", padx=4, pady=(3, 0))
@@ -3498,14 +3770,14 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     ttk.Entry(ff, textvariable=fine_half_var, width=5).pack(side="left", padx=2)
     ttk.Label(ff, text="V around the piezo (after Approach: around the contact)",
               font=("Arial", 9)).pack(side="left")
-    fine_strip, fine_knob = knob_strip(8)
+    fine_strip, fine_knob, fine_mark = knob_strip(8)
     fine = tk.Scale(pb, from_=lo_v, to=hi_v, orient="horizontal",
                     variable=fine_var, command=on_slide, length=px(360),
                     resolution=0.0001, bigincrement=0.01, showvalue=False,
-                    sliderlength=18, font=("Arial", 9))
+                    sliderlength=px(26), width=px(18), font=("Arial", 9))
     fine.grid(row=9, column=0, columnspan=3, sticky="ew", padx=4)
-    knobs = ((scale, slider_var, coarse_strip, coarse_knob, 3),
-             (fine, fine_var, fine_strip, fine_knob, 4))
+    knobs = ((scale, slider_var, coarse_strip, coarse_knob, coarse_mark, 3),
+             (fine, fine_var, fine_strip, fine_knob, fine_mark, 4))
     # The two ends of the fine window, written out in volts and nanometres
     # (Tk's own tick labels round 7.45 to "7.5", and know no nanometres).
     fl = ttk.Frame(pb)
@@ -3515,18 +3787,32 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     fine_hi_lbl = ttk.Label(fl, text="", font=("Arial", 9))
     fine_hi_lbl.pack(side="right")
 
+    def slide_over() -> bool:
+        """Has a slider's move ended (the piezo got there, or was stopped)?
+        Then the knobs belong to the piezo again, whatever the mouse does
+        until it next goes down."""
+        if slide["target"] is not None and not worker.following:
+            slide.update(dragging=False, which=None, target=None)
+            return True
+        return False
+
     def set_fine_window(volts: float | None = None):
         """Put the fine slider's window around ``volts`` (default: where
-        the piezo is) and its knob on it. Always: while the "fine: +/-"
-        box holds nothing usable (it is being typed in), the last usable
-        width stays, so the knob is never left where the piezo is not."""
+        the piezo is, or where a slider has asked it to go) and its knob on
+        it. Always: while the "fine: +/-" box holds nothing usable (it is
+        being typed in), the last usable width stays, so the knob is never
+        left where the piezo is not."""
         try:
             half = abs(float(fine_half_var.get()))
         except ValueError:
             half = float("nan")
         if 0.001 <= half <= hi_v - lo_v:
             slide["half"] = half
-        v = rig.piezo_v if volts is None else float(volts)
+        if volts is None:
+            slide_over()
+            v = rig.piezo_v if slide["target"] is None else slide["target"]
+        else:
+            v = float(volts)
         window = fine_window(v, slide["half"], lo_v, hi_v)
         if slide["window"] != window:
             slide["window"] = window
@@ -3539,7 +3825,27 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         fine_hi_lbl.config(
             text=f"{window[1]:g} V = {C.piezo_volts_to_nm(window[1]):.0f} nm")
         show_knobs()
-    fine_half_var.trace_add("write", lambda *_a: set_fine_window())
+
+    def on_fine_half(*_a):
+        if slide["which"] is not fine:             # never under a held mouse
+            set_fine_window()
+    fine_half_var.trace_add("write", on_fine_half)
+
+    def put_knobs(volts: float, held=None):
+        """Both knobs on ``volts``: where the piezo is or, during a slider's
+        move, where the slider has asked it to go. The fine window walks
+        along when ``volts`` nears one of its ends. ``held`` is the slider
+        under the mouse: its knob and its window are the hand's."""
+        if held is not scale:
+            slider_var.set(volts)
+        if held is not fine:
+            low, high = slide["window"] or (lo_v, hi_v)
+            edge = 0.1 * (high - low)
+            if low + edge <= volts <= high - edge:
+                fine_var.set(volts)
+            else:
+                set_fine_window(volts)
+        on_slide(volts)
 
     def set_speed(*_a):
         """How fast a move toward the surface made by hand goes."""
@@ -3551,42 +3857,90 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             worker.hand_speed_nm_s = speed
     speed_var.trace_add("write", set_speed)
 
+    def sliders_free() -> bool:
+        """May a slider take the piezo? Yes while nothing but the idle
+        sampling, or the sliders' own move, is running or waiting."""
+        mine = QUIET + ("follow",)
+        return ((not worker.busy or worker.current in mine)
+                and all(c[0] in mine for c in list(worker.commands.queue)))
+
+    def volts_under(widget, e) -> float:
+        """The volts a slider would stand on with its knob's middle under
+        the mouse: on the slider's own steps, inside its range."""
+        return float(widget.tk.call(widget._w, "get", int(e.x), int(e.y)))
+
     def pressed(widget, var):
-        def on_press(_e):
+        def on_press(e):
+            # The mouse goes down. On the knob: the knob stays where it is
+            # and is held where it was taken. Anywhere else on the bar: the
+            # knob goes under the mouse, and the piezo after it.
+            if not sliders_free():
+                set_status("busy: wait for the current command to finish, "
+                           "or press Stop")
+                return "break"
+            # With no slider move under way the knobs ARE the piezo: put
+            # them exactly on it before this press is read (they are
+            # refreshed a few times a second, and a press on a knob that is
+            # a moment behind must not send the piezo back to where it was).
+            if slide_over():
+                put_knobs(rig.piezo_v)
+                set_fine_window()
+            elif slide["target"] is None:
+                put_knobs(rig.piezo_v)
+            part = str(widget.identify(e.x, e.y))
+            if part not in ("slider", "trough1", "trough2"):
+                return "break"                     # beside the bar: nothing
+            under = volts_under(widget, e)
+            if part == "slider":
+                # the knob's own place, not the piezo's: the two differ
+                # while an earlier move is still on its way
+                target = float(var.get())
+                slide["grab"] = under - target
+            else:
+                target, slide["grab"] = under, 0.0
+                var.set(target)
             slide["dragging"], slide["which"] = True, widget
-            slide["pressed"] = float(var.get())     # where the knob stands
-            show_knobs()
+            worker.follow_begin(target)
+            slide["target"] = target
+            put_knobs(target, held=widget)
+            return "break"
         return on_press
 
-    def on_drag(_e):
-        # The same refresh as on_slide's, from the motion event itself, in
-        # case the platform does not call the scale's -command mid-drag.
-        show_knobs()
-        if slide["dragging"] and time.monotonic() - live.get("last_poll", 0.0) > 0.15:
-            poll_body()
-            root.update_idletasks()
-
-    def released(var):
-        def on_release(_e):
-            slide["dragging"], slide["which"] = False, None
-            v = float(var.get())
-            was, slide["pressed"] = slide["pressed"], None
-            # Only a knob that was moved moves the piezo. A click on the
-            # knob that leaves it where it is asks for nothing (was: the
-            # value when the mouse went down; None: it never went down on
-            # the slider in the ordinary way).
-            if was is None or abs(v - was) < 1e-9 or not hand_move("goto", v):
-                slider_var.set(rig.piezo_v)         # both knobs back on the piezo
+    def dragged(widget, var):
+        def on_drag(e):
+            if not slide["dragging"] or slide["which"] is not widget:
+                return "break"
+            low, high = float(widget.cget("from")), float(widget.cget("to"))
+            target = min(max(volts_under(widget, e) - slide["grab"], low), high)
+            if not worker.follow_to(target):
+                slide_over()                       # Stop ended it: the drag is over
+                put_knobs(rig.piezo_v)
                 set_fine_window()
-            on_slide()
+                return "break"
+            var.set(target)
+            slide["target"] = target
+            put_knobs(target, held=widget)
+            return "break"
+        return on_drag
+
+    def released(widget):
+        def on_release(_e):
+            if slide["dragging"] and slide["which"] is widget:
+                slide["dragging"], slide["which"] = False, None
+                worker.follow_end()
+                # the knob stays where it was left until the piezo is there
+                on_slide()
+            return "break"
         return on_release
     for widget, var in ((scale, slider_var), (fine, fine_var)):
-        widget.bind("<ButtonPress-1>", pressed(widget, var), add="+")
-        widget.bind("<B1-Motion>", on_drag, add="+")
-        widget.bind("<ButtonRelease-1>", released(var), add="+")
+        widget.bind("<ButtonPress-1>", pressed(widget, var))
+        widget.bind("<B1-Motion>", dragged(widget, var))
+        widget.bind("<ButtonRelease-1>", released(widget))
         # Tk's own Control-click sends a scale's knob to the END of its
-        # range: one slip, and the piezo is asked for 10 V. Not here.
-        widget.bind("<Control-ButtonPress-1>", lambda _e: "break")
+        # range, and its middle button moves the knob without us: not here.
+        for event in ("<Control-ButtonPress-1>", "<ButtonPress-2>", "<B2-Motion>",
+                      "<ButtonRelease-2>"):
+            widget.bind(event, lambda _e: "break")
         # The knob's label is placed by the knob's pixels: again whenever
         # the slider is laid out anew.
         widget.bind("<Configure>", show_knobs, add="+")
@@ -3598,8 +3952,9 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     big: dict[str, tk.Label] = {}
     cells = [("i", "I (uA)"), ("v", "V (mV)"), ("p", "Piezo (V)"), ("s", "Sense (V)")]
     if has_ch2:
-        # Channel 2 of the amplifier, in nA: red while it is railed (which
-        # is where it sits whenever the junction is closed).
+        # Channel 2 of the amplifier, in nA; the word RAILED, in red, while
+        # its output is saturated (where it sits whenever the junction is
+        # closed, at a bias and gain that rail it).
         cells.insert(1, ("i2", "I ch 2 (nA)"))
     for col, (key, title) in enumerate(cells):
         cell = ttk.Frame(rof, relief="groove", borderwidth=1)
@@ -3623,21 +3978,18 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                 big["i2"].config(text="off", fg="#6a6a6a")
             elif ch2 is None:
                 big["i2"].config(text="--", fg="#202020")
+            elif ch2["railed"]:
+                big["i2"].config(text="RAILED", fg="#b00000")   # saturated: no number
             else:
-                big["i2"].config(text=f"{ch2['amps'] * 1e9:9.3f}",
-                                 fg="#b00000" if ch2["railed"] else "#202020")
+                big["i2"].config(text=f"{ch2['amps'] * 1e9:9.3f}", fg="#202020")
         big["v"].config(text=f"{v_mv:8.2f}" if np.isfinite(v_mv) else "--")
         big["p"].config(text=f"{piezo_v:7.4f}")
         big["s"].config(text=f"{sense_v:7.4f}" if sense_v is not None else "none")
-        if not slide["dragging"]:
-            slider_var.set(piezo_v)             # both sliders follow every move
-            low, high = slide["window"] or (lo_v, hi_v)
-            edge = 0.1 * (high - low)
-            if low + edge <= piezo_v <= high - edge:
-                fine_var.set(piezo_v)
-            else:
-                set_fine_window(piezo_v)        # the fine window walks along
-            on_slide(piezo_v)
+        slide_over()
+        if slide["target"] is None:
+            put_knobs(piezo_v)                  # both sliders follow every move
+        else:
+            show_knobs()                        # a slider is ahead: the mark follows
         touching = np.isfinite(i_ua) and abs(i_ua) > contact["ua"]
         contact_lbl.config(text=" CONTACT " if touching else "  OPEN  ",
                            bg="#b00000" if touching else "#6a6a6a")
@@ -3720,7 +4072,8 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
     ttk.Label(amp, text="ch 1: the lower-gain output; contact is judged on it. "
                         "ch 2: the higher-gain output; the Break threshold (junction "
                         "open) is judged on it. Both are drawn, ch 1 blue and ch 2 "
-                        "red, nothing stitched. A gain says what the amplifier is "
+                        "red; ch 2 only where its output is not saturated. A gain "
+                        "says what the amplifier is "
                         "set to (1e4, 1e7 ...); it programs nothing. Flip the sign "
                         "of a channel whose current reads NEGATIVE at a positive "
                         "bias: an amplifier whose output is the other way round "
@@ -4546,11 +4899,12 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         if tr is not None and tr.get("record") is not None:
             rec = tr["record"]
             # g0_2: the same pull on channel 2 of a two-channel amplifier
-            # (None with one channel) -- blue and red on the one axis.
+            # (None with one channel) -- blue and red on the one axis,
+            # the red only where channel 2's output was not saturated.
             plots.plot_trace(ax["trace"], cfg, tr["g0"], tr["disp"], tr["verdict"],
                              title=f"trace {worker.attempts}",
                              sense_v=rec.piezo_sense_v, g0_2=tr.get("g0_2"),
-                             linear=lin_g.get())
+                             linear=lin_g.get(), negative2=tr.get("negative2"))
         if cyc is not None and cyc.t:
             plots.plot_piezo(ax["piezo"], cfg, np.array(cyc.t), np.array(cyc.piezo_v),
                              np.array(cyc.sense_v), marks=cyc.marks,
@@ -4630,14 +4984,18 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
         verdict = analysis.select_trace(
             g0, scfg.ramp, g0_open=s.open_side(i) if s.has_current2 else None)
         sense = s.piezo_sense(i, in_nm=False)
-        # A session taken with a two-channel amplifier: channel 2 as well.
+        # A session taken with a two-channel amplifier: channel 2 as well,
+        # as far as it measured; its sign is read with the saturated part in.
         g0_2 = s.conductance(i, channel=2) if s.has_current2 else None
+        negative2 = (analysis.reads_negative(
+            s.conductance(i, channel=2, as_measured=True))
+            if s.has_current2 else None)
         plots.plot_record(ax["record"], scfg, np.stack([voltage, current]), fs,
                           title=f"saved trace {i + 1}: junction V and current "
                                 f"(the file keeps the trace only)", log=log_iv.get())
         plots.plot_trace(ax["trace"], scfg, g0, disp, verdict,
                          title=f"saved trace {i + 1}", sense_v=sense, g0_2=g0_2,
-                         linear=lin_g.get(), saved=True)
+                         linear=lin_g.get(), saved=True, negative2=negative2)
         t = np.arange(voltage.size) / fs
         cmd = start_v - scfg.cal.nm_to_piezo_volts(disp)
         plots.plot_piezo(ax["piezo"], scfg, t, cmd, sense,
@@ -4710,17 +5068,22 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
                 lines = [f"{a:<27}{b}" for a, b in zip(left_col, right_col)]
                 if has_ch2:
                     # Channel 2 of the amplifier: what it puts out, as a
-                    # current and as a conductance, and whether it is at
-                    # its rail (its normal state while the junction is closed).
+                    # current and as a conductance. At its rail (its normal
+                    # state while the junction is closed, at a bias and
+                    # gain that saturate it) the volts are all there is to
+                    # say: a saturated output is not a current, and no
+                    # conductance is made of it (v75).
                     c2 = p.get("ch2")
                     if not p.get("two_channels"):
                         lines.append("ch 2      not read (one channel selected)")
                     elif c2 is None:
                         lines.append("ch 2      --")
+                    elif c2["railed"]:
+                        lines.append(f"ch 2      {c2['volts']:+8.4f} V  RAILED: its output "
+                                     "is saturated, no reading")
                     else:
                         lines.append(f"ch 2      {c2['volts']:+8.4f} V {c2['amps'] * 1e9:10.3f} nA"
-                                     f"  G {c2['g0']:.2e} G0"
-                                     + ("  RAILED" if c2["railed"] else ""))
+                                     f"  G {c2['g0']:.2e} G0")
                 lines.append(f"file      {live.get('file') or 'none open'}")
                 lines.append(f"keithley  {keithley_line()}")
                 set_text(ro, "\n".join(lines))
@@ -4823,10 +5186,16 @@ def run_gui(cfg: RigConfig, out_dir: Path, igor_export: bool,
             if live.get("busy_since") is None:
                 live["busy_since"] = time.monotonic()
             elapsed = time.monotonic() - live["busy_since"]
-            working(True, f"WORKING: {worker.current} running {elapsed:.0f} s -- "
-                          f"do not touch the rig; Stop ends it between steps. "
-                          f"piezo {rig.piezo_v:.3f} V, junction {v_mv:.1f} mV, "
-                          f"{i_ua:.3f} uA")
+            if worker.current == "follow":
+                # the sliders' own move: the hand is on the rig, by the mouse
+                working(True, f"SLIDER: the piezo follows the knob ({elapsed:.0f} s). "
+                              f"Stop ends it. piezo {rig.piezo_v:.3f} V, junction "
+                              f"{v_mv:.1f} mV, {i_ua:.3f} uA")
+            else:
+                working(True, f"WORKING: {worker.current} running {elapsed:.0f} s -- "
+                              f"do not touch the rig; Stop ends it between steps. "
+                              f"piezo {rig.piezo_v:.3f} V, junction {v_mv:.1f} mV, "
+                              f"{i_ua:.3f} uA")
         else:
             live["busy_since"] = None
             if status2.cget("text"):
